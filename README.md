@@ -54,12 +54,22 @@ Canlı demo hesapta (XM Global, hedging) uçtan uca doğrulandı.
 | `crates/sinyal-proto` — bellek yerleşimi, durum tabloları, emir doğrulama | 66 |
 | `crates/sinyal-shm` — Windows shm, QPC, tek-örnek kilidi, token üretimi | 17 |
 | `crates/sinyal-bridge` — MT5'e yüklenen DLL (C ABI) + geçmiş oturumu | 48 |
-| `crates/sinyal-core` — `sinyald`: feed, mum, emir, korelasyon, yetki, geçmiş | 92 |
-| `crates/sinyal-proto` üreteç testleri | 11 |
+| `crates/sinyal-core` — `sinyald`: feed, mum, emir, korelasyon, yetki, geçmiş, kayıt, replay, simülatör | 232 |
+| `crates/sinyal-proto` üreteç testleri | 15 |
 | `tools/latency-bench` | 7 |
 | `mql5/` — EA + Service + ABI başlıkları | derlendi, canlı çalışıyor |
 
-**241 test, hepsi geçiyor.**
+**385 test, hepsi geçiyor.**
+
+Doğrulamayı kendin çalıştır:
+
+```bash
+pwsh -File tools/kabul-testi.ps1 ws://144.76.111.177:8787
+```
+
+20 maddelik uçtan uca kontrol: bağlantı, sembol bilgisi, MT5 geçmişi (altı
+zaman dilimi), hata yolları, canlı akış, yetki kapısı, emir aç-kapat. Test
+"piyasa kapalı" ile "sistem bozuk" ayrımını yapar.
 
 ### Ölçülen gecikme
 
@@ -103,10 +113,25 @@ Terminalde:
 
 Tuzaklar ve sıralama: [docs/GELISTIRME.md](docs/GELISTIRME.md)
 
-## Çalıştırma
+## Üç kip
+
+Aynı WebSocket protokolü, üç farklı yürütme kipi. Sinyal sisteminin **kodu
+değişmez** — yalnızca bağlandığı port değişir. Fark `hello.mode` alanında
+açıkça ilan edilir.
+
+| Kip | Veri | Yürütme | `hello.mode` |
+|---|---|---|---|
+| **canlı** | MT5'ten gerçek zamanlı | **gerçek emir** | `live` |
+| **paper** | MT5'ten gerçek zamanlı | simüle | `paper` |
+| **replay** | diskteki kayıttan | simüle | `replay` |
+
+`replay` + gerçek yürütme kombinasyonu **yasaktır** — kayda emir göndermek
+anlamsızdır ve kaza riski taşır.
+
+### Canlı
 
 ```bash
-# yalnız yerel, emir kapalı
+# yalnız yerel, emir kapalı (varsayılan)
 sinyald --instance mt5-1
 
 # ağa açık, grafik token'sız, işlem token'lı
@@ -116,32 +141,91 @@ sinyald --generate-token
 ```
 
 Varsayılan olarak yalnızca `127.0.0.1` dinler ve **emir yürütme kapalıdır**.
-
 Piyasa verisi (tick, derinlik, mum, sembol) **token istemez**; hesap ve emir
 ister. `--token` verilmezse bağlantı doğrudan `trader` seviyesinde başlar.
+
+### Paper — canlı veri, risksiz yürütme
+
+```bash
+sinyald --instance mt5-1 --bind 0.0.0.0:8787 --enable-trading --token GIZLI \
+        --paper-bind 0.0.0.0:8789 --paper-balance 10000 --sim-slippage 1
+```
+
+**Aynı süreçte ikinci dinleyici.** Ayrı daemon olamaz: halkalar SPSC'dir, iki
+okuyucu sözleşmeyi kırar. Ayrı **port** ise bilinçli bir güvenlik sınırıdır —
+paper stratejisi yanlışlıkla gerçek emir gönderemez, çünkü o soketin komut
+kanalı hiç kurulmamıştır.
+
+İkisi **aynı anda** çalışır: strateji 8789'da paper koşarken sen 8787'den
+gerçek hesabı izlersin. Veri, mum deposu ve geçmiş ortaktır.
+
+### Kayıt ve replay — "canlıda gibi" test
+
+```bash
+# canlı koşarken tick akışını diske yaz
+sinyald --instance mt5-1 --record ./veri
+
+# kaydı aynı protokolden yeniden oynat
+sinyald --replay ./veri --replay-date 20260811 --bind 127.0.0.1:8788
+sinyald --replay ./veri --replay-date 20260811 \
+        --replay-from 09:00 --replay-to 17:00 --replay-speed 3
+```
+
+`--replay-speed 0` beklemeden en hızlı oynatır; sıra korunur. Aynı kayıt + aynı
+bayraklar → **aynı çıktı** (belirlenimci).
+
+Kayıt biçimi başlıksız, sabit 48 baytlık kayıtlardır; dosya uzunluğu tek
+doğruluk kaynağıdır, yani çökmede yarım kayıt sessizce kırpılır. Kayıt **ayrı
+bir thread'de** yapılır ve sıcak yolda hiç I/O yoktur — kanal dolarsa kayıt
+düşürülür ve **sayılır** (canlı akış kayıttan önceliklidir).
+
+Disk maliyeti: ~56 MB/gün (10 sembol).
+
+### Simülatör neyi modeller, neyi modellemez
+
+Paper ve replay açılışta bunu kendisi ekrana yazar. Kısaca:
+
+**Modellenir** — spread; **aleyhte** kayma (varsayılan 1 point, sıfır DEĞİL);
+bekleyen emir ve SL/TP tetiklenmesi (aynı tick ikisini de vurursa **SL
+kazanır**); `stops_level` (10016); marjin (10019); hacim ızgarası (10014).
+
+**Modellenmez** — komisyon, swap, requote/deviation penceresi, kur çevrimi,
+kısmi dolum, emir son kullanma, stop-out, `freeze_level`.
+
+> Simüle dolum **gerçek dolum değildir.** Sıfır kayma varsayılanı bilinçli
+> olarak reddedildi: simülatörü gerçekte olduğundan kârlı gösteren sessiz bir
+> yalan olurdu.
 
 ---
 
 ## Bilinen eksikler
 
-1. **Tick kaydı ve replay yok.** "Canlıda gibi test" için kayıt-ve-yeniden-oynat
-   katmanı gerekiyor; şu an test ancak canlı akışla yapılabilir.
+1. **Komisyon ve swap simülasyonda modellenmiyor.** Veriler artık sembol
+   tablosunda taşınıyor (`swap_long/short`, `swap_mode`) ama simülatör henüz
+   kullanmıyor. Uzun süre taşınan pozisyonlarda PnL canlıdan sapar.
 2. **Oluşmakta olan bar bayat.** MT5 serisi ~20 sn'de bir tazeleniyor; son barı
    istemci tick'ten kurmalı — **bid**'den, mid'den değil (GOLD'da fark 20-30
    point).
 3. **Hız sınırı yok.** Geçmiş isteğinde eş zamanlılık tavanı var (4) ama
    istek/saniye sınırı yok. Uç internete açıksa bu istek MT5'in içinde iş
    tetikler.
-4. **Swap, komisyon, seans bilgisi taşınmıyor.** Gerçekçi PnL hesabı için
-   gerekli.
+4. **`TickRec` iki yerde tanımlı** (`record.rs` ve `replay.rs`). İkisi bugün
+   aynı, ama tek bir disk biçiminin iki bağımsız tanımı sessiz kaymanın klasik
+   kaynağıdır.
 5. **`CandleStore` yalnızca sembol adıyla anahtarlı**, `instance` ile değil —
    ikinci bir broker eklenirse iki serinin GOLD'u karışır.
 6. **TLS yok.** `ws://` düz metin; token ağ üzerinde açık gider.
 7. **Terminal kaynaklı tick kaybı ölçülmüyor.** Halka kaybı ayrıca ölçülüyor
    ve 0.
+8. **Kurulum yarı otomatik.** `deploy.ps1` dosyaları kopyalayıp derliyor, ama
+   DLL terminal açıkken değiştirilemiyor, EA'yı grafiğe sen sürüklüyorsun ve
+   Service'i Navigator'dan sen başlatıyorsun. Araştırıldı: üçü de
+   otomatikleştirilebilir ama **terminalin kapalı olmasını** gerektiriyor ve
+   terminali zarifçe kapatmanın belgelenmiş bir CLI yolu yok.
 
 ---
 
 ## Lisans
 
 UNLICENSED — özel proje.
+
