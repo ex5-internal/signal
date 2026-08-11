@@ -76,12 +76,18 @@ double g_vol_step[];
 uchar  g_book_sub[];     // MarketBookAdd başarılı mı
 uchar  g_ready[];        // en az bir geçerli tick geldi mi
 
-// Emir yürütme: bilet -> client_id eşlemesi.
-// MqlTradeTransaction'da magic/comment YOKTUR; bize ait olmayan olayları
-// ayıklamanın tek yolu bu yerel tablodur.
-ulong  g_req_id[];       // OrderSendAsync'in döndürdüğü request_id
-ulong  g_req_client[];   // karşılık gelen client_id
-int    g_req_count = 0;
+// --- durum toplama (hesap / pozisyon / emir) ---
+// Sıcak yolda tahsis olmasın diye ÖNCEDEN ayrılır.
+SinyalAccount  g_acc;
+SinyalPosition g_pos[];
+SinyalOrder    g_ord[];
+datetime       g_last_state_pub = 0;
+// OnTrade tetiklendiğinde işaretlenir; bir sonraki timer'da hemen yayımla.
+bool           g_state_dirty = true;
+ulong          g_state_pubs  = 0;
+ulong          g_state_errs  = 0;
+// Sonuç halkasına yazılamayan olay sayısı (emir olayı KAYBI).
+ulong          g_res_dropped = 0;
 
 // Teşhis sayaçları. OnTick/OnBookEvent içinde yalnızca ARTIRILIR;
 // raporlama OnTimer'da yapılır (sıcak yolda Print yasak).
@@ -413,8 +419,12 @@ int OnInit()
    ArrayResize(g_bk_price, SINYAL_MAX_BOOK_DEPTH);
    ArrayResize(g_bk_volume, SINYAL_MAX_BOOK_DEPTH);
    ArrayResize(g_bk_kind, SINYAL_MAX_BOOK_DEPTH);
-   ArrayResize(g_req_id, 256);
-   ArrayResize(g_req_client, 256);
+   // Durum tamponlari — sicak yolda tahsis YAPILMAZ.
+   // MQL5'te sifir uzunluklu dizinin tampon adresi tanimsiz oldugu icin
+   // en az 1 eleman ayrilir; gercek sayi ayri gecer.
+   ArrayResize(g_pos, SINYAL_MAX_POSITIONS);
+   ArrayResize(g_ord, SINYAL_MAX_ORDERS);
+   FillAccountStatics();
 
    g_qpc_freq = SinyalQpcFrequency();
    if(g_qpc_freq == 0) g_qpc_freq = 1;
@@ -578,11 +588,24 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
   {
    if(g_handle == 0) return;
 
+   // BURADA KİMLİK ARAMASI YAPILMAZ.
+   //
+   // Önceki sürüm `request_id`'yi 256 elemanlı bir tabloda doğrusal olarak
+   // arıyordu. Bu, terminalin 1024'lük işlem kuyruğunu geciktirir ve kuyruk
+   // taştığında ESKİ işlemler sessizce ezilir — yani emir olayı kaybedilir.
+   //
+   // İzin verilen işlem sınıfı: alan kopyalama, QPC okuma, halkaya tek push.
+   // YASAK: History*Select, OrderSelect, PositionSelect, SymbolInfo*, Print,
+   // string işlemleri, tablo taraması.
+   //
+   // `client_id` eşleştirmesi ÇEKİRDEKTE geç bağlamayla yapılır:
+   // client_id ↔ request_id ↔ order ↔ position tablosu üzerinden.
    SinyalRes r;
-   r.client_id        = LookupClientId(result.request_id);
+   r.client_id        = 0;               // çekirdek dolduracak
    r.order            = trans.order;
    r.deal             = trans.deal;
    r.position         = trans.position;
+   r.position_by      = trans.position_by;
    r.volume           = trans.volume;
    r.price            = trans.price;
    r.bid              = 0.0;
@@ -591,46 +614,211 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    r.retcode          = (uint)result.retcode;
    r.retcode_external = (uint)result.retcode_external;
    r.request_id       = (uint)result.request_id;
+   r.reserved0        = 0;
    r.kind             = SINYAL_RES_TRADE_TXN;
    r.txn_type         = (uchar)trans.type;
-   ArrayInitialize(r.reserved0, 0);
-   // MqlTradeTransaction'da 'comment' alanı YOKTUR (derleyici doğruladı).
-   // Yorum yalnızca MqlTradeResult'ta bulunur ve pratikte yalnızca
-   // TRADE_TRANSACTION_REQUEST olayında doludur; diğerlerinde boş gelir.
-   SinyalWriteFixed(r.comment, SINYAL_COMMENT_LEN, result.comment);
+   r.order_state      = (uchar)trans.order_state;
+   r.deal_type        = (uchar)trans.deal_type;
+   r.order_type       = (uchar)trans.order_type;
+   r.source           = SINYAL_RESSRC_LIVE;
+   ArrayInitialize(r.reserved1, 0);
+   ArrayInitialize(r.reserved2, 0);
 
-   SinyalPushRes(g_handle, r);
+   // MqlTradeTransaction'da 'comment' alanı YOKTUR; yorum yalnızca
+   // MqlTradeResult'ta ve pratikte yalnızca REQUEST olayında doludur.
+   // Diğer olaylarda yazmak boşuna iş — sıcak yolda bundan kaçınıyoruz.
+   if(trans.type == TRADE_TRANSACTION_REQUEST)
+      SinyalWriteFixed(r.comment, SINYAL_COMMENT_LEN, result.comment);
+   else
+      ArrayInitialize(r.comment, 0);
+
+   if(SinyalPushRes(g_handle, r) != SINYAL_OK)
+      g_res_dropped++;
   }
 
 //+------------------------------------------------------------------+
-//| request_id -> client_id araması.                                  |
+//| Hesabın DEĞİŞMEYEN alanlarını doldur — YALNIZCA OnInit'te.        |
+//|                                                                  |
+//| String dönüşümleri pahalıdır ve sıcak yolda yeri yoktur. Hesap    |
+//| değişirse MT5 zaten OnDeinit/OnInit'i yeniden çalıştırır (REASON_ |
+//| ACCOUNT), yani önbellek geçerliliğini korur.                      |
 //+------------------------------------------------------------------+
-ulong LookupClientId(const ulong request_id)
+void FillAccountStatics()
   {
-   if(request_id == 0) return 0;
-   for(int i = 0; i < g_req_count; i++)
-      if(g_req_id[i] == request_id)
-         return g_req_client[i];
-   return 0;   // bizim göndermediğimiz bir işlem (ör. elle kapatma)
+   ZeroMemory(g_acc);
+   g_acc.login           = AccountInfoInteger(ACCOUNT_LOGIN);
+   g_acc.leverage        = AccountInfoInteger(ACCOUNT_LEVERAGE);
+   g_acc.limit_orders    = (int)AccountInfoInteger(ACCOUNT_LIMIT_ORDERS);
+   g_acc.currency_digits = (int)AccountInfoInteger(ACCOUNT_CURRENCY_DIGITS);
+   g_acc.trade_mode      = SinyalMapTradeMode(AccountInfoInteger(ACCOUNT_TRADE_MODE));
+   g_acc.margin_mode     = SinyalMapMarginMode(AccountInfoInteger(ACCOUNT_MARGIN_MODE));
+   g_acc.so_mode         = SinyalMapSoMode(AccountInfoInteger(ACCOUNT_MARGIN_SO_MODE));
+   g_acc.fifo_close      = (uchar)(AccountInfoInteger(ACCOUNT_FIFO_CLOSE) ? 1 : 0);
+   g_acc.hedge_allowed   = (uchar)(AccountInfoInteger(ACCOUNT_HEDGE_ALLOWED) ? 1 : 0);
+   g_acc.margin_so_call  = AccountInfoDouble(ACCOUNT_MARGIN_SO_CALL);
+   g_acc.margin_so_so    = AccountInfoDouble(ACCOUNT_MARGIN_SO_SO);
+
+   SinyalWriteFixed(g_acc.currency, 16, AccountInfoString(ACCOUNT_CURRENCY));
+   SinyalWriteFixed(g_acc.server,   64, AccountInfoString(ACCOUNT_SERVER));
+   SinyalWriteFixed(g_acc.company,  96, AccountInfoString(ACCOUNT_COMPANY));
+   SinyalWriteFixed(g_acc.name,     96, AccountInfoString(ACCOUNT_NAME));
+   ArrayInitialize(g_acc.reserved0, 0);
+   ArrayInitialize(g_acc.reserved1, 0);
+
+   PrintFormat("Sinyal: hesap #%I64d @ %s (%s) — mod=%s, marjin=%s, kaldirac=1:%I64d",
+               g_acc.login,
+               AccountInfoString(ACCOUNT_SERVER),
+               AccountInfoString(ACCOUNT_CURRENCY),
+               (g_acc.trade_mode == SINYAL_TRADEMODE_DEMO ? "DEMO"
+                : g_acc.trade_mode == SINYAL_TRADEMODE_CONTEST ? "YARISMA"
+                : g_acc.trade_mode == SINYAL_TRADEMODE_REAL ? "GERCEK" : "BILINMIYOR"),
+               (g_acc.margin_mode == SINYAL_MARGINMODE_HEDGING ? "hedging"
+                : g_acc.margin_mode == SINYAL_MARGINMODE_NETTING ? "netting"
+                : g_acc.margin_mode == SINYAL_MARGINMODE_EXCHANGE ? "exchange" : "bilinmiyor"),
+               g_acc.leverage);
+   if(g_acc.trade_mode != SINYAL_TRADEMODE_DEMO)
+      Print("Sinyal: DIKKAT — bu hesap DEMO DEGIL. Cekirdek canli-para kilidi devrede.");
   }
 
-void RememberRequest(const ulong request_id, const ulong client_id)
+//+------------------------------------------------------------------+
+//| Hesabın DEĞİŞEN alanlarını tazele (saniyede bir).                 |
+//+------------------------------------------------------------------+
+void RefreshAccountDynamics()
   {
-   if(request_id == 0) return;
-   int cap = ArraySize(g_req_id);
-   if(g_req_count >= cap)
+   g_acc.time_msc           = (long)TimeCurrent() * 1000;
+   g_acc.balance            = AccountInfoDouble(ACCOUNT_BALANCE);
+   g_acc.credit             = AccountInfoDouble(ACCOUNT_CREDIT);
+   g_acc.profit             = AccountInfoDouble(ACCOUNT_PROFIT);
+   g_acc.equity             = AccountInfoDouble(ACCOUNT_EQUITY);
+   g_acc.margin             = AccountInfoDouble(ACCOUNT_MARGIN);
+   g_acc.margin_free        = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   g_acc.margin_level       = AccountInfoDouble(ACCOUNT_MARGIN_LEVEL);
+   g_acc.margin_initial     = AccountInfoDouble(ACCOUNT_MARGIN_INITIAL);
+   g_acc.margin_maintenance = AccountInfoDouble(ACCOUNT_MARGIN_MAINTENANCE);
+   g_acc.assets             = AccountInfoDouble(ACCOUNT_ASSETS);
+   g_acc.liabilities        = AccountInfoDouble(ACCOUNT_LIABILITIES);
+   g_acc.commission_blocked = AccountInfoDouble(ACCOUNT_COMMISSION_BLOCKED);
+
+   // Emir kapısının dayanağı olan dört izin + bağlantı.
+   g_acc.trade_allowed          = (uchar)(AccountInfoInteger(ACCOUNT_TRADE_ALLOWED) ? 1 : 0);
+   g_acc.trade_expert           = (uchar)(AccountInfoInteger(ACCOUNT_TRADE_EXPERT) ? 1 : 0);
+   g_acc.terminal_trade_allowed = (uchar)(TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) ? 1 : 0);
+   g_acc.mql_trade_allowed      = (uchar)(MQLInfoInteger(MQL_TRADE_ALLOWED) ? 1 : 0);
+   g_acc.connected              = (uchar)(TerminalInfoInteger(TERMINAL_CONNECTED) ? 1 : 0);
+  }
+
+//+------------------------------------------------------------------+
+//| Açık pozisyonları ve bekleyen emirleri topla, durumu yayımla.     |
+//|                                                                  |
+//| Numaralandırma GERİYE doğru yapılır: liste tam o sırada değişirse |
+//| ileri yönde indeks kayar ve kayıt atlanır. Bilet alınamayan slot  |
+//| 'unstable' işaretlenir ama tarama DURDURULMAZ (break değil        |
+//| continue) — tek bir kararsız kayıt yüzünden tüm listeyi kaybetmek |
+//| daha kötü olurdu.                                                 |
+//|                                                                  |
+//| Bu fonksiyon terminal-YEREL okuma yapar (sunucu gidiş-dönüşü yok),|
+//| bu yüzden 1 Hz güvenlidir. HistorySelect BURADA ÇAĞRILMAZ.        |
+//+------------------------------------------------------------------+
+void PublishState()
+  {
+   RefreshAccountDynamics();
+
+   bool unstable = false;
+
+   // --- pozisyonlar ---
+   int pos_total = PositionsTotal();
+   int pw = 0;
+   for(int i = pos_total - 1; i >= 0 && pw < SINYAL_MAX_POSITIONS; i--)
      {
-      // Halka gibi kullan: en eskiyi at. Eski istekler zaten sonuçlanmıştır.
-      for(int i = 1; i < cap; i++)
-        {
-         g_req_id[i - 1]     = g_req_id[i];
-         g_req_client[i - 1] = g_req_client[i];
-        }
-      g_req_count = cap - 1;
+      ulong tk = PositionGetTicket(i);
+      if(tk == 0) { unstable = true; continue; }
+      if(!PositionSelectByTicket(tk)) { unstable = true; continue; }
+
+      string sym = PositionGetString(POSITION_SYMBOL);
+      SinyalPosition p;
+      ZeroMemory(p);
+      p.ticket          = tk;
+      p.identifier      = (ulong)PositionGetInteger(POSITION_IDENTIFIER);
+      p.magic           = (ulong)PositionGetInteger(POSITION_MAGIC);
+      p.time_msc        = (long)PositionGetInteger(POSITION_TIME_MSC);
+      p.time_update_msc = (long)PositionGetInteger(POSITION_TIME_UPDATE_MSC);
+      p.volume          = PositionGetDouble(POSITION_VOLUME);
+      p.price_open      = PositionGetDouble(POSITION_PRICE_OPEN);
+      p.price_current   = PositionGetDouble(POSITION_PRICE_CURRENT);
+      p.sl              = PositionGetDouble(POSITION_SL);
+      p.tp              = PositionGetDouble(POSITION_TP);
+      p.profit          = PositionGetDouble(POSITION_PROFIT);
+      p.swap            = PositionGetDouble(POSITION_SWAP);
+      p.kind            = (uchar)PositionGetInteger(POSITION_TYPE);
+      p.reason          = (uchar)PositionGetInteger(POSITION_REASON);
+      p.digits          = (uchar)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+      p.flags           = 0;
+      if(StringLen(sym) >= SINYAL_SYMBOL_NAME_LEN) p.flags |= SINYAL_RECFLAG_SYMBOL_TRUNC;
+      SinyalWriteFixed(p.symbol,  SINYAL_SYMBOL_NAME_LEN,  sym);
+      SinyalWriteFixed(p.comment, SINYAL_REC_COMMENT_LEN, PositionGetString(POSITION_COMMENT));
+      ArrayInitialize(p.reserved0, 0);
+      g_pos[pw++] = p;
      }
-   g_req_id[g_req_count]     = request_id;
-   g_req_client[g_req_count] = client_id;
-   g_req_count++;
+
+   // --- bekleyen emirler ---
+   int ord_total = OrdersTotal();
+   int ow = 0;
+   for(int i = ord_total - 1; i >= 0 && ow < SINYAL_MAX_ORDERS; i--)
+     {
+      ulong tk = OrderGetTicket(i);
+      if(tk == 0) { unstable = true; continue; }
+
+      string sym = OrderGetString(ORDER_SYMBOL);
+      SinyalOrder o;
+      ZeroMemory(o);
+      o.ticket          = tk;
+      o.magic           = (ulong)OrderGetInteger(ORDER_MAGIC);
+      o.position_id     = (ulong)OrderGetInteger(ORDER_POSITION_ID);
+      o.time_setup_msc  = (long)OrderGetInteger(ORDER_TIME_SETUP_MSC);
+      o.time_expiration = (long)OrderGetInteger(ORDER_TIME_EXPIRATION);
+      o.volume_initial  = OrderGetDouble(ORDER_VOLUME_INITIAL);
+      o.volume_current  = OrderGetDouble(ORDER_VOLUME_CURRENT);
+      o.price_open      = OrderGetDouble(ORDER_PRICE_OPEN);
+      o.price_stoplimit = OrderGetDouble(ORDER_PRICE_STOPLIMIT);
+      o.sl              = OrderGetDouble(ORDER_SL);
+      o.tp              = OrderGetDouble(ORDER_TP);
+      o.price_current   = OrderGetDouble(ORDER_PRICE_CURRENT);
+      o.kind            = (uchar)OrderGetInteger(ORDER_TYPE);
+      o.state           = (uchar)OrderGetInteger(ORDER_STATE);
+      o.type_time       = (uchar)OrderGetInteger(ORDER_TYPE_TIME);
+      o.type_filling    = (uchar)OrderGetInteger(ORDER_TYPE_FILLING);
+      o.reason          = (uchar)OrderGetInteger(ORDER_REASON);
+      o.digits          = (uchar)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+      o.flags           = 0;
+      if(StringLen(sym) >= SINYAL_SYMBOL_NAME_LEN) o.flags |= SINYAL_RECFLAG_SYMBOL_TRUNC;
+      SinyalWriteFixed(o.symbol,  SINYAL_SYMBOL_NAME_LEN,  sym);
+      SinyalWriteFixed(o.comment, SINYAL_REC_COMMENT_LEN, OrderGetString(ORDER_COMMENT));
+      ArrayInitialize(o.reserved0, 0);
+      g_ord[ow++] = o;
+     }
+
+   int rc = SinyalSetState(g_handle, g_acc,
+                           g_pos, pw, pos_total,
+                           g_ord, ow, ord_total,
+                           (long)TimeCurrent() * 1000,
+                           (uchar)(unstable ? 1 : 0));
+   if(rc == SINYAL_OK) g_state_pubs++;
+   else                g_state_errs++;
+
+   if(pos_total > SINYAL_MAX_POSITIONS || ord_total > SINYAL_MAX_ORDERS)
+      PrintFormat("Sinyal: UYARI — durum listesi KESILDI (pozisyon %d/%d, emir %d/%d)",
+                  pw, pos_total, ow, ord_total);
+  }
+
+//+------------------------------------------------------------------+
+//| OnTrade — durum değişti, bir sonraki timer'da hemen yayımla.      |
+//|                                                                  |
+//| Olay-güdümlü + heartbeat hibrit: emir/pozisyon değişimi anında    |
+//| yakalanır, ayrıca saniyede bir düzenli yayın yapılır.             |
+//+------------------------------------------------------------------+
+void OnTrade()
+  {
+   g_state_dirty = true;
   }
 
 //+------------------------------------------------------------------+
@@ -643,10 +831,13 @@ void PushRejection(const ulong client_id, const string why)
    r.order = 0; r.deal = 0; r.position = 0;
    r.volume = 0.0; r.price = 0.0; r.bid = 0.0; r.ask = 0.0;
    r.recv_qpc = SinyalQpc();
-   r.retcode = 0; r.retcode_external = 0; r.request_id = 0;
+   r.retcode = 0; r.retcode_external = 0; r.request_id = 0; r.reserved0 = 0;
+   r.position_by = 0;
    r.kind = SINYAL_RES_REJECTED;
-   r.txn_type = 0;
-   ArrayInitialize(r.reserved0, 0);
+   r.txn_type = 0; r.order_state = 0; r.deal_type = 0; r.order_type = 0;
+   r.source = SINYAL_RESSRC_LIVE;
+   ArrayInitialize(r.reserved1, 0);
+   ArrayInitialize(r.reserved2, 0);
    SinyalWriteFixed(r.comment, SINYAL_COMMENT_LEN, why);
    SinyalPushRes(g_handle, r);
    g_cmds_rejected++;
@@ -784,7 +975,6 @@ void ExecuteCmd(const SinyalCmd &cmd)
    // OrderSendAsync: çağıranı bloklamaz. Gerçek sonuç OnTradeTransaction'dan
    // gelir; buradaki retcode yalnızca "kuyruğa alındı" demektir.
    bool sent = OrderSendAsync(req, res);
-   RememberRequest(res.request_id, cmd.client_id);
 
    SinyalRes ack;
    ack.client_id        = cmd.client_id;
@@ -799,9 +989,16 @@ void ExecuteCmd(const SinyalCmd &cmd)
    ack.retcode          = (uint)res.retcode;
    ack.retcode_external = (uint)res.retcode_external;
    ack.request_id       = (uint)res.request_id;
+   ack.reserved0        = 0;
+   ack.position_by      = 0;
    ack.kind             = SINYAL_RES_SEND_ACK;
    ack.txn_type         = 0;
-   ArrayInitialize(ack.reserved0, 0);
+   ack.order_state      = 0;
+   ack.deal_type        = 0;
+   ack.order_type       = cmd.order_type;
+   ack.source           = SINYAL_RESSRC_LIVE;
+   ArrayInitialize(ack.reserved1, 0);
+   ArrayInitialize(ack.reserved2, 0);
    SinyalWriteFixed(ack.comment, SINYAL_COMMENT_LEN, res.comment);
    SinyalPushRes(g_handle, ack);
 

@@ -38,6 +38,14 @@ int   SinyalPushBook(long h, uint symbol_id, long time_msc,
                      const uchar &kinds[], int depth);
 int   SinyalSetSymbols(long h, const SinyalSymbolEntry &entries[], int count);
 
+// Hesap + acik pozisyonlar + bekleyen emirler (durum, akis degil).
+// DIKKAT: MQL5'te sifir uzunluklu dizinin tampon adresi TANIMSIZDIR.
+// Diziler daima en az 1 elemanli ayrilmali; gercek sayi npos/nord ile gecer.
+int   SinyalSetState(long h, const SinyalAccount &acc,
+                     const SinyalPosition &positions[], int npos, int pos_total,
+                     const SinyalOrder &orders[], int nord, int ord_total,
+                     long built_at_msc, uchar unstable);
+
 // Emirler
 int   SinyalPopCmd(long h, SinyalCmd &cmd);
 int   SinyalPushRes(long h, const SinyalRes &res);
@@ -62,6 +70,9 @@ ulong SinyalTickBacklog(long h);
 #define SINYAL_WHAT_CMD           4
 #define SINYAL_WHAT_RES           5
 #define SINYAL_WHAT_SYMBOLENTRY   6
+#define SINYAL_WHAT_ACCOUNT       7
+#define SINYAL_WHAT_POSITION      8
+#define SINYAL_WHAT_ORDER         9
 #define SINYAL_WHAT_PROTOVERSION  100
 
 //+------------------------------------------------------------------+
@@ -125,9 +136,9 @@ bool SinyalVerifyLayout(string &problem)
       return false;
      }
 
-   int    want[6];
-   int    what[6];
-   string name[6];
+   int    want[9];
+   int    what[9];
+   string name[9];
 
    what[0] = SINYAL_WHAT_TICK;         want[0] = SINYAL_SIZEOF_TICK;         name[0] = "SinyalTick";
    what[1] = SINYAL_WHAT_BOOKLEVEL;    want[1] = SINYAL_SIZEOF_BOOKLEVEL;    name[1] = "SinyalBookLevel";
@@ -135,8 +146,11 @@ bool SinyalVerifyLayout(string &problem)
    what[3] = SINYAL_WHAT_CMD;          want[3] = SINYAL_SIZEOF_CMD;          name[3] = "SinyalCmd";
    what[4] = SINYAL_WHAT_RES;          want[4] = SINYAL_SIZEOF_RES;          name[4] = "SinyalRes";
    what[5] = SINYAL_WHAT_SYMBOLENTRY;  want[5] = SINYAL_SIZEOF_SYMBOLENTRY;  name[5] = "SinyalSymbolEntry";
+   what[6] = SINYAL_WHAT_ACCOUNT;      want[6] = SINYAL_SIZEOF_ACCOUNT;      name[6] = "SinyalAccount";
+   what[7] = SINYAL_WHAT_POSITION;     want[7] = SINYAL_SIZEOF_POSITION;     name[7] = "SinyalPosition";
+   what[8] = SINYAL_WHAT_ORDER;        want[8] = SINYAL_SIZEOF_ORDER;        name[8] = "SinyalOrder";
 
-   for(int i = 0; i < 6; i++)
+   for(int i = 0; i < 9; i++)
      {
       int dll_size = SinyalSizeof(what[i]);
       if(dll_size != want[i])
@@ -155,13 +169,19 @@ bool SinyalVerifyLayout(string &problem)
    SinyalCmd         c;
    SinyalRes         r;
    SinyalSymbolEntry se;
+   SinyalAccount     ac;
+   SinyalPosition    po;
+   SinyalOrder       od;
 
    if(sizeof(t) != SINYAL_SIZEOF_TICK ||
       sizeof(bl) != SINYAL_SIZEOF_BOOKLEVEL ||
       sizeof(bk) != SINYAL_SIZEOF_BOOK ||
       sizeof(c) != SINYAL_SIZEOF_CMD ||
       sizeof(r) != SINYAL_SIZEOF_RES ||
-      sizeof(se) != SINYAL_SIZEOF_SYMBOLENTRY)
+      sizeof(se) != SINYAL_SIZEOF_SYMBOLENTRY ||
+      sizeof(ac) != SINYAL_SIZEOF_ACCOUNT ||
+      sizeof(po) != SINYAL_SIZEOF_POSITION ||
+      sizeof(od) != SINYAL_SIZEOF_ORDER)
      {
       problem = StringFormat(
          "MQL5 derleyicisinin ürettiği yerleşim başlıktan farklı "
@@ -278,6 +298,60 @@ bool SinyalMapTypeTime(uchar wire, ENUM_ORDER_TYPE_TIME &out)
       case SINYAL_TIME_SPECIFIED_DAY: out = ORDER_TIME_SPECIFIED_DAY; return true;
      }
    return false;
+  }
+
+//+------------------------------------------------------------------+
+//| ACCOUNT_TRADE_MODE -> wire degeri.                                |
+//|                                                                  |
+//| MT5'in ham int'i TELE YAZILMAZ: bu enum'un sayisal degerleri      |
+//| resmi dokumanda YAYINLANMIYOR (yalnizca identifier veriliyor).    |
+//| Tanimadigimiz bir deger gelirse UNKNOWN yazariz ve cekirdek onu   |
+//| GERCEK HESAP gibi ele alir — okunamayan hesabi demo saymak,       |
+//| canli hesapta kazara emir gondermek demektir.                     |
+//+------------------------------------------------------------------+
+uchar SinyalMapTradeMode(long raw)
+  {
+   switch((ENUM_ACCOUNT_TRADE_MODE)raw)
+     {
+      case ACCOUNT_TRADE_MODE_DEMO:    return SINYAL_TRADEMODE_DEMO;
+      case ACCOUNT_TRADE_MODE_CONTEST: return SINYAL_TRADEMODE_CONTEST;
+      case ACCOUNT_TRADE_MODE_REAL:    return SINYAL_TRADEMODE_REAL;
+     }
+   return SINYAL_TRADEMODE_UNKNOWN;
+  }
+
+//+------------------------------------------------------------------+
+//| ACCOUNT_MARGIN_MODE -> wire degeri.                               |
+//|                                                                  |
+//| Hedging'de pozisyon kapatma/degistirme ticket ZORUNLU; netting'de |
+//| sembol yeter. Cekirdek bu bilgiye gore komutu dogrular.           |
+//+------------------------------------------------------------------+
+uchar SinyalMapMarginMode(long raw)
+  {
+   switch((ENUM_ACCOUNT_MARGIN_MODE)raw)
+     {
+      case ACCOUNT_MARGIN_MODE_RETAIL_NETTING: return SINYAL_MARGINMODE_NETTING;
+      case ACCOUNT_MARGIN_MODE_EXCHANGE:       return SINYAL_MARGINMODE_EXCHANGE;
+      case ACCOUNT_MARGIN_MODE_RETAIL_HEDGING: return SINYAL_MARGINMODE_HEDGING;
+     }
+   return SINYAL_MARGINMODE_UNKNOWN;
+  }
+
+//+------------------------------------------------------------------+
+//| ACCOUNT_MARGIN_SO_MODE -> wire degeri.                            |
+//|                                                                  |
+//| margin_so_call / margin_so_so degerlerinin BIRIMINI belirler:     |
+//| yuzde mi hesap para birimi mi. Karistirmak marjin hesabini        |
+//| tamamen yanlis yapar.                                             |
+//+------------------------------------------------------------------+
+uchar SinyalMapSoMode(long raw)
+  {
+   switch((ENUM_ACCOUNT_STOPOUT_MODE)raw)
+     {
+      case ACCOUNT_STOPOUT_MODE_PERCENT: return SINYAL_SOMODE_PERCENT;
+      case ACCOUNT_STOPOUT_MODE_MONEY:   return SINYAL_SOMODE_MONEY;
+     }
+   return SINYAL_SOMODE_UNKNOWN;
   }
 
 //+------------------------------------------------------------------+

@@ -13,20 +13,26 @@
 #property strict
 
 //--- yerleşim sürümü (Rust: ring::RING_VERSION)
-#define SINYAL_PROTO_VERSION        2
+#define SINYAL_PROTO_VERSION        3
 
 //--- boyut sınırları
 #define SINYAL_MAX_BOOK_DEPTH       32
 #define SINYAL_COMMENT_LEN          32
 #define SINYAL_SYMBOL_NAME_LEN      32
+#define SINYAL_REC_COMMENT_LEN      32
+#define SINYAL_MAX_POSITIONS        512
+#define SINYAL_MAX_ORDERS           512
 
 //--- beklenen yapı boyutları (EA açılışta DLL ile karşılaştırır)
 #define SINYAL_SIZEOF_TICK          56
 #define SINYAL_SIZEOF_BOOKLEVEL     24
 #define SINYAL_SIZEOF_BOOK          824
 #define SINYAL_SIZEOF_CMD           184
-#define SINYAL_SIZEOF_RES           120
+#define SINYAL_SIZEOF_RES           184
 #define SINYAL_SIZEOF_SYMBOLENTRY   192
+#define SINYAL_SIZEOF_ACCOUNT       512
+#define SINYAL_SIZEOF_POSITION      192
+#define SINYAL_SIZEOF_ORDER         192
 
 //--- mesaj türü (Tick.kind / Book.kind)
 #define SINYAL_KIND_TICK                1
@@ -91,6 +97,34 @@
 #define SINYAL_SYMFLAG_BOOK_SUBSCRIBED  1
 #define SINYAL_SYMFLAG_READY            2
 #define SINYAL_SYMFLAG_POLLED_ONLY      4
+
+//--- Res.source: canli olay mi, mutabakat telafisi mi
+#define SINYAL_RESSRC_LIVE              0
+#define SINYAL_RESSRC_RECONCILE         1
+
+//--- ACCOUNT_TRADE_MODE karsiligi.
+//    MT5'in ham int'i TELE YAZILMAZ: sayisal degerleri resmi dokumanda
+//    YAYINLANMIYOR. EA switch/case ile bu degerlere cevirir; tanimadigi
+//    degerde UNKNOWN yazar ve cekirdek UNKNOWN'i GERCEK HESAP gibi ele alir.
+#define SINYAL_TRADEMODE_DEMO           0
+#define SINYAL_TRADEMODE_CONTEST        1
+#define SINYAL_TRADEMODE_REAL           2
+#define SINYAL_TRADEMODE_UNKNOWN        255
+
+//--- ACCOUNT_MARGIN_MODE karsiligi (hedging'de kapatma ticket ister)
+#define SINYAL_MARGINMODE_NETTING       0
+#define SINYAL_MARGINMODE_EXCHANGE      1
+#define SINYAL_MARGINMODE_HEDGING       2
+#define SINYAL_MARGINMODE_UNKNOWN       255
+
+//--- ACCOUNT_MARGIN_SO_MODE: so_call/so_so BIRIMI
+#define SINYAL_SOMODE_PERCENT           0
+#define SINYAL_SOMODE_MONEY             1
+#define SINYAL_SOMODE_UNKNOWN           255
+
+//--- pozisyon/emir kaydi flags bitleri
+#define SINYAL_RECFLAG_SYMBOL_TRUNC     1
+#define SINYAL_RECFLAG_COMMENT_TRUNC    2
 
 //--- geçerlilik süresi (MT5 ENUM_ORDER_TYPE_TIME ile birebir)
 #define SINYAL_TIME_GTC                 0
@@ -187,7 +221,7 @@ struct SinyalCmd
   };
 
 //+------------------------------------------------------------------+
-//| EA'dan çekirdeğe emir sonucu / ticaret olayı. 120 bayt.           |
+//| EA'dan çekirdeğe emir sonucu / ticaret olayı. 184 bayt.           |
 //|                                                                  |
 //| OrderSendAsync İKİ aşamalı geri bildirim üretir:                  |
 //|   SEND_ACK  → sunucu isteği kuyruğa aldı (henüz DOLMADI)          |
@@ -198,22 +232,29 @@ struct SinyalCmd
 //+------------------------------------------------------------------+
 struct SinyalRes
   {
-   ulong             client_id;      // +0
+   ulong             client_id;      // +0   EA 0 birakir, cekirdek doldurur
    ulong             order;          // +8
    ulong             deal;           // +16
    ulong             position;       // +24
-   double            volume;         // +32
-   double            price;          // +40
-   double            bid;            // +48
-   double            ask;            // +56
-   ulong             recv_qpc;       // +64
-   uint              retcode;        // +72  SEND_ACK'te 10008 = PLACED (DOLMADI!)
-   uint              retcode_external; // +76
-   uint              request_id;     // +80  SEND_ACK <-> TRADE_TXN bagi
-   uchar             kind;           // +84  SINYAL_RES_*
-   uchar             txn_type;       // +85  ENUM_TRADE_TRANSACTION_TYPE
-   uchar             reserved0[2];   // +86  dolgu
-   uchar             comment[SINYAL_COMMENT_LEN]; // +88
+   ulong             position_by;    // +32  CLOSE_BY karsi pozisyon
+   double            volume;         // +40
+   double            price;          // +48
+   double            bid;            // +56
+   double            ask;            // +64
+   ulong             recv_qpc;       // +72
+   uint              retcode;        // +80  SEND_ACK'te 10008 = PLACED (DOLMADI!)
+   uint              retcode_external; // +84
+   uint              request_id;     // +88  SEND_ACK <-> TRADE_TXN bagi
+   uint              reserved0;      // +92  dolgu
+   uchar             comment[SINYAL_COMMENT_LEN]; // +96 (yalniz REQUEST'te dolu)
+   uchar             kind;           // +128 SINYAL_RES_*
+   uchar             txn_type;       // +129 ENUM_TRADE_TRANSACTION_TYPE
+   uchar             order_state;    // +130 ENUM_ORDER_STATE
+   uchar             deal_type;      // +131 ENUM_DEAL_TYPE
+   uchar             order_type;     // +132 ENUM_ORDER_TYPE
+   uchar             source;         // +133 SINYAL_RESSRC_*
+   uchar             reserved1[2];   // +134
+   uchar             reserved2[48];  // +136
   };
 
 //+------------------------------------------------------------------+
@@ -250,4 +291,121 @@ struct SinyalSymbolEntry
    uint              reserved0;      // +108 dolgu
    uchar             name[SINYAL_SYMBOL_NAME_LEN]; // +112
    uchar             reserved1[48];  // +144 gelecekte alan eklemek için
+  };
+
+//+------------------------------------------------------------------+
+//| Hesap durumu. 512 bayt.                                        |
+//|                                                                  |
+//| String alanlar YALNIZCA OnInit'te doldurulur; sicak yolda string  |
+//| donusumu yapilmaz. Sayisal alanlar saniyede bir tazelenir.        |
+//|                                                                  |
+//| trade_mode CANLI PARA KILIDININ dayanagidir. MT5'in ham int'i     |
+//| TELE YAZILMAZ — EA switch/case ile SINYAL_TRADEMODE_* degerlerine |
+//| cevirir, tanimadigi degerde UNKNOWN(255) yazar. Cekirdek UNKNOWN'i|
+//| GERCEK HESAP gibi ele alir (emniyetli taraf).                     |
+//|                                                                  |
+//| margin_so_call/so_so BIRIMI so_mode'a baglidir (yuzde mi para mi).|
+//+------------------------------------------------------------------+
+struct SinyalAccount
+  {
+   long              time_msc;              // +0
+   double            balance;               // +8
+   double            credit;                // +16
+   double            profit;                // +24
+   double            equity;                // +32
+   double            margin;                // +40
+   double            margin_free;           // +48
+   double            margin_level;          // +56
+   double            margin_so_call;        // +64
+   double            margin_so_so;          // +72
+   double            margin_initial;        // +80
+   double            margin_maintenance;    // +88
+   double            assets;                // +96
+   double            liabilities;           // +104
+   double            commission_blocked;    // +112
+   long              login;                 // +120
+   long              leverage;              // +128
+   int               limit_orders;          // +136
+   int               currency_digits;       // +140
+   uchar             trade_mode;            // +144 SINYAL_TRADEMODE_*
+   uchar             margin_mode;           // +145 SINYAL_MARGINMODE_*
+   uchar             so_mode;               // +146 SINYAL_SOMODE_*
+   uchar             trade_allowed;         // +147 ACCOUNT_TRADE_ALLOWED
+   uchar             trade_expert;          // +148 ACCOUNT_TRADE_EXPERT
+   uchar             terminal_trade_allowed;// +149 TERMINAL_TRADE_ALLOWED
+   uchar             mql_trade_allowed;     // +150 MQL_TRADE_ALLOWED
+   uchar             connected;             // +151 TERMINAL_CONNECTED
+   uchar             fifo_close;            // +152
+   uchar             hedge_allowed;         // +153
+   uchar             str_truncated;         // +154
+   uchar             reserved0[5];          // +155
+   uchar             currency[16];          // +160
+   uchar             server[64];            // +176
+   uchar             company[96];           // +240
+   uchar             name[96];              // +336
+   uchar             reserved1[80];         // +432
+  };
+
+//+------------------------------------------------------------------+
+//| Acik pozisyon. 192 bayt.                                      |
+//|                                                                  |
+//| ticket : emir gonderiminde kullanilacak anahtar                   |
+//| identifier: gecmis/deal eslestirme anahtari — KAPATMA komutunda   |
+//|             ticket kullanilir, identifier DEGIL                   |
+//| POSITION_COMMISSION alani YOKTUR: MT5'te kullanimdan kalkti ve    |
+//| daima 0 doner; komisyon yalnizca kapanista DEAL_COMMISSION'dan.   |
+//+------------------------------------------------------------------+
+struct SinyalPosition
+  {
+   ulong             ticket;         // +0   POSITION_TICKET
+   ulong             identifier;     // +8   POSITION_IDENTIFIER
+   ulong             magic;          // +16  POSITION_MAGIC (= client_id)
+   long              time_msc;       // +24  POSITION_TIME_MSC
+   long              time_update_msc;// +32  POSITION_TIME_UPDATE_MSC
+   double            volume;         // +40
+   double            price_open;     // +48
+   double            price_current;  // +56
+   double            sl;             // +64
+   double            tp;             // +72
+   double            profit;         // +80
+   double            swap;           // +88
+   uchar             symbol[SINYAL_SYMBOL_NAME_LEN]; // +96
+   uchar             comment[SINYAL_REC_COMMENT_LEN]; // +128
+   uchar             kind;           // +160 0=BUY 1=SELL
+   uchar             reason;         // +161 ENUM_POSITION_REASON
+   uchar             digits;         // +162
+   uchar             flags;          // +163 SINYAL_RECFLAG_*
+   uchar             reserved0[28];  // +164
+  };
+
+//+------------------------------------------------------------------+
+//| Bekleyen emir. 192 bayt.                                         |
+//|                                                                  |
+//| volume_current KALAN hacimdir; dolan = initial - current.         |
+//| time_expiration SANIYE cinsindendir (ms varyanti yok).            |
+//+------------------------------------------------------------------+
+struct SinyalOrder
+  {
+   ulong             ticket;         // +0   ORDER_TICKET
+   ulong             magic;          // +8   ORDER_MAGIC (= client_id)
+   ulong             position_id;    // +16  ORDER_POSITION_ID
+   long              time_setup_msc; // +24
+   long              time_expiration;// +32  SANIYE, 0 = suresiz
+   double            volume_initial; // +40
+   double            volume_current; // +48  KALAN
+   double            price_open;     // +56
+   double            price_stoplimit;// +64
+   double            sl;             // +72
+   double            tp;             // +80
+   double            price_current;  // +88
+   uchar             symbol[SINYAL_SYMBOL_NAME_LEN]; // +96
+   uchar             comment[SINYAL_REC_COMMENT_LEN]; // +128
+   uchar             kind;           // +160 ENUM_ORDER_TYPE
+   uchar             state;          // +161 ENUM_ORDER_STATE
+   uchar             type_time;      // +162
+   uchar             type_filling;   // +163
+   uchar             reason;         // +164 ENUM_ORDER_REASON
+   uchar             digits;         // +165
+   uchar             flags;          // +166
+   uchar             reserved0[25];  // +167
   };

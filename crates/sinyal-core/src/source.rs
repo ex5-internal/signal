@@ -19,6 +19,7 @@ use sinyal_proto::{book_type, Cmd, Tick};
 use sinyal_shm::{qpc, qpc_delta_nanos};
 use tokio::sync::broadcast;
 
+use crate::join::OrderJoin;
 use crate::state::{LastTick, Registry};
 
 /// Abonelere yayılan olay.
@@ -66,6 +67,12 @@ pub struct ReaderStats {
     pub ea_tick_loss: u64,
     /// Okunmayı bekleyen tick sayısı — biz mi geride kalıyoruz.
     pub backlog: u64,
+    /// Kimligi henuz cozulememis emir olayi sayisi.
+    pub join_pending: u64,
+    /// Geriye donuk atfedilen olay sayisi.
+    pub join_late: u64,
+    /// Hicbir emrimize baglanamayan (elle yapilmis) olay sayisi.
+    pub join_unattributed: u64,
 }
 
 /// Bir örnek için okuyucu thread'i başlat.
@@ -120,6 +127,7 @@ fn reader_loop(
     refresh_symbols(&session, &registry, &instance);
     let mut last_sym_refresh = Instant::now();
 
+    let mut join = OrderJoin::new();
     let mut batch = vec![Tick::default(); 512];
     let mut idle_rounds: u32 = 0;
 
@@ -189,29 +197,24 @@ fn reader_loop(
         }
 
         // --- 3) Emir sonuçları ---
+        //
+        // Ham olaylar geç-bağlama eşleştiricisinden geçer: EA `client_id`
+        // atamaz (sıcak yolda tablo taraması yasak), kimlik burada kurulur.
+        // Çözülemeyen olaylar kısa süre bekletilir ve bağ kurulunca geriye
+        // dönük atfedilir.
         while let Some(r) = unsafe { session.pop_res() } {
             did_work = true;
-            let kind = match r.kind {
-                sinyal_proto::res_kind::SEND_ACK => "ack",
-                sinyal_proto::res_kind::TRADE_TXN => "txn",
-                sinyal_proto::res_kind::REJECTED => "rejected",
-                sinyal_proto::res_kind::DUPLICATE => "duplicate",
-                _ => "unknown",
-            };
-            let _ = tx.send(FeedEvent::Order {
-                instance: inst.clone(),
-                client_id: r.client_id,
-                kind,
-                retcode: r.retcode,
-                order: r.order,
-                deal: r.deal,
-                position: r.position,
-                volume: r.volume,
-                price: r.price,
-                comment: sinyal_proto::read_fixed_str(&r.comment).to_owned(),
-            });
-            let mut s = stats.lock().unwrap_or_else(|e| e.into_inner());
-            s.orders += 1;
+            for ev in join.on_event(r) {
+                emit_order(&tx, &inst, &ev);
+                let mut s = stats.lock().unwrap_or_else(|e| e.into_inner());
+                s.orders += 1;
+            }
+        }
+
+        // Süresi dolan (hiç bağ kurulamayan) olayları kimliksiz yayımla —
+        // atmıyoruz, "bize ait değil / elle yapılmış" olarak gidiyorlar.
+        for ev in join.expire() {
+            emit_order(&tx, &inst, &ev);
         }
 
         // --- 4) Giden emirler ---
@@ -236,10 +239,33 @@ fn reader_loop(
         // --- 5) Periyodik bakım ---
         if last_sym_refresh.elapsed() >= Duration::from_secs(1) {
             refresh_symbols(&session, &registry, &instance);
+
+            // Durum görüntüsü: hesap + açık pozisyonlar + bekleyen emirler.
+            // Aynı zamanda eşleştiriciyi besler — `POSITION_MAGIC` bizim
+            // `client_id`'mizi taşıdığı için çekirdek yeniden başlasa bile
+            // bağlar buradan yeniden kurulur (mutabakatın temeli).
+            if let Some(st) = session.state() {
+                join.seed_from_positions(&st.positions);
+                join.seed_from_orders(&st.orders);
+                if st.truncated {
+                    eprintln!(
+                        "[{instance}] UYARI: durum listesi kesildi (pozisyon {}/{}, emir {}/{})",
+                        st.positions.len(),
+                        st.pos_total,
+                        st.orders.len(),
+                        st.ord_total
+                    );
+                }
+                registry.set_state(&instance, st);
+            }
+
             last_sym_refresh = Instant::now();
             let mut s = stats.lock().unwrap_or_else(|e| e.into_inner());
             s.ea_tick_loss = session.tick_push_failures();
             s.backlog = session.tick_backlog();
+            s.join_pending = join.pending_len() as u64;
+            s.join_late = join.resolved_late;
+            s.join_unattributed = join.unattributed;
         }
 
         // --- 6) Bekleme stratejisi ---
@@ -257,6 +283,29 @@ fn reader_loop(
             }
         }
     }
+}
+
+/// Bir emir olayini abonelere yayinla.
+fn emit_order(tx: &broadcast::Sender<FeedEvent>, inst: &Arc<str>, r: &sinyal_proto::Res) {
+    let kind = match r.kind {
+        sinyal_proto::res_kind::SEND_ACK => "ack",
+        sinyal_proto::res_kind::TRADE_TXN => "txn",
+        sinyal_proto::res_kind::REJECTED => "rejected",
+        sinyal_proto::res_kind::DUPLICATE => "duplicate",
+        _ => "unknown",
+    };
+    let _ = tx.send(FeedEvent::Order {
+        instance: inst.clone(),
+        client_id: r.client_id,
+        kind,
+        retcode: r.retcode,
+        order: r.order,
+        deal: r.deal,
+        position: r.position,
+        volume: r.volume,
+        price: r.price,
+        comment: sinyal_proto::read_fixed_str(&r.comment).to_owned(),
+    });
 }
 
 fn refresh_symbols(session: &Session, registry: &Registry, instance: &str) {
@@ -282,7 +331,7 @@ mod tests {
     }
 
     fn small() -> Capacities {
-        Capacities { ticks: 256, books: 16, cmds: 16, results: 16, symbols: 16 }
+        Capacities { ticks: 256, books: 16, cmds: 16, results: 16, symbols: 16, positions: 8, orders: 8 }
     }
 
     fn sym(id: u32, name: &str) -> SymbolEntry {

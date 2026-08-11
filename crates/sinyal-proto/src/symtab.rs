@@ -21,7 +21,7 @@ use crate::msg::SymbolEntry;
 pub const SYMTAB_MAGIC: u64 = 0x5359_4E59_414C_5331; // "SYNYALS1"
 
 /// Yerleşim sürümü — [`crate::ring::RING_VERSION`] ile birlikte artırılır.
-pub const SYMTAB_VERSION: u32 = 2;
+pub const SYMTAB_VERSION: u32 = 3;
 
 /// Başlık boyutu; kayıtlar bu ofsetten başlar.
 pub const SYMTAB_HEADER_SIZE: usize = 64;

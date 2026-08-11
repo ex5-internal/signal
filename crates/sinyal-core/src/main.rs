@@ -8,6 +8,7 @@
 //! sinyald --instance icmarkets --instance pepperstone --enable-trading --token gizli
 //! ```
 
+mod join;
 mod server;
 mod source;
 mod state;
@@ -27,6 +28,7 @@ struct Args {
     bind: String,
     token: Option<String>,
     trading: bool,
+    allow_live: bool,
     deviation: u32,
     /// Yayın kanalı kapasitesi — yavaş istemci bu kadar mesaj geriye düşebilir.
     capacity: usize,
@@ -41,6 +43,7 @@ impl Args {
             bind: "127.0.0.1:8787".into(),
             token: None,
             trading: false,
+            allow_live: false,
             deviation: 20,
             capacity: 8192,
         };
@@ -76,6 +79,10 @@ impl Args {
                     a.trading = true;
                     i += 1;
                 }
+                "--allow-live" => {
+                    a.allow_live = true;
+                    i += 1;
+                }
                 "--help" | "-h" => {
                     usage();
                     std::process::exit(0);
@@ -103,6 +110,9 @@ SEÇENEKLER:
   --bind ADDR         Dinlenecek adres (varsayılan: 127.0.0.1:8787)
   --token GIZLI       Kimlik doğrulama token'ı. Verilmezse doğrulama YOK.
   --enable-trading    Emir yürütmeyi aç (varsayılan KAPALI)
+  --allow-live        DEMO OLMAYAN hesapta emir yürütmeye izin ver.
+                      Varsayılan kapalı; hesap tipi okunamazsa da kapalı
+                      kabul edilir (emniyetli taraf).
   --deviation N       Varsayılan kayma toleransı, point (varsayılan 20)
   --capacity N        Yayın kuyruğu boyutu (varsayılan 8192)
 
@@ -142,6 +152,7 @@ async fn main() {
         cmd_tx,
         token: args.token.clone(),
         trading: args.trading,
+        allow_live: args.allow_live,
         deviation: args.deviation,
         orders: Arc::new(OrderTracker::new()),
     });

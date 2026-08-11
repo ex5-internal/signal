@@ -352,16 +352,42 @@ pub mod res_kind {
     pub const DUPLICATE: u8 = 4;
 }
 
+/// `Res.source` — olayın nereden geldiği.
+pub mod res_source {
+    /// `OnTradeTransaction`'dan gelen canlı olay.
+    pub const LIVE: u8 = 0;
+    /// Periyodik mutabakatın telafi ettiği, canlı akışta kaçırılmış olay.
+    ///
+    /// Terminalin işlem kuyruğu 1024 elemanlı ve taşınca eskiler ezilir; bu
+    /// bayrak istemcinin "geç gelen" olayı canlı olandan ayırmasını sağlar.
+    pub const RECONCILE: u8 = 1;
+}
+
 /// EA'dan çekirdeğe emir sonucu / ticaret olayı.
+///
+/// # Kimlik eşleştirmesi ÇEKİRDEKTE yapılır
+///
+/// EA sıcak yolda (`OnTradeTransaction`) `client_id` **atamaz** ve 0 bırakır.
+/// Sebebi: `MqlTradeTransaction`'da `magic`/`comment` yoktur ve
+/// `MqlTradeResult.request_id` yalnızca `TRADE_TRANSACTION_REQUEST` olayında
+/// doludur. Sıcak yolda tablo taraması yapmak, 1024'lük terminal kuyruğunu
+/// geciktirip olay kaybettirir.
+///
+/// Bunun yerine EA ham alanları iletir; çekirdek
+/// `client_id ↔ request_id ↔ order ↔ position` tablosuyla **geç bağlama**
+/// yapar. Sıra garantisi olmadığı için çözülemeyen olaylar kısa süreli bir
+/// bekleme tamponunda tutulur ve `REQUEST` gelince geriye dönük atfedilir.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Res {
-    /// Komutun `client_id`'si. `TRADE_TXN` bizim göndermediğimiz bir işlemden
-    /// (ör. elle kapatma) geliyorsa 0 olur.
+    /// **EA daima 0 bırakır**; çekirdek doldurur. 0 kalırsa olay bize ait
+    /// değildir (ör. terminalden elle yapılan işlem).
     pub client_id: u64,
     pub order: u64,
     pub deal: u64,
     pub position: u64,
+    /// `CLOSE_BY` işlemlerinde karşı pozisyon.
+    pub position_by: u64,
     pub volume: f64,
     pub price: f64,
     pub bid: f64,
@@ -383,12 +409,24 @@ pub struct Res {
     /// eşleştirme buradan yapılır; EA ayrıca bilet→`client_id` yerel tablosu
     /// tutar.
     pub request_id: u32,
+    pub _pad0: u32,
+    /// Yalnızca `TRADE_TRANSACTION_REQUEST` olayında anlamlıdır; diğerlerinde
+    /// EA boş bırakır.
+    pub comment: [u8; COMMENT_LEN],
     /// `res_kind::*`.
     pub kind: u8,
     /// MT5 `ENUM_TRADE_TRANSACTION_TYPE`.
     pub txn_type: u8,
-    pub _pad: [u8; 2],
-    pub comment: [u8; COMMENT_LEN],
+    /// MT5 `ENUM_ORDER_STATE` — kısmi dolum senaryolarında join için gerekli.
+    pub order_state: u8,
+    /// MT5 `ENUM_DEAL_TYPE`.
+    pub deal_type: u8,
+    /// MT5 `ENUM_ORDER_TYPE`.
+    pub order_type: u8,
+    /// `res_source::*` — canlı olay mı, mutabakat telafisi mi.
+    pub source: u8,
+    pub _pad1: [u8; 2],
+    pub _reserved: [u8; 48],
 }
 
 impl Default for Res {
@@ -398,6 +436,7 @@ impl Default for Res {
             order: 0,
             deal: 0,
             position: 0,
+            position_by: 0,
             volume: 0.0,
             price: 0.0,
             bid: 0.0,
@@ -406,10 +445,16 @@ impl Default for Res {
             retcode: 0,
             retcode_external: 0,
             request_id: 0,
+            _pad0: 0,
+            comment: [0; COMMENT_LEN],
             kind: 0,
             txn_type: 0,
-            _pad: [0; 2],
-            comment: [0; COMMENT_LEN],
+            order_state: 0,
+            deal_type: 0,
+            order_type: 0,
+            source: res_source::LIVE,
+            _pad1: [0; 2],
+            _reserved: [0; 48],
         }
     }
 }

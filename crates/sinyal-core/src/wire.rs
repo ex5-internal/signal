@@ -39,6 +39,15 @@ pub enum ClientMsg {
     /// Sembol tablosunu iste.
     Symbols,
 
+    /// Hesap durumunu iste (bakiye, equity, marjin, izinler, hesap tipi).
+    Account,
+
+    /// Açık pozisyonları iste.
+    Positions,
+
+    /// Bekleyen emirleri iste.
+    Orders,
+
     /// Sembol başına son bilinen fiyatı iste (abone olmadan anlık görüntü).
     Snapshot {
         #[serde(default)]
@@ -195,6 +204,21 @@ pub enum ServerMsg {
 
     Snapshot { items: Vec<TickSnap> },
 
+    Account { items: Vec<AccountInfo> },
+
+    Positions {
+        items: Vec<PositionInfo>,
+        /// Terminaldeki gerçek sayı; `items.len()`'ten büyükse liste kesildi.
+        total: u32,
+        truncated: bool,
+    },
+
+    Orders {
+        items: Vec<OrderInfo>,
+        total: u32,
+        truncated: bool,
+    },
+
     /// Emir yaşam döngüsü olayı.
     Order(OrderEvent),
 
@@ -234,6 +258,98 @@ pub struct SymbolInfo {
     /// Sembol canlı veri üretti mi. `false` ise fiyatına güvenme.
     pub ready: bool,
     pub src: String,
+}
+
+/// Hesap durumu.
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountInfo {
+    pub src: String,
+    pub login: i64,
+    pub server: String,
+    pub company: String,
+    pub currency: String,
+    pub leverage: i64,
+    pub balance: f64,
+    pub credit: f64,
+    pub profit: f64,
+    pub equity: f64,
+    pub margin: f64,
+    pub margin_free: f64,
+    pub margin_level: f64,
+    /// `demo` | `contest` | `real` | `unknown`
+    ///
+    /// **`unknown` gerçek hesap gibi ele alınır.** Okunamayan bir hesabı demo
+    /// saymak, canlı hesapta kazara emir göndermek demektir.
+    pub mode: &'static str,
+    /// `netting` | `exchange` | `hedging` | `unknown`
+    ///
+    /// `hedging` ise pozisyon kapatma komutu **ticket zorunlu** ister.
+    pub margin_mode: &'static str,
+    /// `margin_so_call`/`margin_so_so` birimi: `percent` | `money`.
+    pub so_mode: &'static str,
+    pub margin_so_call: f64,
+    pub margin_so_so: f64,
+    /// Emir gönderilebilir mi (tüm MT5 izinleri açık mı).
+    pub can_trade: bool,
+    /// Kapalıysa **hangi** iznin düştüğü. Tek bir "izin yok" hatası hata
+    /// ayıklanamaz.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_by: Option<String>,
+    /// Bu görüntünün yaşı (ms).
+    pub age_ms: u64,
+}
+
+/// Açık pozisyon.
+#[derive(Debug, Clone, Serialize)]
+pub struct PositionInfo {
+    pub src: String,
+    /// Kapatma komutunda **bu** kullanılır.
+    pub ticket: u64,
+    /// Geçmiş/deal eşleştirme anahtarı — kapatmada kullanılmaz.
+    pub identifier: u64,
+    /// Bizim gönderdiğimiz emirlerde istemci kimliğini taşır (0 = bize ait değil).
+    pub client_id: u64,
+    pub symbol: String,
+    /// `buy` | `sell`
+    pub side: &'static str,
+    pub volume: f64,
+    pub price_open: f64,
+    pub price_current: f64,
+    pub sl: f64,
+    pub tp: f64,
+    pub profit: f64,
+    pub swap: f64,
+    pub time_msc: i64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub comment: String,
+}
+
+/// Bekleyen emir.
+#[derive(Debug, Clone, Serialize)]
+pub struct OrderInfo {
+    pub src: String,
+    pub ticket: u64,
+    pub client_id: u64,
+    pub symbol: String,
+    /// `buy_limit` | `sell_stop` | ...
+    pub kind: &'static str,
+    pub volume_initial: f64,
+    /// **Kalan** hacim. Dolan = initial − current.
+    pub volume_current: f64,
+    pub price: f64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub stoplimit: f64,
+    pub sl: f64,
+    pub tp: f64,
+    pub time_setup_msc: i64,
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub expiration: i64,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub comment: String,
+}
+
+fn is_zero_i64(v: &i64) -> bool {
+    *v == 0
 }
 
 #[derive(Debug, Clone, Serialize)]

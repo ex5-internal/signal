@@ -14,7 +14,10 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::source::FeedEvent;
 use crate::state::Registry;
-use crate::wire::{ClientMsg, OrderEvent, OrderReq, ServerMsg, SymbolInfo, TickSnap};
+use crate::wire::{
+    AccountInfo, ClientMsg, OrderEvent, OrderInfo, OrderReq, PositionInfo, ServerMsg, SymbolInfo,
+    TickSnap,
+};
 
 /// Sunucunun paylaşılan bağlamı.
 pub struct Ctx {
@@ -26,6 +29,11 @@ pub struct Ctx {
     pub token: Option<String>,
     /// `false` ise hiçbir emir kabul edilmez (EA'daki bayrağa ek ikinci kapı).
     pub trading: bool,
+    /// Demo OLMAYAN hesapta emir yürütmeye izin ver.
+    ///
+    /// Varsayılan `false`: hesap tipi okunamıyorsa (UNKNOWN) da gerçek sayılır
+    /// ve emir reddedilir — emniyetli taraf.
+    pub allow_live: bool,
     /// Varsayılan kayma toleransı (point).
     pub deviation: u32,
     pub orders: Arc<OrderTracker>,
@@ -353,6 +361,18 @@ fn handle_client_msg(
             vec![ServerMsg::Snapshot { items }]
         }
 
+        ClientMsg::Account => vec![ServerMsg::Account { items: collect_accounts(ctx) }],
+
+        ClientMsg::Positions => {
+            let (items, total, truncated) = collect_positions(ctx);
+            vec![ServerMsg::Positions { items, total, truncated }]
+        }
+
+        ClientMsg::Orders => {
+            let (items, total, truncated) = collect_orders(ctx);
+            vec![ServerMsg::Orders { items, total, truncated }]
+        }
+
         ClientMsg::Order(req) => vec![submit_order(req, ctx)],
 
         ClientMsg::Cancel { id, ticket } => vec![submit_simple(
@@ -368,9 +388,21 @@ fn handle_client_msg(
 }
 
 /// Emir öncesi ortak denetimler; hata varsa `Err(ServerMsg)`.
+///
+/// Üç ayrı kapı, her biri farklı bir hatayı yakalar:
+/// 1. `--enable-trading` — operatörün açık izni
+/// 2. MT5/hesap izinleri — hangi bayrağın düştüğü söylenir
+/// 3. **Canlı para kilidi** — demo olmayan hesapta `--allow-live` şart
 fn gate<'a>(ctx: &'a Ctx, id: &str) -> Result<u64, ServerMsg> {
     if !ctx.trading {
         return Err(rejected(id, "emir yurutme kapali (--enable-trading)"));
+    }
+    // Hangi örnek olduğunu bilmediğimiz komutlar için ilk örneği denetle;
+    // sembollü emirler `submit_order` içinde kendi örneğiyle yeniden denetlenir.
+    if let Some(inst) = ctx.cmd_tx.keys().next() {
+        if let Err(why) = ctx.registry.trading_gate(inst, ctx.allow_live) {
+            return Err(rejected(id, &why));
+        }
     }
     ctx.orders.register(id).map_err(|_| ServerMsg::Order(OrderEvent {
         id: id.to_owned(),
@@ -556,6 +588,139 @@ fn submit_order(req: OrderReq, ctx: &Ctx) -> ServerMsg {
     write_fixed_str(&mut cmd.comment, &c);
 
     dispatch(ctx, &instance, cmd, &req.id)
+}
+
+fn mode_name(v: u8) -> &'static str {
+    match v {
+        sinyal_proto::trade_mode::DEMO => "demo",
+        sinyal_proto::trade_mode::CONTEST => "contest",
+        sinyal_proto::trade_mode::REAL => "real",
+        _ => "unknown",
+    }
+}
+
+fn margin_mode_name(v: u8) -> &'static str {
+    match v {
+        sinyal_proto::margin_mode::NETTING => "netting",
+        sinyal_proto::margin_mode::EXCHANGE => "exchange",
+        sinyal_proto::margin_mode::HEDGING => "hedging",
+        _ => "unknown",
+    }
+}
+
+fn so_mode_name(v: u8) -> &'static str {
+    match v {
+        sinyal_proto::so_mode::PERCENT => "percent",
+        sinyal_proto::so_mode::MONEY => "money",
+        _ => "unknown",
+    }
+}
+
+fn order_kind_name(v: u8) -> &'static str {
+    use sinyal_proto::order_type as t;
+    match v {
+        t::BUY => "buy",
+        t::SELL => "sell",
+        t::BUY_LIMIT => "buy_limit",
+        t::SELL_LIMIT => "sell_limit",
+        t::BUY_STOP => "buy_stop",
+        t::SELL_STOP => "sell_stop",
+        t::BUY_STOP_LIMIT => "buy_stop_limit",
+        t::SELL_STOP_LIMIT => "sell_stop_limit",
+        _ => "unknown",
+    }
+}
+
+fn collect_accounts(ctx: &Ctx) -> Vec<AccountInfo> {
+    ctx.registry
+        .all_states()
+        .into_iter()
+        .map(|(src, s)| {
+            let a = &s.snap.account;
+            AccountInfo {
+                src,
+                login: a.login,
+                server: a.server_str().to_owned(),
+                company: a.company_str().to_owned(),
+                currency: a.currency_str().to_owned(),
+                leverage: a.leverage,
+                balance: a.balance,
+                credit: a.credit,
+                profit: a.profit,
+                equity: a.equity,
+                margin: a.margin,
+                margin_free: a.margin_free,
+                margin_level: a.margin_level,
+                mode: mode_name(a.trade_mode),
+                margin_mode: margin_mode_name(a.margin_mode),
+                so_mode: so_mode_name(a.so_mode),
+                margin_so_call: a.margin_so_call,
+                margin_so_so: a.margin_so_so,
+                can_trade: a.can_trade(),
+                blocked_by: a.permission_problem().map(|s| s.to_owned()),
+                age_ms: s.at.elapsed().as_millis() as u64,
+            }
+        })
+        .collect()
+}
+
+fn collect_positions(ctx: &Ctx) -> (Vec<PositionInfo>, u32, bool) {
+    let mut items = Vec::new();
+    let mut total = 0u32;
+    let mut truncated = false;
+    for (src, s) in ctx.registry.all_states() {
+        total += s.snap.pos_total;
+        truncated |= s.snap.truncated;
+        for p in &s.snap.positions {
+            items.push(PositionInfo {
+                src: src.clone(),
+                ticket: p.ticket,
+                identifier: p.identifier,
+                client_id: p.magic,
+                symbol: p.symbol_str().to_owned(),
+                side: if p.is_buy() { "buy" } else { "sell" },
+                volume: p.volume,
+                price_open: p.price_open,
+                price_current: p.price_current,
+                sl: p.sl,
+                tp: p.tp,
+                profit: p.profit,
+                swap: p.swap,
+                time_msc: p.time_msc,
+                comment: p.comment_str().to_owned(),
+            });
+        }
+    }
+    (items, total, truncated)
+}
+
+fn collect_orders(ctx: &Ctx) -> (Vec<OrderInfo>, u32, bool) {
+    let mut items = Vec::new();
+    let mut total = 0u32;
+    let mut truncated = false;
+    for (src, s) in ctx.registry.all_states() {
+        total += s.snap.ord_total;
+        truncated |= s.snap.truncated;
+        for o in &s.snap.orders {
+            items.push(OrderInfo {
+                src: src.clone(),
+                ticket: o.ticket,
+                client_id: o.magic,
+                symbol: o.symbol_str().to_owned(),
+                kind: order_kind_name(o.kind),
+                volume_initial: o.volume_initial,
+                volume_current: o.volume_current,
+                price: o.price_open,
+                stoplimit: o.price_stoplimit,
+                sl: o.sl,
+                tp: o.tp,
+                time_setup_msc: o.time_setup_msc,
+                expiration: o.time_expiration,
+                comment: o.comment_str().to_owned(),
+            });
+        }
+    }
+    (items, total, truncated)
 }
 
 /// Yorum alanına sığacak şekilde kısalt (MT5 yorumu zaten kısaltır).

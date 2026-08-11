@@ -45,6 +45,9 @@ pub mod sizeof_what {
     pub const CMD: i32 = 4;
     pub const RES: i32 = 5;
     pub const SYMBOL_ENTRY: i32 = 6;
+    pub const ACCOUNT: i32 = 7;
+    pub const POSITION: i32 = 8;
+    pub const ORDER: i32 = 9;
     /// Protokol sürümü (boyut değil).
     pub const PROTO_VERSION: i32 = 100;
 }
@@ -255,6 +258,8 @@ pub unsafe extern "C" fn SinyalOpen(
             cmds: if cmd_cap == 0 { d.cmds } else { cmd_cap as u64 },
             results: if res_cap == 0 { d.results } else { res_cap as u64 },
             symbols: if sym_cap == 0 { d.symbols } else { sym_cap },
+            positions: d.positions,
+            orders: d.orders,
         };
 
         match Session::create(&name, caps) {
@@ -312,6 +317,9 @@ pub extern "C" fn SinyalSizeof(what: i32) -> i32 {
         sizeof_what::CMD => size_of::<Cmd>() as i32,
         sizeof_what::RES => size_of::<Res>() as i32,
         sizeof_what::SYMBOL_ENTRY => size_of::<SymbolEntry>() as i32,
+        sizeof_what::ACCOUNT => size_of::<sinyal_proto::AccountSnapshot>() as i32,
+        sizeof_what::POSITION => size_of::<sinyal_proto::PositionRec>() as i32,
+        sizeof_what::ORDER => size_of::<sinyal_proto::OrderRec>() as i32,
         sizeof_what::PROTO_VERSION => sinyal_proto::ring::RING_VERSION as i32,
         _ => SINYAL_ERR_ARGS,
     }
@@ -496,6 +504,78 @@ pub unsafe extern "C" fn SinyalSetSymbols(h: i64, entries: *const SymbolEntry, c
     })
 }
 
+/// Hesap + açık pozisyonlar + bekleyen emirleri topluca yayımla.
+///
+/// # Boş dizi geçirme
+///
+/// MQL5'te sıfır uzunluklu bir dizinin tampon adresi tanımsızdır. Bu yüzden EA
+/// dizileri **daima en az 1 elemanlı** ayırmalı ve gerçek sayıyı `npos`/`nord`
+/// ile ayrı geçirmelidir. Burada işaretçiler NULL olamaz ama sayı 0 olabilir.
+///
+/// `pos_total`/`ord_total` terminaldeki GERÇEK sayılardır; listeden büyükse
+/// kesilme olmuştur ve çekirdek bunu istemciye bildirir.
+///
+/// # Güvenlik
+/// Diziler en az `npos`/`nord` eleman içermelidir; `h` geçerli olmalıdır.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn SinyalSetState(
+    h: i64,
+    account: *const sinyal_proto::AccountSnapshot,
+    positions: *const sinyal_proto::PositionRec,
+    npos: i32,
+    pos_total: i32,
+    orders: *const sinyal_proto::OrderRec,
+    nord: i32,
+    ord_total: i32,
+    built_at_msc: i64,
+    unstable: u8,
+) -> i32 {
+    guard(|| {
+        let Some(handle) = resolve(h) else {
+            set_error("SinyalSetState: tanıtıcı geçersiz");
+            return SINYAL_ERR_HANDLE;
+        };
+        if account.is_null() || npos < 0 || nord < 0 || pos_total < 0 || ord_total < 0 {
+            set_error("SinyalSetState: NULL hesap veya negatif sayı");
+            return SINYAL_ERR_ARGS;
+        }
+        if (npos > 0 && positions.is_null()) || (nord > 0 && orders.is_null()) {
+            set_error("SinyalSetState: sayı > 0 iken dizi NULL");
+            return SINYAL_ERR_ARGS;
+        }
+        let acc = unsafe { core::ptr::read(account) };
+        let ps = if npos == 0 {
+            &[][..]
+        } else {
+            unsafe { core::slice::from_raw_parts(positions, npos as usize) }
+        };
+        let os = if nord == 0 {
+            &[][..]
+        } else {
+            unsafe { core::slice::from_raw_parts(orders, nord as usize) }
+        };
+        // Güvenlik: tek yazar sözleşmesi çağıranın sorumluluğunda.
+        match unsafe {
+            handle.session.set_state(
+                &acc,
+                ps,
+                os,
+                pos_total as u32,
+                ord_total as u32,
+                built_at_msc,
+                unstable != 0,
+            )
+        } {
+            Ok(()) => SINYAL_OK,
+            Err(e) => {
+                set_error(format!("durum yayımlanamadı: {e}"));
+                SINYAL_ERR_OTHER
+            }
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Emirler
 // ---------------------------------------------------------------------------
@@ -633,9 +713,12 @@ mod tests {
         assert_eq!(SinyalSizeof(sizeof_what::BOOK_LEVEL), 24);
         assert_eq!(SinyalSizeof(sizeof_what::BOOK), 824);
         assert_eq!(SinyalSizeof(sizeof_what::CMD), 184);
-        assert_eq!(SinyalSizeof(sizeof_what::RES), 120);
+        assert_eq!(SinyalSizeof(sizeof_what::RES), 184);
         assert_eq!(SinyalSizeof(sizeof_what::SYMBOL_ENTRY), 192);
-        assert_eq!(SinyalSizeof(sizeof_what::PROTO_VERSION), 2);
+        assert_eq!(SinyalSizeof(sizeof_what::ACCOUNT), 512);
+        assert_eq!(SinyalSizeof(sizeof_what::POSITION), 192);
+        assert_eq!(SinyalSizeof(sizeof_what::ORDER), 192);
+        assert_eq!(SinyalSizeof(sizeof_what::PROTO_VERSION), 3);
         assert_eq!(SinyalSizeof(9999), SINYAL_ERR_ARGS, "bilinmeyen kod hata dönmeli");
     }
 

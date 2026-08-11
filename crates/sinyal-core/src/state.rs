@@ -57,6 +57,13 @@ impl InstanceState {
     }
 }
 
+/// Bir örneğin hesap/pozisyon/emir anlık görüntüsü ve alındığı an.
+#[derive(Clone, Debug)]
+pub struct InstanceSnapshot {
+    pub snap: sinyal_proto::StateSnapshot,
+    pub at: std::time::Instant,
+}
+
 /// Tüm örneklerin durumu.
 ///
 /// `RwLock`: okuma çok, yazma nadir (sembol tablosu değişimi). Son fiyat
@@ -65,6 +72,11 @@ impl InstanceState {
 #[derive(Debug, Default)]
 pub struct Registry {
     inner: RwLock<HashMap<String, InstanceState>>,
+    /// Örnek adı → en son hesap/pozisyon/emir görüntüsü.
+    ///
+    /// Akıştan AYRI tutulur: yeniden bağlanan bir istemci olay geçmişini
+    /// göremez ama "şu an ne açık" sorusunun cevabını anında almalıdır.
+    states: RwLock<HashMap<String, InstanceSnapshot>>,
 }
 
 impl Registry {
@@ -114,6 +126,57 @@ impl Registry {
     pub fn symbol(&self, instance: &str, id: u32) -> Option<SymbolEntry> {
         let g = self.inner.read().unwrap_or_else(|e| e.into_inner());
         g.get(instance)?.symbol(id).copied()
+    }
+
+    /// Bir örneğin durum görüntüsünü güncelle (okuyucu thread'i çağırır).
+    pub fn set_state(&self, instance: &str, snap: sinyal_proto::StateSnapshot) {
+        let mut g = self.states.write().unwrap_or_else(|e| e.into_inner());
+        g.insert(
+            instance.to_owned(),
+            InstanceSnapshot { snap, at: std::time::Instant::now() },
+        );
+    }
+
+    /// Bir örneğin son durum görüntüsü.
+    pub fn state_of(&self, instance: &str) -> Option<InstanceSnapshot> {
+        let g = self.states.read().unwrap_or_else(|e| e.into_inner());
+        g.get(instance).cloned()
+    }
+
+    /// Tüm örneklerin durum görüntüleri (örnek adına göre sıralı).
+    pub fn all_states(&self) -> Vec<(String, InstanceSnapshot)> {
+        let g = self.states.read().unwrap_or_else(|e| e.into_inner());
+        let mut v: Vec<(String, InstanceSnapshot)> =
+            g.iter().map(|(k, s)| (k.clone(), s.clone())).collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v
+    }
+
+    /// Bu örnekte emir yürütmeye izin var mı, yoksa neden yok.
+    ///
+    /// İki ayrı kapı: (1) MT5/hesap izinleri, (2) **canlı para kilidi**.
+    /// Demo olmayan bir hesapta `allow_live` açıkça verilmedikçe emir
+    /// gönderilmez; hesap tipi okunamadıysa (UNKNOWN) da gerçek sayılır.
+    pub fn trading_gate(&self, instance: &str, allow_live: bool) -> Result<(), String> {
+        let Some(s) = self.state_of(instance) else {
+            return Err("hesap durumu henuz alinmadi (EA yayin yapmadi)".into());
+        };
+        let a = &s.snap.account;
+        if let Some(p) = a.permission_problem() {
+            return Err(p.to_string());
+        }
+        if a.is_real_money() && !allow_live {
+            let tip = match a.trade_mode {
+                sinyal_proto::trade_mode::REAL => "GERCEK",
+                sinyal_proto::trade_mode::CONTEST => "YARISMA",
+                _ => "BILINMEYEN",
+            };
+            return Err(format!(
+                "hesap tipi {tip} — canli para kilidi devrede. \
+                 Bilerek istiyorsan --allow-live ile baslat."
+            ));
+        }
+        Ok(())
     }
 
     pub fn instances(&self) -> Vec<String> {

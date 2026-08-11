@@ -6,9 +6,10 @@
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+use sinyal_proto::state::{self, StateTable};
 use sinyal_proto::{
-    capacity, Book, BookLevel, Cmd, Res, Ring, SegmentNames, SymbolEntry, SymbolTable, Tick,
-    MAX_BOOK_DEPTH,
+    capacity, AccountSnapshot, Book, BookLevel, Cmd, OrderRec, PositionRec, Res, Ring, SegmentNames,
+    StateSnapshot, SymbolEntry, SymbolTable, Tick, MAX_BOOK_DEPTH,
 };
 use sinyal_shm::{current_thread_id, InstanceLock, SharedMem};
 
@@ -23,6 +24,8 @@ pub struct Capacities {
     pub cmds: u64,
     pub results: u64,
     pub symbols: u32,
+    pub positions: u32,
+    pub orders: u32,
 }
 
 impl Default for Capacities {
@@ -33,6 +36,8 @@ impl Default for Capacities {
             cmds: capacity::CMDS,
             results: capacity::RESULTS,
             symbols: capacity::SYMBOLS,
+            positions: capacity::POSITIONS,
+            orders: capacity::ORDERS,
         }
     }
 }
@@ -43,6 +48,7 @@ pub enum SessionError {
     Shm(sinyal_shm::ShmError),
     Ring(sinyal_proto::RingError),
     SymTab(sinyal_proto::SymTabError),
+    State(sinyal_proto::StateError),
     /// Kapasite 2'nin kuvveti değil.
     BadCapacity(&'static str, u64),
     /// İşlem, oturumun sahibi olmayan bir thread'den geldi ve REDDEDİLDİ.
@@ -58,6 +64,7 @@ impl core::fmt::Display for SessionError {
             Self::Shm(e) => write!(f, "paylaşımlı bellek: {e}"),
             Self::Ring(e) => write!(f, "halka: {e}"),
             Self::SymTab(e) => write!(f, "sembol tablosu: {e}"),
+            Self::State(e) => write!(f, "durum segmenti: {e}"),
             Self::BadCapacity(which, v) => {
                 write!(f, "{which} kapasitesi 2'nin kuvveti olmalı, verilen {v}")
             }
@@ -88,6 +95,12 @@ impl From<sinyal_proto::SymTabError> for SessionError {
     }
 }
 
+impl From<sinyal_proto::StateError> for SessionError {
+    fn from(e: sinyal_proto::StateError) -> Self {
+        Self::State(e)
+    }
+}
+
 /// Bir EA örneğinin köprü oturumu.
 ///
 /// # Segment sahipliği
@@ -109,12 +122,14 @@ pub struct Session {
     cmds: Ring<Cmd>,
     results: Ring<Res>,
     symtab: SymbolTable,
+    statetab: StateTable,
 
     _mem_ticks: SharedMem,
     _mem_books: SharedMem,
     _mem_cmds: SharedMem,
     _mem_results: SharedMem,
     _mem_symbols: SharedMem,
+    _mem_state: SharedMem,
 
     /// Yalnızca yazar (EA) tarafında dolu. Düştüğünde örnek adı serbest kalır.
     _lock: Option<InstanceLock>,
@@ -172,6 +187,10 @@ impl Session {
             &names.symbols,
             sinyal_proto::symtab::bytes_needed(caps.symbols),
         )?;
+        let mem_state = SharedMem::create_or_open(
+            &names.state,
+            state::bytes_needed(caps.positions, caps.orders),
+        )?;
 
         // Güvenlik: her eşleme en az `bytes_needed` bayt ve 64'e hizalı;
         // `was_created` ile yalnızca YENİ segmentlerde başlık yazılıyor, böylece
@@ -187,6 +206,13 @@ impl Session {
                 SymbolTable::attach(mem_symbols.as_ptr())?
             }
         };
+        let statetab = unsafe {
+            if mem_state.was_created() {
+                StateTable::init(mem_state.as_ptr(), caps.positions, caps.orders)
+            } else {
+                StateTable::attach(mem_state.as_ptr())?
+            }
+        };
 
         Ok(Self {
             ticks,
@@ -194,11 +220,13 @@ impl Session {
             cmds,
             results,
             symtab,
+            statetab,
             _mem_ticks: mem_ticks,
             _mem_books: mem_books,
             _mem_cmds: mem_cmds,
             _mem_results: mem_results,
             _mem_symbols: mem_symbols,
+            _mem_state: mem_state,
             _lock: Some(lock),
             owner_thread: AtomicU32::new(0),
             thread_violations: AtomicU64::new(0),
@@ -236,17 +264,29 @@ impl Session {
             SharedMem::open(&names.symbols, sinyal_proto::symtab::bytes_needed(sym_cap))?;
         let symtab = unsafe { SymbolTable::attach(mem_symbols.as_ptr())? };
 
+        // Durum segmenti de kapasitesini KEŞFEDEREK açılır — tahmin edip
+        // yanlış boyutta eşlemek ERROR_ACCESS_DENIED üretirdi.
+        let (pos_cap, ord_cap) = {
+            let probe = SharedMem::open(&names.state, state::STATE_HEADER_SIZE)?;
+            unsafe { StateTable::peek_capacity(probe.as_ptr()) }?
+        };
+        let mem_state =
+            SharedMem::open(&names.state, state::bytes_needed(pos_cap, ord_cap))?;
+        let statetab = unsafe { StateTable::attach(mem_state.as_ptr())? };
+
         Ok(Self {
             ticks,
             books,
             cmds,
             results,
             symtab,
+            statetab,
             _mem_ticks: mem_ticks,
             _mem_books: mem_books,
             _mem_cmds: mem_cmds,
             _mem_results: mem_results,
             _mem_symbols: mem_symbols,
+            _mem_state: mem_state,
             // Çekirdek okuyucudur, kilit almaz: kilit YAZAR tekliğini korur.
             // Çekirdeği de kilitlemek, EA'nın hiç başlayamamasına yol açardı.
             _lock: None,
@@ -470,6 +510,58 @@ impl Session {
         self.symtab.snapshot(64)
     }
 
+    /// Hesap + açık pozisyonlar + bekleyen emirleri topluca yayımla (EA tarafı).
+    ///
+    /// Üçü **birlikte** yayımlanır: ayrı yayımlamak, equity'nin yeni ama
+    /// pozisyon listesinin eski olduğu tutarsız bir görüntüye izin verirdi ve
+    /// marjin hesabı yapan bir istemci yanlış karar verirdi.
+    ///
+    /// `pos_total`/`ord_total` terminaldeki GERÇEK sayılardır; listeden
+    /// büyükse kesilme olmuş demektir ve bu sessiz kalmaz.
+    ///
+    /// # Güvenlik
+    /// Yalnızca TEK yazar thread'i çağırabilir.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn set_state(
+        &self,
+        account: &AccountSnapshot,
+        positions: &[PositionRec],
+        orders: &[OrderRec],
+        pos_total: u32,
+        ord_total: u32,
+        built_at_msc: i64,
+        unstable: bool,
+    ) -> Result<(), SessionError> {
+        if !self.check_thread() {
+            return Err(SessionError::WrongThread);
+        }
+        unsafe {
+            self.statetab.publish(
+                account,
+                positions,
+                orders,
+                pos_total,
+                ord_total,
+                built_at_msc,
+                sinyal_shm::qpc(),
+                unstable,
+            )
+        }
+        .map_err(SessionError::State)
+    }
+
+    /// Durumun tutarlı anlık görüntüsü (çekirdek tarafı).
+    ///
+    /// EA henüz hiç yayın yapmadıysa `None` döner — bu bir hata değil,
+    /// "henüz veri yok" demektir.
+    #[inline]
+    pub fn state(&self) -> Option<StateSnapshot> {
+        if !self.statetab.has_data() {
+            return None;
+        }
+        self.statetab.snapshot(64)
+    }
+
     // --- Teşhis ---
 
     /// Halka dolu olduğu için KAYBEDİLEN tick sayısı.
@@ -555,7 +647,7 @@ mod tests {
     use sinyal_proto::{filling, kind, write_fixed_str};
 
     fn small_caps() -> Capacities {
-        Capacities { ticks: 64, books: 8, cmds: 8, results: 8, symbols: 16 }
+        Capacities { ticks: 64, books: 8, cmds: 8, results: 8, symbols: 16, positions: 8, orders: 8 }
     }
 
     fn unique(tag: &str) -> String {
@@ -760,6 +852,88 @@ mod tests {
             assert!(!unsafe { ea.push_tick(&sample_tick(0, 1.0)) });
         }
         assert_eq!(ea.tick_push_failures(), 5, "kayıp sayılmalı");
+    }
+
+    #[test]
+    fn state_crosses_the_segment_boundary() {
+        // Hesap + pozisyon + emir BİRLİKTE yayımlanır ve çekirdek tarafı
+        // tutarlı bir görüntü okur.
+        let inst = unique("state");
+        let ea = Session::create(&inst, small_caps()).unwrap();
+        let core = Session::open(&inst).unwrap();
+
+        assert!(core.state().is_none(), "yayın öncesi durum olmamalı");
+
+        let mut acc = AccountSnapshot {
+            balance: 10_000.0,
+            equity: 10_042.5,
+            margin_free: 9_900.0,
+            login: 318262494,
+            leverage: 500,
+            trade_mode: sinyal_proto::trade_mode::DEMO,
+            margin_mode: sinyal_proto::margin_mode::HEDGING,
+            trade_allowed: 1,
+            trade_expert: 1,
+            terminal_trade_allowed: 1,
+            mql_trade_allowed: 1,
+            connected: 1,
+            ..Default::default()
+        };
+        sinyal_proto::write_fixed_str(&mut acc.currency, "USD");
+        sinyal_proto::write_fixed_str(&mut acc.server, "XMGlobal-MT5 7");
+
+        let mut p = PositionRec {
+            ticket: 942420795,
+            identifier: 942420795,
+            magic: 7,
+            volume: 0.01,
+            price_open: 1.15402,
+            ..Default::default()
+        };
+        sinyal_proto::write_fixed_str(&mut p.symbol, "EURUSD");
+
+        let mut o = OrderRec {
+            ticket: 942418505,
+            magic: 8,
+            volume_initial: 0.01,
+            volume_current: 0.01,
+            price_open: 1.13901,
+            kind: sinyal_proto::order_type::BUY_LIMIT,
+            ..Default::default()
+        };
+        sinyal_proto::write_fixed_str(&mut o.symbol, "EURUSD");
+
+        unsafe { ea.set_state(&acc, &[p], &[o], 1, 1, 1_700_000_000_000, false) }.unwrap();
+
+        let s = core.state().expect("durum okunmalı");
+        assert_eq!(s.account.login, 318262494);
+        assert_eq!(s.account.currency_str(), "USD");
+        assert_eq!(s.account.server_str(), "XMGlobal-MT5 7");
+        assert!(s.account.can_trade(), "tüm izinler açık");
+        assert!(!s.account.is_real_money(), "demo hesap");
+        assert_eq!(s.positions.len(), 1);
+        assert_eq!(s.positions[0].ticket, 942420795);
+        assert_eq!(s.positions[0].symbol_str(), "EURUSD");
+        assert_eq!(s.orders.len(), 1);
+        assert_eq!(s.orders[0].kind, sinyal_proto::order_type::BUY_LIMIT);
+        assert!(!s.truncated);
+    }
+
+    #[test]
+    fn state_write_from_foreign_thread_is_refused() {
+        let inst = unique("statethread");
+        let ea = Session::create(&inst, small_caps()).unwrap();
+        // Sahibi bu thread yap.
+        assert!(unsafe { ea.push_tick(&sample_tick(1, 1.0)) });
+
+        let ea = std::sync::Arc::new(ea);
+        let ea2 = ea.clone();
+        let res = std::thread::spawn(move || unsafe {
+            ea2.set_state(&AccountSnapshot::default(), &[], &[], 0, 0, 0, false)
+        })
+        .join()
+        .unwrap();
+        assert!(matches!(res, Err(SessionError::WrongThread)));
     }
 
     #[test]

@@ -43,7 +43,7 @@ pub const RING_MAGIC: u64 = 0x5359_4E59_414C_5231; // "SYNYALR1"
 ///   `ticks_bookdepth`/`volume_limit`/`flags` eklendi (doğru doldurma modu
 ///   seçimi bunlar olmadan yapılamıyordu), `Cmd.magic` u32→u64,
 ///   `Res`'e `request_id` eklendi.
-pub const RING_VERSION: u32 = 2;
+pub const RING_VERSION: u32 = 3;
 
 /// Başlık boyutu; slotlar bu ofsetten başlar (64'ün katı — hizalama korunur).
 pub const RING_HEADER_SIZE: usize = 256;

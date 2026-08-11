@@ -35,15 +35,20 @@
 
 pub mod msg;
 pub mod ring;
+pub mod state;
 pub mod symtab;
 pub mod validate;
 
 pub use msg::{
     action, book_type, exec_mode, filling, filling_mask, kind, order_type, read_fixed_str, res_kind,
-    sym_flag, tick_flag, type_time, write_fixed_str, Book, BookLevel, Cmd, Res, SymbolEntry, Tick,
-    COMMENT_LEN, MAX_BOOK_DEPTH, SYMBOL_NAME_LEN,
+    res_source, sym_flag, tick_flag, type_time, write_fixed_str, Book, BookLevel, Cmd, Res,
+    SymbolEntry, Tick, COMMENT_LEN, MAX_BOOK_DEPTH, SYMBOL_NAME_LEN,
 };
 pub use ring::{Cell, Ring, RingError, RingHeader};
+pub use state::{
+    margin_mode, so_mode, trade_mode, AccountSnapshot, OrderRec, PositionRec, StateError,
+    StateHeader, StateSnapshot, StateTable, MAX_ORDERS, MAX_POSITIONS,
+};
 pub use symtab::{SymTabError, SymbolTable, SymbolTableHeader};
 pub use validate::{
     normalize_price, normalize_volume, resolve_filling, respects_stops_level, ValidationError,
@@ -69,6 +74,10 @@ pub mod capacity {
     pub const RESULTS: u64 = 1 << 13;
     /// Sembol tablosu kapasitesi.
     pub const SYMBOLS: u32 = 1024;
+    /// Durum segmentindeki azami pozisyon sayısı.
+    pub const POSITIONS: u32 = 512;
+    /// Durum segmentindeki azami bekleyen emir sayısı.
+    pub const ORDERS: u32 = 512;
 }
 
 /// Bir EA örneğinin paylaşılan bellek segment adları.
@@ -86,6 +95,8 @@ pub struct SegmentNames {
     pub cmds: String,
     pub results: String,
     pub symbols: String,
+    /// Hesap + açık pozisyonlar + bekleyen emirler (durum, akış değil).
+    pub state: String,
 }
 
 impl SegmentNames {
@@ -97,6 +108,7 @@ impl SegmentNames {
             cmds: format!("Local\\Sinyal.{instance}.cmd"),
             results: format!("Local\\Sinyal.{instance}.res"),
             symbols: format!("Local\\Sinyal.{instance}.sym"),
+            state: format!("Local\\Sinyal.{instance}.state"),
         }
     }
 }
@@ -171,24 +183,67 @@ mod layout {
     const _: () = assert!(offset_of!(Cmd, type_time) == 123);
 
     // --- Res ---
-    const _: () = assert!(size_of::<Res>() == 120, "Res 120 bayt olmalı");
-    const _: () = assert!(size_of::<Cell<Res>>() == 128);
+    const _: () = assert!(size_of::<Res>() == 184, "Res 184 bayt olmalı");
+    const _: () = assert!(size_of::<Cell<Res>>() == 192, "Cell<Res> 3 önbellek satırı olmalı");
     const _: () = assert!(offset_of!(Res, client_id) == 0);
     const _: () = assert!(offset_of!(Res, order) == 8);
     const _: () = assert!(offset_of!(Res, deal) == 16);
     const _: () = assert!(offset_of!(Res, position) == 24);
-    const _: () = assert!(offset_of!(Res, volume) == 32);
-    const _: () = assert!(offset_of!(Res, price) == 40);
-    const _: () = assert!(offset_of!(Res, bid) == 48);
-    const _: () = assert!(offset_of!(Res, ask) == 56);
-    const _: () = assert!(offset_of!(Res, recv_qpc) == 64);
-    const _: () = assert!(offset_of!(Res, retcode) == 72);
-    const _: () = assert!(offset_of!(Res, retcode_external) == 76);
+    const _: () = assert!(offset_of!(Res, position_by) == 32);
+    const _: () = assert!(offset_of!(Res, volume) == 40);
+    const _: () = assert!(offset_of!(Res, price) == 48);
+    const _: () = assert!(offset_of!(Res, bid) == 56);
+    const _: () = assert!(offset_of!(Res, ask) == 64);
+    const _: () = assert!(offset_of!(Res, recv_qpc) == 72);
+    const _: () = assert!(offset_of!(Res, retcode) == 80);
+    const _: () = assert!(offset_of!(Res, retcode_external) == 84);
     // SEND_ACK ile TRADE_TXN'i bağlayan tek resmî anahtar.
-    const _: () = assert!(offset_of!(Res, request_id) == 80);
-    const _: () = assert!(offset_of!(Res, kind) == 84);
-    const _: () = assert!(offset_of!(Res, txn_type) == 85);
-    const _: () = assert!(offset_of!(Res, comment) == 88);
+    const _: () = assert!(offset_of!(Res, request_id) == 88);
+    const _: () = assert!(offset_of!(Res, comment) == 96);
+    const _: () = assert!(offset_of!(Res, kind) == 128);
+    const _: () = assert!(offset_of!(Res, txn_type) == 129);
+    const _: () = assert!(offset_of!(Res, order_state) == 130);
+    const _: () = assert!(offset_of!(Res, deal_type) == 131);
+    const _: () = assert!(offset_of!(Res, order_type) == 132);
+    const _: () = assert!(offset_of!(Res, source) == 133);
+
+    // --- Durum segmenti ---
+    const _: () = assert!(size_of::<AccountSnapshot>() == 512, "AccountSnapshot 512 bayt olmalı");
+    const _: () = assert!(offset_of!(AccountSnapshot, time_msc) == 0);
+    const _: () = assert!(offset_of!(AccountSnapshot, balance) == 8);
+    const _: () = assert!(offset_of!(AccountSnapshot, equity) == 32);
+    const _: () = assert!(offset_of!(AccountSnapshot, login) == 120);
+    const _: () = assert!(offset_of!(AccountSnapshot, leverage) == 128);
+    const _: () = assert!(offset_of!(AccountSnapshot, limit_orders) == 136);
+    // Canlı para kilidinin dayanağı — yeri kaymamalı.
+    const _: () = assert!(offset_of!(AccountSnapshot, trade_mode) == 144);
+    const _: () = assert!(offset_of!(AccountSnapshot, margin_mode) == 145);
+    const _: () = assert!(offset_of!(AccountSnapshot, currency) == 160);
+    const _: () = assert!(offset_of!(AccountSnapshot, server) == 176);
+    const _: () = assert!(offset_of!(AccountSnapshot, company) == 240);
+    const _: () = assert!(offset_of!(AccountSnapshot, name) == 336);
+
+    const _: () = assert!(size_of::<PositionRec>() == 192, "PositionRec 192 bayt olmalı");
+    const _: () = assert!(offset_of!(PositionRec, ticket) == 0);
+    const _: () = assert!(offset_of!(PositionRec, identifier) == 8);
+    const _: () = assert!(offset_of!(PositionRec, magic) == 16);
+    const _: () = assert!(offset_of!(PositionRec, volume) == 40);
+    const _: () = assert!(offset_of!(PositionRec, symbol) == 96);
+    const _: () = assert!(offset_of!(PositionRec, comment) == 128);
+    const _: () = assert!(offset_of!(PositionRec, kind) == 160);
+
+    const _: () = assert!(size_of::<OrderRec>() == 192, "OrderRec 192 bayt olmalı");
+    const _: () = assert!(offset_of!(OrderRec, ticket) == 0);
+    const _: () = assert!(offset_of!(OrderRec, magic) == 8);
+    const _: () = assert!(offset_of!(OrderRec, position_id) == 16);
+    const _: () = assert!(offset_of!(OrderRec, volume_initial) == 40);
+    const _: () = assert!(offset_of!(OrderRec, volume_current) == 48);
+    const _: () = assert!(offset_of!(OrderRec, symbol) == 96);
+    const _: () = assert!(offset_of!(OrderRec, comment) == 128);
+    const _: () = assert!(offset_of!(OrderRec, kind) == 160);
+
+    const _: () = assert!(size_of::<StateHeader>() == 128);
+    const _: () = assert!(align_of::<StateHeader>() == 64);
 
     // --- SymbolEntry ---
     const _: () = assert!(size_of::<SymbolEntry>() == 192, "SymbolEntry 192 bayt olmalı");

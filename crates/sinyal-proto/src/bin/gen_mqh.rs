@@ -21,9 +21,12 @@
 use std::mem::size_of;
 
 use sinyal_proto::msg::{Book, BookLevel, Cmd, Res, SymbolEntry, Tick};
+use sinyal_proto::state::{
+    margin_mode, rec_flag, so_mode, trade_mode, AccountSnapshot, OrderRec, PositionRec,
+};
 use sinyal_proto::{
-    action, book_type, exec_mode, filling, filling_mask, kind, order_type, res_kind, sym_flag,
-    tick_flag, type_time, COMMENT_LEN, MAX_BOOK_DEPTH, SYMBOL_NAME_LEN,
+    action, book_type, exec_mode, filling, filling_mask, kind, order_type, res_kind, res_source,
+    sym_flag, tick_flag, type_time, COMMENT_LEN, MAX_BOOK_DEPTH, SYMBOL_NAME_LEN,
 };
 
 fn main() -> std::io::Result<()> {
@@ -66,6 +69,9 @@ fn render() -> String {
 #define SINYAL_MAX_BOOK_DEPTH       {max_book_depth}
 #define SINYAL_COMMENT_LEN          {comment_len}
 #define SINYAL_SYMBOL_NAME_LEN      {symbol_name_len}
+#define SINYAL_REC_COMMENT_LEN      {rec_comment_len}
+#define SINYAL_MAX_POSITIONS        {max_positions}
+#define SINYAL_MAX_ORDERS           {max_orders}
 
 //--- beklenen yapı boyutları (EA açılışta DLL ile karşılaştırır)
 #define SINYAL_SIZEOF_TICK          {sz_tick}
@@ -74,18 +80,27 @@ fn render() -> String {
 #define SINYAL_SIZEOF_CMD           {sz_cmd}
 #define SINYAL_SIZEOF_RES           {sz_res}
 #define SINYAL_SIZEOF_SYMBOLENTRY   {sz_symentry}
+#define SINYAL_SIZEOF_ACCOUNT       {sz_account}
+#define SINYAL_SIZEOF_POSITION      {sz_position}
+#define SINYAL_SIZEOF_ORDER         {sz_order}
 
 "#,
         proto_version = sinyal_proto::ring::RING_VERSION,
         max_book_depth = MAX_BOOK_DEPTH,
         comment_len = COMMENT_LEN,
         symbol_name_len = SYMBOL_NAME_LEN,
+        rec_comment_len = sinyal_proto::state::REC_COMMENT_LEN,
+        max_positions = sinyal_proto::state::MAX_POSITIONS,
+        max_orders = sinyal_proto::state::MAX_ORDERS,
         sz_tick = size_of::<Tick>(),
         sz_booklevel = size_of::<BookLevel>(),
         sz_book = size_of::<Book>(),
         sz_cmd = size_of::<Cmd>(),
         sz_res = size_of::<Res>(),
         sz_symentry = size_of::<SymbolEntry>(),
+        sz_account = size_of::<AccountSnapshot>(),
+        sz_position = size_of::<PositionRec>(),
+        sz_order = size_of::<OrderRec>(),
     ));
 
     // ---- sabitler ----
@@ -154,6 +169,36 @@ fn render() -> String {
     s.push_str(&def32("SINYAL_SYMFLAG_BOOK_SUBSCRIBED", sym_flag::BOOK_SUBSCRIBED));
     s.push_str(&def32("SINYAL_SYMFLAG_READY", sym_flag::READY));
     s.push_str(&def32("SINYAL_SYMFLAG_POLLED_ONLY", sym_flag::POLLED_ONLY));
+
+    s.push_str("\n//--- Res.source: canli olay mi, mutabakat telafisi mi\n");
+    s.push_str(&def("SINYAL_RESSRC_LIVE", res_source::LIVE));
+    s.push_str(&def("SINYAL_RESSRC_RECONCILE", res_source::RECONCILE));
+
+    s.push_str(
+        "\n//--- ACCOUNT_TRADE_MODE karsiligi.\n\
+         //    MT5'in ham int'i TELE YAZILMAZ: sayisal degerleri resmi dokumanda\n\
+         //    YAYINLANMIYOR. EA switch/case ile bu degerlere cevirir; tanimadigi\n\
+         //    degerde UNKNOWN yazar ve cekirdek UNKNOWN'i GERCEK HESAP gibi ele alir.\n",
+    );
+    s.push_str(&def("SINYAL_TRADEMODE_DEMO", trade_mode::DEMO));
+    s.push_str(&def("SINYAL_TRADEMODE_CONTEST", trade_mode::CONTEST));
+    s.push_str(&def("SINYAL_TRADEMODE_REAL", trade_mode::REAL));
+    s.push_str(&def("SINYAL_TRADEMODE_UNKNOWN", trade_mode::UNKNOWN));
+
+    s.push_str("\n//--- ACCOUNT_MARGIN_MODE karsiligi (hedging'de kapatma ticket ister)\n");
+    s.push_str(&def("SINYAL_MARGINMODE_NETTING", margin_mode::NETTING));
+    s.push_str(&def("SINYAL_MARGINMODE_EXCHANGE", margin_mode::EXCHANGE));
+    s.push_str(&def("SINYAL_MARGINMODE_HEDGING", margin_mode::HEDGING));
+    s.push_str(&def("SINYAL_MARGINMODE_UNKNOWN", margin_mode::UNKNOWN));
+
+    s.push_str("\n//--- ACCOUNT_MARGIN_SO_MODE: so_call/so_so BIRIMI\n");
+    s.push_str(&def("SINYAL_SOMODE_PERCENT", so_mode::PERCENT));
+    s.push_str(&def("SINYAL_SOMODE_MONEY", so_mode::MONEY));
+    s.push_str(&def("SINYAL_SOMODE_UNKNOWN", so_mode::UNKNOWN));
+
+    s.push_str("\n//--- pozisyon/emir kaydi flags bitleri\n");
+    s.push_str(&def("SINYAL_RECFLAG_SYMBOL_TRUNC", rec_flag::SYMBOL_TRUNCATED));
+    s.push_str(&def("SINYAL_RECFLAG_COMMENT_TRUNC", rec_flag::COMMENT_TRUNCATED));
 
     s.push_str("\n//--- geçerlilik süresi (MT5 ENUM_ORDER_TYPE_TIME ile birebir)\n");
     s.push_str(&def("SINYAL_TIME_GTC", type_time::GTC));
@@ -264,22 +309,29 @@ struct SinyalCmd
 //+------------------------------------------------------------------+
 struct SinyalRes
   {{
-   ulong             client_id;      // +0
+   ulong             client_id;      // +0   EA 0 birakir, cekirdek doldurur
    ulong             order;          // +8
    ulong             deal;           // +16
    ulong             position;       // +24
-   double            volume;         // +32
-   double            price;          // +40
-   double            bid;            // +48
-   double            ask;            // +56
-   ulong             recv_qpc;       // +64
-   uint              retcode;        // +72  SEND_ACK'te 10008 = PLACED (DOLMADI!)
-   uint              retcode_external; // +76
-   uint              request_id;     // +80  SEND_ACK <-> TRADE_TXN bagi
-   uchar             kind;           // +84  SINYAL_RES_*
-   uchar             txn_type;       // +85  ENUM_TRADE_TRANSACTION_TYPE
-   uchar             reserved0[2];   // +86  dolgu
-   uchar             comment[SINYAL_COMMENT_LEN]; // +88
+   ulong             position_by;    // +32  CLOSE_BY karsi pozisyon
+   double            volume;         // +40
+   double            price;          // +48
+   double            bid;            // +56
+   double            ask;            // +64
+   ulong             recv_qpc;       // +72
+   uint              retcode;        // +80  SEND_ACK'te 10008 = PLACED (DOLMADI!)
+   uint              retcode_external; // +84
+   uint              request_id;     // +88  SEND_ACK <-> TRADE_TXN bagi
+   uint              reserved0;      // +92  dolgu
+   uchar             comment[SINYAL_COMMENT_LEN]; // +96 (yalniz REQUEST'te dolu)
+   uchar             kind;           // +128 SINYAL_RES_*
+   uchar             txn_type;       // +129 ENUM_TRADE_TRANSACTION_TYPE
+   uchar             order_state;    // +130 ENUM_ORDER_STATE
+   uchar             deal_type;      // +131 ENUM_DEAL_TYPE
+   uchar             order_type;     // +132 ENUM_ORDER_TYPE
+   uchar             source;         // +133 SINYAL_RESSRC_*
+   uchar             reserved1[2];   // +134
+   uchar             reserved2[48];  // +136
   }};
 
 //+------------------------------------------------------------------+
@@ -317,6 +369,123 @@ struct SinyalSymbolEntry
    uchar             name[SINYAL_SYMBOL_NAME_LEN]; // +112
    uchar             reserved1[48];  // +144 gelecekte alan eklemek için
   }};
+
+//+------------------------------------------------------------------+
+//| Hesap durumu. {sz_account} bayt.                                        |
+//|                                                                  |
+//| String alanlar YALNIZCA OnInit'te doldurulur; sicak yolda string  |
+//| donusumu yapilmaz. Sayisal alanlar saniyede bir tazelenir.        |
+//|                                                                  |
+//| trade_mode CANLI PARA KILIDININ dayanagidir. MT5'in ham int'i     |
+//| TELE YAZILMAZ — EA switch/case ile SINYAL_TRADEMODE_* degerlerine |
+//| cevirir, tanimadigi degerde UNKNOWN(255) yazar. Cekirdek UNKNOWN'i|
+//| GERCEK HESAP gibi ele alir (emniyetli taraf).                     |
+//|                                                                  |
+//| margin_so_call/so_so BIRIMI so_mode'a baglidir (yuzde mi para mi).|
+//+------------------------------------------------------------------+
+struct SinyalAccount
+  {{
+   long              time_msc;              // +0
+   double            balance;               // +8
+   double            credit;                // +16
+   double            profit;                // +24
+   double            equity;                // +32
+   double            margin;                // +40
+   double            margin_free;           // +48
+   double            margin_level;          // +56
+   double            margin_so_call;        // +64
+   double            margin_so_so;          // +72
+   double            margin_initial;        // +80
+   double            margin_maintenance;    // +88
+   double            assets;                // +96
+   double            liabilities;           // +104
+   double            commission_blocked;    // +112
+   long              login;                 // +120
+   long              leverage;              // +128
+   int               limit_orders;          // +136
+   int               currency_digits;       // +140
+   uchar             trade_mode;            // +144 SINYAL_TRADEMODE_*
+   uchar             margin_mode;           // +145 SINYAL_MARGINMODE_*
+   uchar             so_mode;               // +146 SINYAL_SOMODE_*
+   uchar             trade_allowed;         // +147 ACCOUNT_TRADE_ALLOWED
+   uchar             trade_expert;          // +148 ACCOUNT_TRADE_EXPERT
+   uchar             terminal_trade_allowed;// +149 TERMINAL_TRADE_ALLOWED
+   uchar             mql_trade_allowed;     // +150 MQL_TRADE_ALLOWED
+   uchar             connected;             // +151 TERMINAL_CONNECTED
+   uchar             fifo_close;            // +152
+   uchar             hedge_allowed;         // +153
+   uchar             str_truncated;         // +154
+   uchar             reserved0[5];          // +155
+   uchar             currency[16];          // +160
+   uchar             server[64];            // +176
+   uchar             company[96];           // +240
+   uchar             name[96];              // +336
+   uchar             reserved1[80];         // +432
+  }};
+
+//+------------------------------------------------------------------+
+//| Acik pozisyon. {sz_position} bayt.                                      |
+//|                                                                  |
+//| ticket : emir gonderiminde kullanilacak anahtar                   |
+//| identifier: gecmis/deal eslestirme anahtari — KAPATMA komutunda   |
+//|             ticket kullanilir, identifier DEGIL                   |
+//| POSITION_COMMISSION alani YOKTUR: MT5'te kullanimdan kalkti ve    |
+//| daima 0 doner; komisyon yalnizca kapanista DEAL_COMMISSION'dan.   |
+//+------------------------------------------------------------------+
+struct SinyalPosition
+  {{
+   ulong             ticket;         // +0   POSITION_TICKET
+   ulong             identifier;     // +8   POSITION_IDENTIFIER
+   ulong             magic;          // +16  POSITION_MAGIC (= client_id)
+   long              time_msc;       // +24  POSITION_TIME_MSC
+   long              time_update_msc;// +32  POSITION_TIME_UPDATE_MSC
+   double            volume;         // +40
+   double            price_open;     // +48
+   double            price_current;  // +56
+   double            sl;             // +64
+   double            tp;             // +72
+   double            profit;         // +80
+   double            swap;           // +88
+   uchar             symbol[SINYAL_SYMBOL_NAME_LEN]; // +96
+   uchar             comment[SINYAL_REC_COMMENT_LEN]; // +128
+   uchar             kind;           // +160 0=BUY 1=SELL
+   uchar             reason;         // +161 ENUM_POSITION_REASON
+   uchar             digits;         // +162
+   uchar             flags;          // +163 SINYAL_RECFLAG_*
+   uchar             reserved0[28];  // +164
+  }};
+
+//+------------------------------------------------------------------+
+//| Bekleyen emir. {sz_order} bayt.                                         |
+//|                                                                  |
+//| volume_current KALAN hacimdir; dolan = initial - current.         |
+//| time_expiration SANIYE cinsindendir (ms varyanti yok).            |
+//+------------------------------------------------------------------+
+struct SinyalOrder
+  {{
+   ulong             ticket;         // +0   ORDER_TICKET
+   ulong             magic;          // +8   ORDER_MAGIC (= client_id)
+   ulong             position_id;    // +16  ORDER_POSITION_ID
+   long              time_setup_msc; // +24
+   long              time_expiration;// +32  SANIYE, 0 = suresiz
+   double            volume_initial; // +40
+   double            volume_current; // +48  KALAN
+   double            price_open;     // +56
+   double            price_stoplimit;// +64
+   double            sl;             // +72
+   double            tp;             // +80
+   double            price_current;  // +88
+   uchar             symbol[SINYAL_SYMBOL_NAME_LEN]; // +96
+   uchar             comment[SINYAL_REC_COMMENT_LEN]; // +128
+   uchar             kind;           // +160 ENUM_ORDER_TYPE
+   uchar             state;          // +161 ENUM_ORDER_STATE
+   uchar             type_time;      // +162
+   uchar             type_filling;   // +163
+   uchar             reason;         // +164 ENUM_ORDER_REASON
+   uchar             digits;         // +165
+   uchar             flags;          // +166
+   uchar             reserved0[25];  // +167
+  }};
 "#,
         sz_tick = size_of::<Tick>(),
         sz_booklevel = size_of::<BookLevel>(),
@@ -324,6 +493,9 @@ struct SinyalSymbolEntry
         sz_cmd = size_of::<Cmd>(),
         sz_res = size_of::<Res>(),
         sz_symentry = size_of::<SymbolEntry>(),
+        sz_account = size_of::<AccountSnapshot>(),
+        sz_position = size_of::<PositionRec>(),
+        sz_order = size_of::<OrderRec>(),
     ));
 
     s
@@ -379,6 +551,7 @@ fn mql5_struct_size(src: &str, name: &str) -> Option<usize> {
                         "SINYAL_COMMENT_LEN" => COMMENT_LEN,
                         "SINYAL_SYMBOL_NAME_LEN" => SYMBOL_NAME_LEN,
                         "SINYAL_MAX_BOOK_DEPTH" => MAX_BOOK_DEPTH,
+                        "SINYAL_REC_COMMENT_LEN" => sinyal_proto::state::REC_COMMENT_LEN,
                         other => panic!("bilinmeyen dizi sabiti: {other}"),
                     },
                 };
@@ -434,6 +607,9 @@ mod tests {
             "SinyalCmd",
             "SinyalRes",
             "SinyalSymbolEntry",
+            "SinyalAccount",
+            "SinyalPosition",
+            "SinyalOrder",
         ] {
             assert!(out.contains(&format!("struct {name}")), "{name} eksik");
         }
@@ -480,13 +656,16 @@ mod tests {
     #[test]
     fn generated_mql5_structs_have_the_same_size_as_rust() {
         let out = render();
-        let cases: [(&str, usize); 6] = [
+        let cases: [(&str, usize); 9] = [
             ("SinyalTick", size_of::<Tick>()),
             ("SinyalBookLevel", size_of::<BookLevel>()),
             ("SinyalBook", size_of::<Book>()),
             ("SinyalCmd", size_of::<Cmd>()),
             ("SinyalRes", size_of::<Res>()),
             ("SinyalSymbolEntry", size_of::<SymbolEntry>()),
+            ("SinyalAccount", size_of::<AccountSnapshot>()),
+            ("SinyalPosition", size_of::<PositionRec>()),
+            ("SinyalOrder", size_of::<OrderRec>()),
         ];
         for (name, rust_size) in cases {
             let mql = mql5_struct_size(&out, name)
