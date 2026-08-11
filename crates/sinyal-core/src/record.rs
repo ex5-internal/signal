@@ -1307,6 +1307,94 @@ mod tests {
     }
 
     #[test]
+    fn a_real_recording_is_loadable_by_the_real_replay_loader() {
+        // KAYDEDİCİ İLE OKUYUCU ARASINDAKİ DİKİŞ.
+        //
+        // Bu dosyanın diğer testleri kaydediciyi KENDİ yükleyicisiyle, replay
+        // testleri de okuyucuyu KENDİ yazdığı dosyayla doğruluyor. İki taraf
+        // birbirini hiç anlamasa bile o testlerin HEPSİ yeşil kalırdı — ve
+        // gerçekten kalmıştı: ilk sürüm sembol tablosunu `wire::SymbolInfo`
+        // olarak yazıyordu, okuyucu ise `id` alanını arıyordu. Birim testleri
+        // bunu göremez, çünkü kimse gerçek bir turu atmıyordu.
+        //
+        // Bu test o turu atar: ÜRETİMDEKİ kaydedici yazar, ÜRETİMDEKİ
+        // yükleyici okur.
+        let dir = TmpDir::new("e2e");
+        let inst = "mt5-1";
+        let date_stamp = day_stamp(now_ms());
+
+        let rec = Recorder::start(dir.path(), inst).expect("kayit acilmali");
+        rec.push_symbols(vec![sym(0, "EURUSD"), sym(1, "XAUUSD")]);
+
+        // Tick'ler 1 ms arayla: tempo `recv_ms` farkından üretildiği için
+        // damgaların gerçekten ilerlemesi gerekiyor.
+        let freq = qpc_frequency().max(1);
+        let base = qpc();
+        let pushed: Vec<Tick> = (0..64u64)
+            .map(|i| {
+                let mut t = tick(i, base + i * freq / 1000);
+                t.symbol_id = (i % 2) as u32;
+                t
+            })
+            .collect();
+        for t in &pushed {
+            rec.push_tick(t);
+        }
+        assert!(rec.stop(), "kayit temiz kapanmali");
+        assert_eq!(rec.counts().dropped, 0, "bu boyutta dusen olmamali");
+
+        let days = list_days(dir.path(), inst).unwrap();
+        assert!(
+            days.contains(&date_stamp),
+            "kaydedici beklenen gun dosyasini acmali: {days:?} icinde {date_stamp} yok"
+        );
+
+        // --- ÜRETİMDEKİ REPLAY YÜKLEYİCİSİ ---
+        let opts = crate::replay::ReplayOpts {
+            speed: 0.0,
+            ..crate::replay::ReplayOpts::new(dir.path(), format!("{date_stamp:08}"))
+        };
+        let loaded = crate::replay::load(&opts)
+            .expect("kaydedicinin urettigi dizin replay tarafindan YUKLENEBILMELI");
+
+        assert_eq!(loaded.instances, vec![inst.to_string()]);
+        assert_eq!(loaded.len(), pushed.len(), "her kayit geri gelmeli");
+
+        // Fiyatlar ve broker saati BİT DÜZEYİNDE aynı dönmeli: kayıt biçimi
+        // yuvarlama yapmaz, yaparsa strateji kayıttan farklı bir seri görür.
+        for (item, w) in loaded.items.iter().zip(&pushed) {
+            assert_eq!(item.rec.bid, w.bid, "bid birebir");
+            assert_eq!(item.rec.ask, w.ask, "ask birebir");
+            assert_eq!(item.rec.last, w.last);
+            assert_eq!(item.rec.time_msc, w.time_msc, "broker saati korunmali");
+            assert_eq!(item.rec.symbol_id, w.symbol_id);
+            assert_eq!(item.rec.flags, w.flags);
+        }
+
+        // Tempo `recv_ms`ten üretiliyor: damgalar ARTAN olmalı, yoksa replay
+        // kaydı yanlış hızda oynatır.
+        for pair in loaded.items.windows(2) {
+            assert!(
+                pair[1].rec.recv_ms >= pair[0].rec.recv_ms,
+                "recv_ms geri gitmemeli: {} -> {}",
+                pair[0].rec.recv_ms,
+                pair[1].rec.recv_ms
+            );
+        }
+
+        // ASIL TUZAK: `symbol_id` → ad eşlemesi. Bu kopmuşsa replay hiçbir
+        // tick'i isimlendiremez ve akış SESSİZCE boşalır.
+        let snaps = &loaded.symbols[0];
+        assert_eq!(snaps.len(), 1, "tek bir tablo goruntusu bekleniyordu");
+        let items = &snaps[0].items;
+        let name_of = |id: u32| {
+            items.iter().find(|i| i.id == id).map(|i| i.s.as_str()).unwrap_or("<YOK>")
+        };
+        assert_eq!(name_of(0), "EURUSD", "symbol_id 0 cozulemedi: {items:?}");
+        assert_eq!(name_of(1), "XAUUSD", "symbol_id 1 cozulemedi: {items:?}");
+    }
+
+    #[test]
     fn utc_day_arithmetic_round_trips() {
         // Kendi takvim aritmetiğimizi kullanıyoruz; artık gün ve yüzyıl
         // kuralları burada kanıtlanmalı.

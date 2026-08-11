@@ -85,86 +85,19 @@ const DAY_MS: i64 = 86_400_000;
 // TickRec — dosyadaki sabit 48 baytlık kayıt
 // ---------------------------------------------------------------------------
 
-/// Diskteki kayıt boyu. **Sabit** — dosya uzunluğunun tek doğruluk kaynağı
-/// olabilmesi buna bağlı.
-pub const TICK_REC_SIZE: usize = 48;
-
-/// Diske yazılan tek tick kaydı — tam 48 bayt.
+/// Diskteki kayıt boyu ve kaydın kendisi — **tek tanım**, `record.rs`'ten.
 ///
-/// Alan sırası dosya biçiminin parçasıdır ve değiştirilemez:
+/// Bir zamanlar bu dosyada ikinci, bağımsız bir `TickRec` vardı: yazıcı
+/// (`record.rs`) ve okuyucu (burası) ayrı ajanlar tarafından aynı şartnameden
+/// yazılmıştı ve ikisi de "48 bayt, şu ofsetler" diyordu. İkisi de kendi
+/// birim testini geçiyordu, çünkü her biri KENDİ yazdığını KENDİ okuyordu.
 ///
-/// ```text
-/// recv_ms    i64  +0    yerel alım zamanı, epoch ms  -> replay TEMPOSU bundan
-/// time_msc   i64  +8    broker sunucu saati, epoch ms -> tüketiciye giden zaman
-/// bid        f64  +16
-/// ask        f64  +24
-/// last       f64  +32
-/// symbol_id  u32  +40
-/// flags      u16  +44
-/// kind       u16  +46
-/// ```
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct TickRec {
-    /// Yerel alım zamanı, epoch ms. Replay temposu **bundan** üretilir.
-    pub recv_ms: i64,
-    /// Broker sunucu saati, epoch ms. Tüketiciye giden zaman budur.
-    pub time_msc: i64,
-    pub bid: f64,
-    pub ask: f64,
-    /// CFD/forex'te 0 olabilir.
-    pub last: f64,
-    pub symbol_id: u32,
-    /// `sinyal_proto::tick_flag::*` maskesi.
-    pub flags: u16,
-    /// `sinyal_proto::kind::*` (dosyada u16 olarak taşınır).
-    pub kind: u16,
-}
-
-// Yerleşim sözleşmesi derleme zamanında kilitleniyor: 48 bayttan sapan bir
-// yapı, "len % 48" kırpmasını sessizce anlamsız yapardı.
-const _: () = {
-    assert!(std::mem::size_of::<TickRec>() == TICK_REC_SIZE);
-    assert!(std::mem::align_of::<TickRec>() == 8);
-};
-
-impl TickRec {
-    /// Kaydı dosya biçimine (little-endian) çevir.
-    ///
-    /// Baytlar açıkça yazılıyor, `transmute` ile değil: kayıt dosyası
-    /// makineler arasında taşınabilir olmalı ve okuyucu, yazıcının hangi
-    /// derleyiciyle üretildiğine bağlı kalmamalı. Desteklenen hedeflerin
-    /// hepsi little-endian olduğu için sonuç ham `memcpy` ile aynıdır.
-    pub fn to_bytes(self) -> [u8; TICK_REC_SIZE] {
-        let mut b = [0u8; TICK_REC_SIZE];
-        b[0..8].copy_from_slice(&self.recv_ms.to_le_bytes());
-        b[8..16].copy_from_slice(&self.time_msc.to_le_bytes());
-        b[16..24].copy_from_slice(&self.bid.to_le_bytes());
-        b[24..32].copy_from_slice(&self.ask.to_le_bytes());
-        b[32..40].copy_from_slice(&self.last.to_le_bytes());
-        b[40..44].copy_from_slice(&self.symbol_id.to_le_bytes());
-        b[44..46].copy_from_slice(&self.flags.to_le_bytes());
-        b[46..48].copy_from_slice(&self.kind.to_le_bytes());
-        b
-    }
-
-    /// Dosya biçiminden oku. Dilim TAM 48 bayt olmalı.
-    pub fn from_bytes(b: &[u8]) -> Self {
-        debug_assert_eq!(b.len(), TICK_REC_SIZE);
-        let i64_at = |o: usize| i64::from_le_bytes(b[o..o + 8].try_into().unwrap());
-        let f64_at = |o: usize| f64::from_le_bytes(b[o..o + 8].try_into().unwrap());
-        Self {
-            recv_ms: i64_at(0),
-            time_msc: i64_at(8),
-            bid: f64_at(16),
-            ask: f64_at(24),
-            last: f64_at(32),
-            symbol_id: u32::from_le_bytes(b[40..44].try_into().unwrap()),
-            flags: u16::from_le_bytes(b[44..46].try_into().unwrap()),
-            kind: u16::from_le_bytes(b[46..48].try_into().unwrap()),
-        }
-    }
-}
+/// Bu, sessiz veri bozulmasının klasik kaynağıdır: biri bir alan eklediğinde
+/// veya bir ofset kaydırdığında derleyici hiçbir şey söylemez, testler yeşil
+/// kalır ve bozukluk ancak aylar sonra "grafik saçmalıyor" diye ortaya çıkar.
+/// Tek bir on-disk biçimin tek bir tanımı olmalı; yerleşim değişirse iki
+/// taraf da AYNI anda değişsin diye tip buradan yeniden dışa veriliyor.
+pub use crate::record::{TickRec, REC_SIZE as TICK_REC_SIZE};
 
 // ---------------------------------------------------------------------------
 // symbols-YYYYMMDD.jsonl
@@ -561,7 +494,8 @@ pub fn load_ticks(path: &Path) -> Result<Vec<TickRec>, ReplayError> {
     }
     let mut out = Vec::with_capacity(full / TICK_REC_SIZE);
     for c in bytes[..full].chunks_exact(TICK_REC_SIZE) {
-        out.push(TickRec::from_bytes(c));
+        // `chunks_exact` tam 48 bayt garanti eder; dönüşüm başarısız olamaz.
+        out.push(TickRec::from_bytes(c.try_into().expect("chunks_exact 48 bayt verir")));
     }
     Ok(out)
 }
