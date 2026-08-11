@@ -1024,12 +1024,22 @@ void ReportTelemetry(const bool force)
 
    PrintFormat("Sinyal: tick=%I64u (+%I64u) halka-kayip=%I64u birikmis=%I64u | "
                "dom=%I64u (kayip=%I64u) | kopru-hata=%I64u symtick-hata=%I64u | "
-               "timer-atlama=%I64u msc-geri=%I64u | emir=%I64u/red=%I64u",
+               "timer-atlama=%I64u msc-geri=%I64u | emir=%I64u/red=%I64u | "
+               "durum=%I64u/hata=%I64u res-kayip=%I64u",
                g_ticks_pushed, delta, ring_lost, backlog,
                g_books_pushed, g_books_dropped,
                g_push_errors, g_symtick_fails,
                g_timer_skips, g_msc_regress,
-               g_cmds_done, g_cmds_rejected);
+               g_cmds_done, g_cmds_rejected,
+               g_state_pubs, g_state_errs, g_res_dropped);
+
+   // Durum hiç yayımlanmadıysa çekirdek hesap/pozisyon göremez. Bu sessiz
+   // kalırsa "account boş dönüyor" sorununun sebebi anlaşılamaz.
+   if(g_state_pubs == 0)
+      Print("Sinyal: UYARI — durum HİÇ yayımlanmadı. Çekirdek hesap ve "
+            "pozisyon bilgisi göremez.");
+   if(g_state_errs > 0)
+      PrintFormat("Sinyal: UYARI — durum yayını %I64u kez BAŞARISIZ oldu.", g_state_errs);
 
    if(ring_lost > 0)
       Print("Sinyal: UYARI — halka doldu ve tick KAYBEDİLDİ. "
@@ -1099,6 +1109,16 @@ void OnTimer()
    //    ediliyor; onları da taramak zararsız (değişmemişse yayın yok).
    for(int i = 0; i < g_count; i++)
       PushIfChanged(i, SINYAL_KIND_TICK);
+
+   // 3) Durumu yayımla: saniyede bir, veya OnTrade tetiklediyse hemen.
+   //    Olay-güdümlü + heartbeat hibrit. HistorySelect BURADA ÇAĞRILMAZ.
+   datetime now_s = TimeLocal();
+   if(g_state_dirty || now_s != g_last_state_pub)
+     {
+      PublishState();
+      g_last_state_pub = now_s;
+      g_state_dirty = false;
+     }
 
    ReportTelemetry(false);
   }

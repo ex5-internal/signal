@@ -23,6 +23,17 @@ use core::ffi::c_void;
 mod ffi {
     use core::ffi::c_void;
 
+    // BCryptGenRandom bcrypt.dll'de; digerleri kernel32'de (varsayilan).
+    #[link(name = "bcrypt")]
+    extern "system" {
+        pub fn BCryptGenRandom(
+            h_algorithm: *mut c_void,
+            pb_buffer: *mut u8,
+            cb_buffer: u32,
+            dw_flags: u32,
+        ) -> i32;
+    }
+
     pub const INVALID_HANDLE_VALUE: isize = -1;
     pub const PAGE_READWRITE: u32 = 0x04;
     pub const FILE_MAP_ALL_ACCESS: u32 = 0x000F_001F;
@@ -329,6 +340,55 @@ impl core::fmt::Debug for InstanceLock {
     }
 }
 
+/// Kriptografik olarak güvenli rastgele baytlar.
+///
+/// Token üretimi için. `rand` benzeri bir bağımlılık eklemek yerine sistemin
+/// kendi CSPRNG'si kullanılır — bu kütüphane MT5 sürecine yükleniyor ve
+/// bağımlılıksız kalması gerekiyor.
+///
+/// Sistem rastgelelik veremezse `None` döner; **tahmin edilebilir bir değere
+/// düşmez**. Zayıf bir token üretip onu güçlü sanmak, hiç üretmemekten kötüdür.
+pub fn random_bytes(out: &mut [u8]) -> Option<()> {
+    const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
+    if out.is_empty() {
+        return Some(());
+    }
+    // Güvenlik: `out` geçerli ve yazılabilir; uzunluk doğru veriliyor.
+    let status = unsafe {
+        ffi::BCryptGenRandom(
+            core::ptr::null_mut(),
+            out.as_mut_ptr(),
+            out.len() as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    // NTSTATUS: 0 = STATUS_SUCCESS.
+    if status == 0 {
+        Some(())
+    } else {
+        None
+    }
+}
+
+/// URL-güvenli base64 (dolgusuz) — token metni için.
+pub fn base64url(data: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut s = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        s.push(A[(n >> 18) as usize & 63] as char);
+        s.push(A[(n >> 12) as usize & 63] as char);
+        if chunk.len() > 1 {
+            s.push(A[(n >> 6) as usize & 63] as char);
+        }
+        if chunk.len() > 2 {
+            s.push(A[n as usize & 63] as char);
+        }
+    }
+    s
+}
+
 /// Çağıran thread'in işletim sistemi kimliği.
 ///
 /// SPSC sözleşmesinin çalışma zamanı denetimi için: halkaya yazan thread
@@ -526,6 +586,42 @@ mod tests {
 
         let other = std::thread::spawn(current_thread_id).join().unwrap();
         assert_ne!(mine, other, "farklı thread farklı kimlik vermeli");
+    }
+
+    #[test]
+    fn random_bytes_are_filled_and_not_repeating() {
+        let mut a = [0u8; 32];
+        let mut b = [0u8; 32];
+        random_bytes(&mut a).expect("sistem CSPRNG çalışmalı");
+        random_bytes(&mut b).expect("sistem CSPRNG çalışmalı");
+        assert_ne!(a, [0u8; 32], "tampon doldurulmalı");
+        assert_ne!(a, b, "iki çağrı aynı değeri vermemeli");
+        assert!(random_bytes(&mut []).is_some(), "boş dilim sorun olmamalı");
+    }
+
+    #[test]
+    fn base64url_encodes_without_padding_or_unsafe_chars() {
+        assert_eq!(base64url(b""), "");
+        assert_eq!(base64url(b"f"), "Zg");
+        assert_eq!(base64url(b"fo"), "Zm8");
+        assert_eq!(base64url(b"foo"), "Zm9v");
+        assert_eq!(base64url(b"foobar"), "Zm9vYmFy");
+
+        // URL/komut satırı güvenli olmalı: '+' '/' '=' ÇIKMAMALI.
+        let mut buf = [0u8; 96];
+        random_bytes(&mut buf).unwrap();
+        let s = base64url(&buf);
+        assert!(!s.contains('+') && !s.contains('/') && !s.contains('='), "güvensiz karakter: {s}");
+        assert!(s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+    }
+
+    #[test]
+    fn generated_token_has_enough_entropy_to_be_unguessable() {
+        // 32 bayt = 256 bit; base64url'de 43 karakter.
+        let mut buf = [0u8; 32];
+        random_bytes(&mut buf).unwrap();
+        let t = base64url(&buf);
+        assert_eq!(t.len(), 43, "32 bayt 43 karakter olmalı, bulunan {}", t.len());
     }
 
     #[test]

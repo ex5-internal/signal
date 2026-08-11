@@ -8,6 +8,7 @@
 //! sinyald --instance icmarkets --instance pepperstone --enable-trading --token gizli
 //! ```
 
+mod candles;
 mod join;
 mod server;
 mod source;
@@ -83,6 +84,23 @@ impl Args {
                     a.allow_live = true;
                     i += 1;
                 }
+                "--generate-token" => {
+                    // Sistem CSPRNG'si; zayif bir degere DUSMEZ.
+                    let mut buf = [0u8; 32];
+                    match sinyal_shm::random_bytes(&mut buf) {
+                        Some(()) => {
+                            println!("{}", sinyal_shm::base64url(&buf));
+                            std::process::exit(0);
+                        }
+                        None => {
+                            eprintln!(
+                                "hata: sistem rastgelelik uretemedi. Tahmin edilebilir bir \
+                                 token uretmektense hic uretmemek dogru."
+                            );
+                            std::process::exit(1);
+                        }
+                    }
+                }
                 "--help" | "-h" => {
                     usage();
                     std::process::exit(0);
@@ -109,6 +127,7 @@ SEÇENEKLER:
                       (varsayılan: mt5-1)
   --bind ADDR         Dinlenecek adres (varsayılan: 127.0.0.1:8787)
   --token GIZLI       Kimlik doğrulama token'ı. Verilmezse doğrulama YOK.
+  --generate-token    Guclu rastgele token uretip basar ve cikar
   --enable-trading    Emir yürütmeyi aç (varsayılan KAPALI)
   --allow-live        DEMO OLMAYAN hesapta emir yürütmeye izin ver.
                       Varsayılan kapalı; hesap tipi okunamazsa da kapalı
@@ -134,6 +153,7 @@ async fn main() {
     };
 
     let registry = Arc::new(Registry::new());
+    let candles = Arc::new(Mutex::new(candles::CandleStore::new()));
     let (tx, _) = broadcast::channel(args.capacity);
 
     let mut cmd_tx = HashMap::new();
@@ -141,7 +161,7 @@ async fn main() {
     for inst in &args.instances {
         let (ctx_tx, ctx_rx) = std::sync::mpsc::channel();
         let stats = Arc::new(Mutex::new(ReaderStats::default()));
-        spawn_reader(inst.clone(), registry.clone(), tx.clone(), ctx_rx, stats.clone());
+        spawn_reader(inst.clone(), registry.clone(), tx.clone(), ctx_rx, stats.clone(), candles.clone());
         cmd_tx.insert(inst.clone(), ctx_tx);
         stats_all.push((inst.clone(), stats));
     }
@@ -155,6 +175,7 @@ async fn main() {
         allow_live: args.allow_live,
         deviation: args.deviation,
         orders: Arc::new(OrderTracker::new()),
+        candles: candles.clone(),
     });
 
     let listener = match TcpListener::bind(&args.bind).await {
@@ -172,10 +193,17 @@ async fn main() {
         "  kimlik   : {}",
         if args.token.is_some() { "token gerekli" } else { "YOK (açık uç)" }
     );
-    if args.token.is_none() && !args.bind.starts_with("127.") {
-        eprintln!(
-            "UYARI: token olmadan localhost dışına bağlanıyorsun — bu uç emir yürütebilir."
-        );
+    let public_bind = !args.bind.starts_with("127.");
+    if public_bind {
+        println!();
+        println!("  Piyasa verisi (tick/derinlik/mum/sembol) TOKEN'SIZ acik.");
+        if args.token.is_some() {
+            println!("  Hesap ve emir islemleri token istiyor.");
+            println!("  NOT: ws:// duz metin — token ag uzerinde acik gider.");
+        } else {
+            eprintln!("  UYARI: token YOK ve localhost disina baglaniyorsun.");
+            eprintln!("         Emir yurutme herkese acik olur. --token KULLAN.");
+        }
     }
 
     // Periyodik durum raporu: akışın canlı olup olmadığını görmenin en hızlı

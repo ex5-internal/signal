@@ -39,6 +39,19 @@ pub enum ClientMsg {
     /// Sembol tablosunu iste.
     Symbols,
 
+    /// Mum (OHLC) geçmişi iste.
+    ///
+    /// DİKKAT: geçmiş, daemon başladığı andan itibarendir — geriye dönük
+    /// broker geçmişi YOKTUR. İlk bar `partial: true` ile işaretlenir.
+    Candles {
+        symbol: String,
+        /// `M1` | `M5` | `M15` | `M30` | `H1` | `H4`
+        #[serde(default = "default_tf")]
+        tf: String,
+        #[serde(default = "default_candle_count")]
+        count: usize,
+    },
+
     /// Hesap durumunu iste (bakiye, equity, marjin, izinler, hesap tipi).
     Account,
 
@@ -145,6 +158,14 @@ pub struct OrderReq {
     pub comment: String,
 }
 
+fn default_tf() -> String {
+    "M1".into()
+}
+
+fn default_candle_count() -> usize {
+    300
+}
+
 fn default_action() -> String {
     "deal".into()
 }
@@ -165,11 +186,15 @@ pub enum ServerMsg {
         instances: Vec<String>,
         /// Emir yürütme açık mı.
         trading: bool,
-        /// Kimlik doğrulama gerekiyor mu.
-        auth_required: bool,
+        /// Piyasa verisi (tick/derinlik/mum/sembol) token'sız erişilebilir mi.
+        public_feed: bool,
+        /// Hesap ve emir işlemleri için token gerekiyor mu.
+        auth_required_for_trading: bool,
+        /// Bu bağlantının şu anki seviyesi: `public` | `trader`.
+        level: &'static str,
     },
 
-    Authed,
+    Authed { level: &'static str },
 
     /// Tek fiyat güncellemesi. Alan adları kısa — yüksek frekanslı.
     Tick {
@@ -203,6 +228,20 @@ pub enum ServerMsg {
     Symbols { items: Vec<SymbolInfo> },
 
     Snapshot { items: Vec<TickSnap> },
+
+    /// İstenen mum geçmişi.
+    Candles {
+        s: String,
+        tf: String,
+        items: Vec<crate::candles::Bar>,
+    },
+
+    /// Bir mum kapandı (canlı).
+    Candle {
+        s: String,
+        tf: &'static str,
+        bar: crate::candles::Bar,
+    },
 
     Account { items: Vec<AccountInfo> },
 

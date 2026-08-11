@@ -37,6 +37,8 @@ pub struct Ctx {
     /// Varsayılan kayma toleransı (point).
     pub deviation: u32,
     pub orders: Arc<OrderTracker>,
+    /// Mum deposu — okuyucu thread'i yazar, WS okur.
+    pub candles: Arc<Mutex<crate::candles::CandleStore>>,
 }
 
 /// İstemci kimliği (metin) ile wire kimliği (u64) arasındaki eşleme.
@@ -83,6 +85,45 @@ impl OrderTracker {
     }
 }
 
+/// Bir bağlantının yetki seviyesi.
+///
+/// Bağlantı **Public** olarak başlar: piyasa verisi (tick, derinlik, mum,
+/// sembol listesi) token istemez — grafik çizen bir istemcinin gizli bir şeye
+/// ihtiyacı yok. `auth` başarılı olunca **Trader**'a yükselir ve hesap
+/// bilgisi + emir yürütme açılır.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Level {
+    Public,
+    Trader,
+}
+
+impl Level {
+    fn name(self) -> &'static str {
+        match self {
+            Level::Public => "public",
+            Level::Trader => "trader",
+        }
+    }
+}
+
+/// İki gizli değeri **sabit zamanda** karşılaştır.
+///
+/// Sıradan `==` ilk farklı baytta döner; saldırgan yanıt süresinden token'ı
+/// bayt bayt tahmin edebilir. Bağımlılık eklemeye değmeyecek kadar basit.
+fn secret_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    // Uzunluk farkı zaten sızar; onu gizlemeye çalışmıyoruz, önemli olan
+    // eşit uzunlukta erken dönmemek.
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
 /// Bir istemcinin abonelikleri.
 #[derive(Default)]
 struct Subs {
@@ -90,6 +131,9 @@ struct Subs {
     book_all: bool,
     ticks: HashSet<String>,
     books: HashSet<String>,
+    /// "SEMBOL.TF" biçiminde; joker "*.TF" tüm sembolleri kapsar.
+    candles: HashSet<String>,
+    candle_all_tf: HashSet<String>,
     orders: bool,
 }
 
@@ -104,6 +148,16 @@ impl Subs {
             Some(("book", s)) => {
                 self.books.insert(s.to_owned());
             }
+            // candle.EURUSD.M5  veya  candle.*.M5
+            Some(("candle", rest)) => match rest.split_once('.') {
+                Some(("*", tf)) => {
+                    self.candle_all_tf.insert(tf.to_ascii_uppercase());
+                }
+                Some((sym, tf)) => {
+                    self.candles.insert(format!("{sym}.{}", tf.to_ascii_uppercase()));
+                }
+                None => {}
+            },
             _ if ch == "order" => self.orders = true,
             _ => {}
         }
@@ -119,6 +173,15 @@ impl Subs {
             Some(("book", s)) => {
                 self.books.remove(s);
             }
+            Some(("candle", rest)) => match rest.split_once('.') {
+                Some(("*", tf)) => {
+                    self.candle_all_tf.remove(&tf.to_ascii_uppercase());
+                }
+                Some((sym, tf)) => {
+                    self.candles.remove(&format!("{sym}.{}", tf.to_ascii_uppercase()));
+                }
+                None => {}
+            },
             _ if ch == "order" => self.orders = false,
             _ => {}
         }
@@ -129,6 +192,9 @@ impl Subs {
             FeedEvent::Tick { symbol, .. } => self.tick_all || self.ticks.contains(&**symbol),
             FeedEvent::Book { symbol, .. } => self.book_all || self.books.contains(&**symbol),
             FeedEvent::Order { .. } => self.orders,
+            FeedEvent::Candle { symbol, tf, .. } => {
+                self.candle_all_tf.contains(*tf) || self.candles.contains(&format!("{symbol}.{tf}"))
+            }
         }
     }
 }
@@ -163,14 +229,17 @@ async fn handle(stream: TcpStream, ctx: Arc<Ctx>) -> Result<(), String> {
     let mut rx = ctx.events.subscribe();
     let mut subs = Subs::default();
     let auth_required = ctx.token.is_some();
-    let mut authed = !auth_required;
+    let mut level = Level::Public;
 
     let hello = ServerMsg::Hello {
         proto: sinyal_proto::ring::RING_VERSION,
         mode: "live",
         instances: ctx.registry.instances(),
         trading: ctx.trading,
-        auth_required,
+        // Piyasa verisi daima token'sız; yalnızca hesap ve emir kilitli.
+        public_feed: true,
+        auth_required_for_trading: auth_required,
+        level: Level::Public.name(),
     };
     send(&mut out, &hello).await?;
 
@@ -180,7 +249,7 @@ async fn handle(stream: TcpStream, ctx: Arc<Ctx>) -> Result<(), String> {
             ev = rx.recv() => {
                 match ev {
                     Ok(ev) => {
-                        if !authed || !subs.wants(&ev) {
+                        if !subs.wants(&ev) {
                             continue;
                         }
                         let msg = match to_wire(&ev, &ctx) {
@@ -211,7 +280,7 @@ async fn handle(stream: TcpStream, ctx: Arc<Ctx>) -> Result<(), String> {
                             }).await?;
                             continue;
                         };
-                        if let Some(reply) = handle_client_msg(cm, &ctx, &mut subs, &mut authed) {
+                        if let Some(reply) = handle_client_msg(cm, &ctx, &mut subs, &mut level) {
                             for m in reply {
                                 send(&mut out, &m).await?;
                             }
@@ -255,6 +324,11 @@ fn to_wire(ev: &FeedEvent, ctx: &Ctx) -> Option<ServerMsg> {
             asks: asks.clone(),
             src: instance.to_string(),
         },
+        FeedEvent::Candle { symbol, tf, bar } => ServerMsg::Candle {
+            s: symbol.to_string(),
+            tf,
+            bar: *bar,
+        },
         FeedEvent::Order {
             instance, client_id, kind, retcode, order, deal, position, volume, price, comment,
         } => {
@@ -277,36 +351,77 @@ fn to_wire(ev: &FeedEvent, ctx: &Ctx) -> Option<ServerMsg> {
     })
 }
 
+/// Trader seviyesi gerektiren işlemler için tek tip ret mesajı.
+fn needs_auth(what: &str) -> ServerMsg {
+    ServerMsg::Error {
+        msg: format!("'{what}' icin auth gerekli — once {{\"op\":\"auth\",\"token\":\"...\"}} gonderin"),
+    }
+}
+
 fn handle_client_msg(
     cm: ClientMsg,
     ctx: &Ctx,
     subs: &mut Subs,
-    authed: &mut bool,
+    level: &mut Level,
 ) -> Option<Vec<ServerMsg>> {
-    // Kimlik doğrulanmadan hiçbir şey yapılmaz — bu uç emir yürütebiliyor.
-    if !*authed {
-        return Some(match cm {
-            ClientMsg::Auth { token } => {
-                if ctx.token.as_deref() == Some(token.as_str()) {
-                    *authed = true;
-                    vec![ServerMsg::Authed]
-                } else {
-                    vec![ServerMsg::Error { msg: "gecersiz token".into() }]
-                }
-            }
-            _ => vec![ServerMsg::Error { msg: "once auth gonderin".into() }],
-        });
+    // Trader gerektiren işlemleri en başta ayıkla. Public yüzey (piyasa
+    // verisi) hiçbir kontrolden geçmez — grafik çizen istemci token istemez.
+    let trader_only = matches!(
+        cm,
+        ClientMsg::Account
+            | ClientMsg::Positions
+            | ClientMsg::Orders
+            | ClientMsg::Order(_)
+            | ClientMsg::Cancel { .. }
+            | ClientMsg::Close { .. }
+            | ClientMsg::ModifySltp { .. }
+    );
+    if trader_only && *level != Level::Trader {
+        let what = match cm {
+            ClientMsg::Account => "account",
+            ClientMsg::Positions => "positions",
+            ClientMsg::Orders => "orders",
+            ClientMsg::Order(_) => "order",
+            ClientMsg::Cancel { .. } => "cancel",
+            ClientMsg::Close { .. } => "close",
+            ClientMsg::ModifySltp { .. } => "modify_sltp",
+            _ => "islem",
+        };
+        return Some(vec![needs_auth(what)]);
     }
 
     Some(match cm {
-        ClientMsg::Auth { .. } => vec![ServerMsg::Authed],
+        ClientMsg::Auth { token } => {
+            match ctx.token.as_deref() {
+                // Sunucuda token tanımlı değilse yükseltme yapılamaz; sessizce
+                // "tamam" demek istemciyi yanıltırdı.
+                None => vec![ServerMsg::Error {
+                    msg: "sunucuda token tanimli degil — islem yurutme kapali".into(),
+                }],
+                Some(expected) if secret_eq(expected, &token) => {
+                    *level = Level::Trader;
+                    vec![ServerMsg::Authed { level: Level::Trader.name() }]
+                }
+                Some(_) => {
+                    // Seviye DEĞİŞMEZ; başarısız denemeden sonra public kalır.
+                    vec![ServerMsg::Error { msg: "gecersiz token".into() }]
+                }
+            }
+        }
         ClientMsg::Ping => vec![ServerMsg::Pong],
 
         ClientMsg::Subscribe { channels } => {
+            let mut out = Vec::new();
             for c in &channels {
+                // `order` kanalı emir akışını taşır — hesap gizliliği kapsamında,
+                // token ister. Piyasa kanalları istemez.
+                if c == "order" && *level != Level::Trader {
+                    out.push(needs_auth("subscribe order"));
+                    continue;
+                }
                 subs.add(c);
             }
-            vec![]
+            out
         }
         ClientMsg::Unsubscribe { channels } => {
             for c in &channels {
@@ -359,6 +474,26 @@ fn handle_client_msg(
                 })
                 .collect();
             vec![ServerMsg::Snapshot { items }]
+        }
+
+        ClientMsg::Candles { symbol, tf, count } => {
+            if crate::candles::tf_millis(&tf).is_none() {
+                let names: Vec<&str> =
+                    crate::candles::TIMEFRAMES.iter().map(|(n, _)| *n).collect();
+                vec![ServerMsg::Error {
+                    msg: format!("gecersiz tf '{tf}' — gecerli: {}", names.join(", ")),
+                }]
+            } else {
+                // Üst sınır: bir istemci 10 milyon bar isteyip belleği
+                // şişirmesin.
+                let n = count.min(crate::candles::MAX_REQUEST);
+                let items = ctx
+                    .candles
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&symbol, &tf, n);
+                vec![ServerMsg::Candles { s: symbol, tf: tf.to_ascii_uppercase(), items }]
+            }
         }
 
         ClientMsg::Account => vec![ServerMsg::Account { items: collect_accounts(ctx) }],
@@ -731,6 +866,73 @@ fn short(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_comparison_is_length_and_content_correct() {
+        assert!(secret_eq("abc", "abc"));
+        assert!(!secret_eq("abc", "abd"));
+        assert!(!secret_eq("abc", "ab"));
+        assert!(!secret_eq("", "a"));
+        assert!(secret_eq("", ""));
+        // Uzun token'da tek bayt farkı yakalanmalı.
+        let a = "A45zSMQPMrR7yL8qmu9sUHe1DBUcuvGMyc7fVF1sZC0";
+        let mut b = a.to_string();
+        b.replace_range(42..43, "1");
+        assert!(!secret_eq(a, &b), "son bayttaki fark yakalanmalı");
+    }
+
+    #[test]
+    fn candle_subscriptions_match_symbol_and_wildcard() {
+        let mut s = Subs::default();
+        let ev = |sym: &str, tf: &'static str| FeedEvent::Candle {
+            symbol: Arc::from(sym),
+            tf,
+            bar: crate::candles::Bar {
+                t: 0,
+                o: 1.0,
+                h: 1.0,
+                l: 1.0,
+                c: 1.0,
+                ticks: 1,
+                partial: false,
+            },
+        };
+
+        assert!(!s.wants(&ev("EURUSD", "M1")), "abone olmadan gitmemeli");
+
+        s.add("candle.EURUSD.M1");
+        assert!(s.wants(&ev("EURUSD", "M1")));
+        assert!(!s.wants(&ev("EURUSD", "M5")), "başka dilim kapsanmamalı");
+        assert!(!s.wants(&ev("GOLD", "M1")), "başka sembol kapsanmamalı");
+
+        s.add("candle.*.M5");
+        assert!(s.wants(&ev("GOLD", "M5")), "joker tüm sembolleri kapsamalı");
+        assert!(s.wants(&ev("EURUSD", "M1")), "tekil abonelik korunmalı");
+
+        // Küçük harf de kabul edilmeli.
+        let mut s2 = Subs::default();
+        s2.add("candle.eurusd.m15");
+        assert!(s2.wants(&ev("eurusd", "M15")));
+
+        s.remove("candle.*.M5");
+        assert!(!s.wants(&ev("GOLD", "M5")));
+    }
+
+    #[test]
+    fn candle_subscription_does_not_leak_into_other_channels() {
+        let mut s = Subs::default();
+        s.add("candle.*.M1");
+        let tick = FeedEvent::Tick {
+            instance: Arc::from("i"),
+            symbol: Arc::from("EURUSD"),
+            bid: 1.0,
+            ask: 1.0,
+            last: 0.0,
+            time_msc: 0,
+            lat_us: 0,
+        };
+        assert!(!s.wants(&tick), "mum aboneliği tick getirmemeli");
+    }
 
     #[test]
     fn duplicate_order_id_is_refused() {

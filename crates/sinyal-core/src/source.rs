@@ -19,6 +19,7 @@ use sinyal_proto::{book_type, Cmd, Tick};
 use sinyal_shm::{qpc, qpc_delta_nanos};
 use tokio::sync::broadcast;
 
+use crate::candles::CandleStore;
 use crate::join::OrderJoin;
 use crate::state::{LastTick, Registry};
 
@@ -54,6 +55,16 @@ pub enum FeedEvent {
         price: f64,
         comment: String,
     },
+    /// Bir mum kapandı.
+    ///
+    /// Yalnızca KAPANAN bar yayılır; açık barın her tick'te güncellenmesini
+    /// yayınlamak tick akışını ikiye katlardı. İstemci açık barı zaten tick
+    /// akışından kendisi güncelleyebilir.
+    Candle {
+        symbol: Arc<str>,
+        tf: &'static str,
+        bar: crate::candles::Bar,
+    },
 }
 
 /// Okuyucu thread'inin durumu (teşhis).
@@ -79,16 +90,18 @@ pub struct ReaderStats {
 ///
 /// Thread, EA gelene kadar bağlanmayı yeniden dener; bu beklenen bir
 /// durumdur (çekirdek terminalden önce başlamış olabilir).
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_reader(
     instance: String,
     registry: Arc<Registry>,
     tx: broadcast::Sender<FeedEvent>,
     cmd_rx: Receiver<Cmd>,
     stats: Arc<std::sync::Mutex<ReaderStats>>,
+    candles: Arc<std::sync::Mutex<CandleStore>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name(format!("sinyal-rd-{instance}"))
-        .spawn(move || reader_loop(instance, registry, tx, cmd_rx, stats))
+        .spawn(move || reader_loop(instance, registry, tx, cmd_rx, stats, candles))
         .expect("okuyucu thread'i başlatılamadı")
 }
 
@@ -98,6 +111,7 @@ fn reader_loop(
     tx: broadcast::Sender<FeedEvent>,
     cmd_rx: Receiver<Cmd>,
     stats: Arc<std::sync::Mutex<ReaderStats>>,
+    candles: Arc<std::sync::Mutex<CandleStore>>,
 ) {
     let inst: Arc<str> = Arc::from(instance.as_str());
 
@@ -152,10 +166,25 @@ fn reader_loop(
                     t.symbol_id,
                     LastTick { bid: t.bid, ask: t.ask, last: t.last, time_msc: t.time_msc },
                 );
+                let sym: Arc<str> = Arc::from(name.as_str());
+
+                // Mum deposunu besle; kapanan barlar ayrıca yayılır.
+                let closed = {
+                    let mut cs = candles.lock().unwrap_or_else(|e| e.into_inner());
+                    cs.on_tick(&name, t.bid, t.ask, t.time_msc)
+                };
+                for cb in closed {
+                    let _ = tx.send(FeedEvent::Candle {
+                        symbol: Arc::from(cb.symbol.as_str()),
+                        tf: cb.tf,
+                        bar: cb.bar,
+                    });
+                }
+
                 // Abone yoksa `send` hata döner — bu normal, yok sayılır.
                 let _ = tx.send(FeedEvent::Tick {
                     instance: inst.clone(),
-                    symbol: Arc::from(name.as_str()),
+                    symbol: sym,
                     bid: t.bid,
                     ask: t.ask,
                     last: t.last,
@@ -387,7 +416,7 @@ mod tests {
         let (tx, mut rx) = broadcast::channel(256);
         let (_cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         let stats = Arc::new(std::sync::Mutex::new(ReaderStats::default()));
-        let _rd = spawn_reader(inst.clone(), registry.clone(), tx, cmd_rx, stats);
+        let _rd = spawn_reader(inst.clone(), registry.clone(), tx, cmd_rx, stats, Arc::new(std::sync::Mutex::new(CandleStore::new())));
 
         // Okuyucunun bağlanıp sembol tablosunu almasını bekle.
         std::thread::sleep(Duration::from_millis(300));
@@ -436,7 +465,7 @@ mod tests {
         let (tx, mut rx) = broadcast::channel(256);
         let (_cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         let stats = Arc::new(std::sync::Mutex::new(ReaderStats::default()));
-        let _rd = spawn_reader(inst.clone(), registry.clone(), tx, cmd_rx, stats);
+        let _rd = spawn_reader(inst.clone(), registry.clone(), tx, cmd_rx, stats, Arc::new(std::sync::Mutex::new(CandleStore::new())));
         std::thread::sleep(Duration::from_millis(300));
 
         ea.run(|s| {
@@ -484,7 +513,7 @@ mod tests {
         let (tx, _rx) = broadcast::channel(256);
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         let stats = Arc::new(std::sync::Mutex::new(ReaderStats::default()));
-        let _rd = spawn_reader(inst.clone(), registry.clone(), tx, cmd_rx, stats);
+        let _rd = spawn_reader(inst.clone(), registry.clone(), tx, cmd_rx, stats, Arc::new(std::sync::Mutex::new(CandleStore::new())));
         std::thread::sleep(Duration::from_millis(300));
 
         cmd_tx
