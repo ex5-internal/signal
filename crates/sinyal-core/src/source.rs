@@ -22,6 +22,7 @@ use tokio::sync::broadcast;
 use crate::candles::CandleStore;
 use crate::history::{HistClient, HistCmd, HistReply, HistStatus, DEFAULT_TIMEOUT};
 use crate::join::OrderJoin;
+use crate::record::RecorderHandle;
 use crate::state::{LastTick, Registry};
 
 /// Abonelere yayılan olay.
@@ -105,6 +106,20 @@ pub struct ReaderStats {
     pub hist_timeout: u64,
     /// Su an cevabi beklenen gecmis istegi sayisi.
     pub hist_pending: u64,
+    /// Tick kaydi acik mi (`--record`).
+    pub rec_on: bool,
+    /// Diske YAZILAN tick sayisi.
+    pub rec_written: u64,
+    /// Kayit kanali dolu (ya da yazma basarisiz) oldugu icin DUSURULEN tick
+    /// sayisi.
+    ///
+    /// Sifir olmayan her deger gercek bir kayiptir: kayit dosyasi o kadar
+    /// tick eksik. Sessiz kalmasi, aylar sonra "kayitta delik var" demekti.
+    pub rec_dropped: u64,
+    /// Kayit sirasinda alinan dosya hatasi sayisi.
+    pub rec_errors: u64,
+    /// `symbols-*.jsonl` dosyasina eklenen satir sayisi.
+    pub rec_symbol_lines: u64,
 }
 
 /// Bir örnek için okuyucu thread'i başlat.
@@ -120,10 +135,13 @@ pub fn spawn_reader(
     hist_rx: Receiver<HistCmd>,
     stats: Arc<std::sync::Mutex<ReaderStats>>,
     candles: Arc<std::sync::Mutex<CandleStore>>,
+    recorder: Option<Arc<RecorderHandle>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name(format!("sinyal-rd-{instance}"))
-        .spawn(move || reader_loop(instance, registry, tx, cmd_rx, hist_rx, stats, candles))
+        .spawn(move || {
+            reader_loop(instance, registry, tx, cmd_rx, hist_rx, stats, candles, recorder)
+        })
         .expect("okuyucu thread'i başlatılamadı")
 }
 
@@ -136,6 +154,7 @@ fn reader_loop(
     hist_rx: Receiver<HistCmd>,
     stats: Arc<std::sync::Mutex<ReaderStats>>,
     candles: Arc<std::sync::Mutex<CandleStore>>,
+    recorder: Option<Arc<RecorderHandle>>,
 ) {
     let inst: Arc<str> = Arc::from(instance.as_str());
 
@@ -167,7 +186,7 @@ fn reader_loop(
     }
 
     // Sembol tablosunu ilk anda yükle — tick akışını isimlendirebilmek için.
-    refresh_symbols(&session, &registry, &instance);
+    refresh_symbols(&session, &registry, &instance, recorder.as_deref());
     let mut last_sym_refresh = Instant::now();
     // Durum yoklaması sembol yenilemesinden ayrı: sıklığı korelasyon
     // ihtiyacına göre uyarlanıyor (bkz. aşağıdaki `state_due`).
@@ -210,6 +229,17 @@ fn reader_loop(
             did_work = true;
             let now = qpc();
             for t in &batch[..n] {
+                // Kayıt: TEK bir kanal push'u, sıcak yolda I/O YOK. Kanal
+                // doluysa kayıt düşer ve sayılır (bkz. record.rs) — okuyucuyu
+                // bekletmek EA'nın halkasını doldurup canlı tick kaybettirirdi.
+                //
+                // İsimlendirmeden ÖNCE: ham tick her hâlükârda kaydedilir.
+                // Sembol adı zaten kayıttan değil `symbols-*.jsonl`'dan
+                // çözülüyor, bu yüzden tablo henüz gelmemişken atılan tick
+                // kayıtta bir delik olurdu.
+                if let Some(r) = &recorder {
+                    r.push_tick(t);
+                }
                 let Some(name) = registry.name_of(&instance, t.symbol_id) else {
                     // Sembol tablosu henüz yayımlanmamış olabilir; bir sonraki
                     // yenilemede isimlenecek. Tick'i atmak yerine atlıyoruz —
@@ -442,7 +472,7 @@ fn reader_loop(
 
         // --- 6) Periyodik bakım ---
         if last_sym_refresh.elapsed() >= Duration::from_secs(1) {
-            refresh_symbols(&session, &registry, &instance);
+            refresh_symbols(&session, &registry, &instance, recorder.as_deref());
 
             last_sym_refresh = Instant::now();
             let mut s = stats.lock().unwrap_or_else(|e| e.into_inner());
@@ -453,6 +483,14 @@ fn reader_loop(
             s.join_unattributed = join.unattributed;
             s.hist_ready = hist.is_some();
             s.hist_pending = hist.as_ref().map_or(0, |h| h.pending_len() as u64);
+            if let Some(r) = &recorder {
+                let c = r.counts();
+                s.rec_on = true;
+                s.rec_written = c.written;
+                s.rec_dropped = c.dropped;
+                s.rec_errors = c.errors;
+                s.rec_symbol_lines = c.sym_lines;
+            }
         }
 
         // Service çekirdekten sonra başlayabilir; bir kez deneyip vazgeçmek
@@ -505,9 +543,21 @@ fn emit_order(tx: &broadcast::Sender<FeedEvent>, inst: &Arc<str>, r: &sinyal_pro
     });
 }
 
-fn refresh_symbols(session: &Session, registry: &Registry, instance: &str) {
+fn refresh_symbols(
+    session: &Session,
+    registry: &Registry,
+    instance: &str,
+    recorder: Option<&RecorderHandle>,
+) {
     if let Some(list) = session.symbols() {
         if !list.is_empty() {
+            // Kaydediciye HER yenilemede gönderiyoruz; diske yazma kararını
+            // (içerik değişti mi) o veriyor. Değişiklik denetimini burada
+            // yapmak, kaydedicinin diskte ne olduğu bilgisini yok sayardı —
+            // ve düşen bir görüntü kalıcı bir boşluğa dönüşürdü.
+            if let Some(r) = recorder {
+                r.push_symbols(list.clone());
+            }
             registry.set_symbols(instance, list);
         }
     }
@@ -572,6 +622,89 @@ mod tests {
         }
     }
 
+    /// UÇTAN UCA: EA'nın yazdığı tick, okuyucu döngüsünden geçip DİSKE
+    /// düşüyor mu.
+    ///
+    /// `record.rs` kaydedicinin kendisini kanıtlıyor; buradaki asıl mesele
+    /// **bağlantı**: sıcak yoldaki tek satırlık `push_tick` çağrısı ve sembol
+    /// tablosunun kaydediciye iletilmesi. İkisi de sessizce düşebilir
+    /// (kaydedici mükemmel çalışır, kimse ona tick vermez) ve sonuç "kayıt
+    /// açıktı ama dizin boş" olurdu.
+    #[test]
+    fn recorded_ticks_travel_from_the_ring_to_the_disk() {
+        let inst = unique("rec");
+        let ea = FakeEa::start(inst.clone(), small());
+        ea.run(|s| {
+            unsafe { s.set_symbols(&[sym(0, "EURUSD")]) }.unwrap();
+        });
+
+        let dir = std::env::temp_dir().join(format!("sinyal-src-rec-{inst}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let rec = Arc::new(crate::record::Recorder::start(&dir, &inst).expect("kayit acilmali"));
+
+        let registry = Arc::new(Registry::new());
+        let (tx, _rx) = broadcast::channel(256);
+        let (_cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (_hist_tx, hist_rx) = std::sync::mpsc::channel();
+        let stats = Arc::new(std::sync::Mutex::new(ReaderStats::default()));
+        let _rd = spawn_reader(
+            inst.clone(),
+            registry.clone(),
+            tx,
+            cmd_rx,
+            hist_rx,
+            stats.clone(),
+            Arc::new(std::sync::Mutex::new(CandleStore::new())),
+            Some(rec.clone()),
+        );
+        std::thread::sleep(Duration::from_millis(300));
+
+        ea.run(|s| {
+            for i in 0..5u32 {
+                let t = Tick {
+                    time_msc: 1_700_000_000_000 + i as i64,
+                    bid: 1.1000 + i as f64 * 0.0001,
+                    ask: 1.1002 + i as f64 * 0.0001,
+                    recv_qpc: qpc(),
+                    symbol_id: 0,
+                    kind: kind::TICK,
+                    ..Default::default()
+                };
+                assert!(unsafe { s.push_tick(&t) });
+            }
+        });
+
+        // Okuyucunun beşini de işlemesini bekle.
+        let mut seen = 0;
+        for _ in 0..100 {
+            seen = stats.lock().unwrap_or_else(|e| e.into_inner()).ticks;
+            if seen >= 5 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(seen, 5, "okuyucu tick'leri islemeliydi");
+
+        // `stop` tamponu yazdırır ve kilidi bırakır.
+        assert!(rec.stop());
+        let counts = rec.counts();
+        assert_eq!(counts.written, 5, "bes tick de diske yazilmaliydi: {counts:?}");
+        assert_eq!(counts.dropped, 0);
+
+        let days = crate::record::list_days(&dir, &inst).unwrap();
+        assert_eq!(days.len(), 1, "tek gun dosyasi bekleniyordu: {days:?}");
+        let recs =
+            crate::record::load_ticks(&crate::record::tick_path(&dir, &inst, days[0])).unwrap();
+        assert_eq!(recs.len(), 5);
+        assert_eq!(recs[0].time_msc, 1_700_000_000_000);
+        assert!((recs[4].bid - 1.1004).abs() < 1e-12, "fiyat bozulmadan gitmeli");
+        // Sembol tablosu da kaydediciye ulaşmalı: isimlendirme replay'de
+        // buradan çözülüyor.
+        assert_eq!(counts.sym_lines, 1, "sembol tablosu bir kez yazilmali");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn reader_names_ticks_using_the_symbol_table() {
         let inst = unique("names");
@@ -585,7 +718,7 @@ mod tests {
         let (_cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         let stats = Arc::new(std::sync::Mutex::new(ReaderStats::default()));
         let (_hist_tx, hist_rx) = std::sync::mpsc::channel();
-        let _rd = spawn_reader(inst.clone(), registry.clone(), tx, cmd_rx, hist_rx, stats, Arc::new(std::sync::Mutex::new(CandleStore::new())));
+        let _rd = spawn_reader(inst.clone(), registry.clone(), tx, cmd_rx, hist_rx, stats, Arc::new(std::sync::Mutex::new(CandleStore::new())), None);
 
         // Okuyucunun bağlanıp sembol tablosunu almasını bekle.
         std::thread::sleep(Duration::from_millis(300));
@@ -635,7 +768,7 @@ mod tests {
         let (_cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         let stats = Arc::new(std::sync::Mutex::new(ReaderStats::default()));
         let (_hist_tx, hist_rx) = std::sync::mpsc::channel();
-        let _rd = spawn_reader(inst.clone(), registry.clone(), tx, cmd_rx, hist_rx, stats, Arc::new(std::sync::Mutex::new(CandleStore::new())));
+        let _rd = spawn_reader(inst.clone(), registry.clone(), tx, cmd_rx, hist_rx, stats, Arc::new(std::sync::Mutex::new(CandleStore::new())), None);
         std::thread::sleep(Duration::from_millis(300));
 
         ea.run(|s| {
@@ -693,6 +826,7 @@ mod tests {
             hist_rx,
             stats,
             Arc::new(std::sync::Mutex::new(CandleStore::new())),
+            None,
         );
         std::thread::sleep(Duration::from_millis(300));
 
@@ -785,6 +919,7 @@ mod tests {
             hist_rx,
             stats,
             store.clone(),
+            None,
         );
         std::thread::sleep(Duration::from_millis(300));
 
@@ -870,7 +1005,7 @@ mod tests {
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         let stats = Arc::new(std::sync::Mutex::new(ReaderStats::default()));
         let (_hist_tx, hist_rx) = std::sync::mpsc::channel();
-        let _rd = spawn_reader(inst.clone(), registry.clone(), tx, cmd_rx, hist_rx, stats, Arc::new(std::sync::Mutex::new(CandleStore::new())));
+        let _rd = spawn_reader(inst.clone(), registry.clone(), tx, cmd_rx, hist_rx, stats, Arc::new(std::sync::Mutex::new(CandleStore::new())), None);
         std::thread::sleep(Duration::from_millis(300));
 
         cmd_tx

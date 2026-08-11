@@ -194,10 +194,18 @@ pub enum ServerMsg {
     /// Bağlantı kurulduğunda ilk mesaj.
     Hello {
         proto: u32,
-        /// `live` (gerçek MT5) veya `mock` (simülatör).
+        /// `live` (gerçek MT5) veya `replay` (diskteki kayıttan oynatım).
+        ///
+        /// **Canlı ile replay arasındaki TEK mesaj farkı budur** (bir de
+        /// `sim` bayrağı). Mesaj biçimleri, alan adları ve kanal adları
+        /// birebir aynı kalır ki sinyal sisteminin kod yolu değişmesin.
+        /// Amaç sistemi kandırmak DEĞİL: replay'i canlı sanıp gerçek emir
+        /// göndermek kabul edilemez bir kaza olurdu, bu yüzden fark burada
+        /// AÇIKÇA ilan edilir.
         mode: &'static str,
         instances: Vec<String>,
-        /// Emir yürütme açık mı.
+        /// Emir yürütme açık mı. Replay'de daima `true` — emirler
+        /// reddedilmez, **simüle** edilir (bkz. `OrderEvent::sim`).
         trading: bool,
         /// Piyasa verisi (tick/derinlik/mum/sembol) token'sız erişilebilir mi.
         public_feed: bool,
@@ -205,6 +213,16 @@ pub enum ServerMsg {
         auth_required_for_trading: bool,
         /// Bu bağlantının şu anki seviyesi: `public` | `trader`.
         level: &'static str,
+        /// Replay kapsamının başlangıcı (epoch ms). **Canlıda gönderilmez.**
+        #[serde(skip_serializing_if = "Option::is_none")]
+        replay_from_ms: Option<i64>,
+        /// Replay kapsamının sonu (epoch ms). **Canlıda gönderilmez.**
+        ///
+        /// Bu, istenen kapsamdır; kaydın gerçekten nereye kadar veri
+        /// içerdiği ayrı bir sorudur ve oynatım bitince `replay_done` ile
+        /// bildirilir.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        replay_to_ms: Option<i64>,
     },
 
     Authed { level: &'static str },
@@ -301,6 +319,20 @@ pub enum ServerMsg {
 
     /// Emir yaşam döngüsü olayı.
     Order(OrderEvent),
+
+    /// Kaydın oynatımı bitti (**yalnızca replay kipinde**).
+    ///
+    /// Canlı akış hiç bitmez; bu mesajın gelmesi tek başına "artık tick
+    /// gelmeyecek" demektir. Sessizce durmak, istemcinin hareketsiz bir
+    /// piyasa ile biten bir kaydı ayırt edememesi demek olurdu.
+    ReplayDone {
+        /// Oynatılan tick sayısı.
+        ticks: u64,
+        /// Oynatılan son tick'in broker saati (epoch ms). Kayıt bu kapsamda
+        /// boşsa gönderilmez.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        last_ms: Option<i64>,
+    },
 
     /// İstemci yavaş kaldı ve mesaj atlandı.
     ///
@@ -455,17 +487,22 @@ pub struct TickSnap {
     pub src: String,
 }
 
+/// `false` ise alanı tel üzerinde HİÇ gösterme (bkz. [`OrderEvent::sim`]).
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
 /// Emir olayı.
 ///
 /// **`kind` = `ack` emrin DOLDUĞU anlamına GELMEZ.** `OrderSendAsync` iki
 /// aşamalı geri bildirim üretir: `ack` isteğin sunucuya iletildiğini,
 /// `txn` gerçek yürütmeyi bildirir. Emri yalnızca `txn` + `retcode` 10009
 /// geldiğinde dolmuş sayın.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct OrderEvent {
     /// İstemcinin verdiği kimlik.
     pub id: String,
-    /// `ack` | `txn` | `rejected` | `duplicate`
+    /// `queued` | `ack` | `txn` | `rejected` | `duplicate`
     pub kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retcode: Option<u32>,
@@ -483,6 +520,18 @@ pub struct OrderEvent {
     #[serde(default)]
     pub comment: String,
     pub src: String,
+    /// **Bu dolum simüle edildi; gerçek bir emir yürütülmedi.**
+    ///
+    /// Yalnızca replay kipinde ve daima `true` olarak gönderilir. Canlı
+    /// olaylarda alan HİÇ bulunmaz — "yok" ile "false" arasındaki farkı
+    /// korumak kasıtlı: istemci `sim` alanının varlığına bakarak da karar
+    /// verebilmeli, çünkü canlı bir olayı yanlışlıkla simüle sanmak da,
+    /// simüle bir olayı gerçek sanmak da pahalıdır.
+    ///
+    /// Simüle dolum GERÇEK DOLUM DEĞİLDİR: kayma, komisyon ve swap
+    /// modellenmez (bkz. `crate::server` simülasyon bölümü).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sim: bool,
 }
 
 #[cfg(test)]
@@ -580,6 +629,7 @@ mod tests {
             price: None,
             comment: String::new(),
             src: "mt5-1".into(),
+            sim: false,
         };
         let j = serde_json::to_string(&ServerMsg::Order(e)).unwrap();
         assert!(j.contains(r#""kind":"ack""#));
@@ -590,6 +640,93 @@ mod tests {
         assert!(!j.contains(r#""order":"#), "boş alanlar gönderilmemeli: {j}");
         assert!(!j.contains(r#""deal":"#));
         assert!(!j.contains(r#""comment":"#));
+    }
+
+    #[test]
+    fn live_order_events_never_carry_the_sim_field() {
+        // Canlı bir olayda `sim` alanının hiç bulunmaması, istemcinin alanın
+        // VARLIĞINA bakarak da karar verebilmesi demek. `"sim":false`
+        // göndermek, alanı hiç göndermemekten farklı bir sözleşme olurdu.
+        let e = OrderEvent {
+            id: "a1".into(),
+            kind: "txn",
+            retcode: Some(10009),
+            price: Some(1.2345),
+            volume: Some(0.1),
+            src: "mt5-1".into(),
+            sim: false,
+            ..Default::default()
+        };
+        let j = serde_json::to_string(&ServerMsg::Order(e)).unwrap();
+        assert!(!j.contains("sim"), "canli olayda sim alani HIC olmamali: {j}");
+    }
+
+    #[test]
+    fn simulated_order_events_say_so_out_loud() {
+        let e = OrderEvent {
+            id: "a1".into(),
+            kind: "txn",
+            retcode: Some(10009),
+            src: "mt5-1".into(),
+            sim: true,
+            ..Default::default()
+        };
+        let j = serde_json::to_string(&ServerMsg::Order(e)).unwrap();
+        assert!(j.contains(r#""sim":true"#), "simule dolum gizlenemez: {j}");
+    }
+
+    #[test]
+    fn hello_carries_replay_scope_only_in_replay_mode() {
+        // Canlı hello, replay alanlarını HİÇ taşımamalı: bir istemcinin
+        // "replay_from_ms yok, demek ki canlı" çıkarımı geçerli olmalı.
+        let live = ServerMsg::Hello {
+            proto: 3,
+            mode: "live",
+            instances: vec!["mt5-1".into()],
+            trading: false,
+            public_feed: true,
+            auth_required_for_trading: true,
+            level: "public",
+            replay_from_ms: None,
+            replay_to_ms: None,
+        };
+        let j = serde_json::to_string(&live).unwrap();
+        assert!(j.contains(r#""mode":"live""#));
+        assert!(!j.contains("replay_from_ms"), "canlida kapsam alani olmamali: {j}");
+        assert!(!j.contains("replay_to_ms"));
+
+        let replay = ServerMsg::Hello {
+            proto: 3,
+            mode: "replay",
+            instances: vec!["mt5-1".into()],
+            trading: true,
+            public_feed: true,
+            auth_required_for_trading: false,
+            level: "trader",
+            replay_from_ms: Some(1_700_000_000_000),
+            replay_to_ms: Some(1_700_086_400_000),
+        };
+        let j = serde_json::to_string(&replay).unwrap();
+        assert!(j.contains(r#""mode":"replay""#), "replay ilan edilmeli: {j}");
+        assert!(j.contains(r#""replay_from_ms":1700000000000"#));
+        assert!(j.contains(r#""replay_to_ms":1700086400000"#));
+    }
+
+    #[test]
+    fn replay_done_is_a_message_of_its_own() {
+        // Sessizce durmak, hareketsiz piyasa ile biten kaydı ayırt edilemez
+        // yapardı.
+        let j = serde_json::to_string(&ServerMsg::ReplayDone {
+            ticks: 1234,
+            last_ms: Some(1_700_000_000_123),
+        })
+        .unwrap();
+        assert!(j.contains(r#""t":"replay_done""#), "{j}");
+        assert!(j.contains(r#""ticks":1234"#));
+        assert!(j.contains(r#""last_ms":1700000000123"#));
+
+        let j = serde_json::to_string(&ServerMsg::ReplayDone { ticks: 0, last_ms: None }).unwrap();
+        assert!(!j.contains("last_ms"), "bos kapsamda son zaman uydurulmaz: {j}");
     }
 
     #[test]

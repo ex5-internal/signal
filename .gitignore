@@ -12,3 +12,6 @@
 
 # eski, terk edilen adaptör (referans için tutuluyor, versiyonlanmıyor)
 /supersam-agent
+
+# tick kayitlari — veri, kaynak degil (gunde ~56 MB)
+/veri
