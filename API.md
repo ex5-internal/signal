@@ -2,6 +2,93 @@
 
 Tek WebSocket ucu. Piyasa verisi token istemez; hesap ve emir ister.
 
+> **Bu belgeyi okuyan otomatik bir sisteme:** buradaki her alan adı ve
+> davranış koddan doğrulanmıştır. Tahmin etme; bir şey belirsizse
+> [docs/MIMARI.md](docs/MIMARI.md) içinde gerekçesi vardır.
+
+---
+
+## Önce bunu oku: bu sistem NE DEĞİLDİR
+
+| | |
+|---|---|
+| ❌ Genel amaçlı piyasa verisi feed'i | Tek bir MT5 terminaline bağlıdır; o terminal kapanınca veri durur |
+| ❌ Birden çok broker toplayıcısı | Şu an tek örnek (`mt5-1`) çalışıyor |
+| ❌ Backtest motoru | Mumlar bellekte; `sinyald` yeniden başlarsa tick serisi sıfırlanır |
+| ❌ Garantili teslimat | Halka dolarsa EA tick düşürür (sayaçla bildirir); `lagged` mesajı boşluk demektir |
+| ❌ Kayıpsız tick kaynağı | MT5 EA API'si bunu vermez — bkz. aşağıdaki "sadakat" bölümü |
+| ❌ TLS'li | `ws://` düz metin; token açık gider |
+
+Ne **olduğu**: işlemin gerçekten yapıldığı terminalin gördüğü veriyi, aynı
+terminale emir gönderebilen bir uçla birlikte sunan köprü. Değeri, veri ile
+yürütmenin **aynı yerden** gelmesidir.
+
+---
+
+## En kısa çalışan istemci
+
+```javascript
+const ws = new WebSocket("ws://144.76.111.177:8787");
+
+ws.onopen = () => {
+  ws.send(JSON.stringify({op: "symbols"}));                       // digits/point
+  ws.send(JSON.stringify({op: "candles", symbol: "GOLD", tf: "M1", count: 500}));
+  ws.send(JSON.stringify({op: "subscribe", channels: ["tick.GOLD"]}));
+};
+
+ws.onmessage = (ev) => {
+  // Bir çerçevede BIRDEN FAZLA satır gelebilir — mutlaka böl.
+  for (const line of String(ev.data).split("\n")) {
+    if (!line.trim()) continue;
+    const m = JSON.parse(line);
+
+    switch (m.t) {
+      case "hello":
+        if (m.mode !== "live") console.warn("CANLI DEGIL:", m.mode);
+        break;
+
+      case "candles":
+        if (m.hist === "off") {
+          // "Veri yok" DEĞİL — kurulum eksik. Sessizce kabul etme.
+          throw new Error("MT5 gecmisi yok: " + m.hist_note);
+        }
+        if (m.src_kind !== "mt5") {
+          console.warn("mid-fiyat serisi geldi, MT5 serisi degil");
+        }
+        gecmisiYukle(m.items);   // {t,o,h,l,c,ticks,partial?}
+        break;
+
+      case "tick":
+        // Oluşan barı BID'den güncelle (MT5 serisiyle tutması için).
+        sonBariGuncelle(m.s, m.b, m.ms);
+        break;
+
+      case "lagged":
+        // Akışta boşluk oluştu — geçmişi yeniden çek.
+        ws.send(JSON.stringify({op: "candles", symbol: "GOLD", tf: "M1", count: 500}));
+        break;
+
+      case "error":
+        console.error("sunucu:", m.msg);
+        break;
+    }
+  }
+};
+```
+
+İşlem için ek olarak:
+
+```javascript
+ws.send(JSON.stringify({op: "auth", token: TOKEN}));       // -> {"t":"authed","level":"trader"}
+ws.send(JSON.stringify({op: "subscribe", channels: ["order"]}));
+ws.send(JSON.stringify({op: "order", id: "s-001", symbol: "GOLD",
+                        side: "buy", type: "market", volume: 0.01}));
+
+// Emri YALNIZCA bununla gerçekleşmiş say:
+//   m.t === "order" && m.kind === "txn" && m.retcode === 10009
+```
+
+
 ```
 ws://144.76.111.177:8787
 ```
@@ -186,6 +273,61 @@ bir işlem. Olay asla atılmaz, kimliksiz yayımlanır.
 - `lagged` mesajı gelirse akışta **boşluk** oluşmuştur; mum geçmişi yeniden
   çekilmelidir.
 - Zaman alanlarının hepsi **broker sunucu saatidir**. Broker DST uygulayabilir.
+
+---
+
+## 6. Sadakat — sinyal sisteminin bilmesi ZORUNLU olanlar
+
+Bunlar hata değil, **sistemin doğası**. Bilmeden yazılan bir strateji canlıda
+beklediğinden farklı davranır.
+
+### Kayıpsız tick YOKTUR
+
+MQL5 dokümanı birebir: *"In case when OnTick function for the previous quote is
+being processed when a new quote is received, the new quote will be ignored."*
+Bu MT5'in kendi sınırıdır, bizim değil. İki ayrı kayıp vardır ve
+**karıştırılmamalıdır**:
+
+- **Halka kaybı** — bizim tarafımız yetişemedi. Ölçülüyor ve **0**.
+- **Terminal kaynaklı atlama** — MT5 atladı. Ölçülemiyor, garanti edilemiyor.
+
+Pratikte: ölçülen en sık ardışık tick aralığı 72 ms, tarama periyodumuz 16 ms.
+Sakin piyasada kayıp yok. **Volatil anlarda garanti yok.**
+
+### Her sembolde her tick gelmez
+
+`symbols` cevabındaki iki alan bunu söyler:
+
+- `chart: true` → EA'nın bağlı olduğu grafik. **Olay güdümlü, her tick.**
+- `polled_only: true` → 16 ms örnekleme. **Ara tickler görülmez.**
+
+Şu an `chart: true` olan tek sembol **GOLD**. Strateji başka bir sembolde
+çalışacaksa EA o sembole taşınmalıdır — aksi halde girdi eksiktir.
+
+### Mum kaynağı ile canlı fiyat aynı tabanda değil
+
+`src_kind: "mt5"` serisi broker'ın kendi barlarıdır (forex/CFD'de **bid**).
+Tick akışı ise **bid ve ask'i ayrı ayrı** verir. Oluşan barı `mid` ile
+kurarsan geçmişin bittiği yerde yarım spread kadar sahte bir basamak oluşur —
+**GOLD'da 20-30 point**. Oluşan barı `b` (bid) ile kur.
+
+### Zaman broker saatidir
+
+`tick.ms` ve `Bar.t` alanları **broker sunucu saatidir** — yerel saat veya UTC
+değil. Broker DST uygulayabilir. Bar sınırları bu saatten türetilir; kendi
+saatinle yeniden hesaplama.
+
+### Emir dolumu anlık değildir
+
+`ack` (10008) "sunucuya iletildi" demek. `txn` (10009) "yürütüldü" demek.
+Arada gerçek kayma olur. Ölçülen uçtan uca gecikme p50 ~250 µs **bizim
+tarafımızda**; broker tarafındaki süre buna dahil değildir.
+
+### `id: ""` gelen olaylar
+
+Bize ait olmayan işlemler — terminalden elle yapılmış. Olay **asla atılmaz**,
+kimliksiz yayımlanır. Sinyal sistemi bunları kendi emri sanmamalı ama yok da
+saymamalı: hesabın durumunu değiştirmişlerdir.
 
 ---
 
