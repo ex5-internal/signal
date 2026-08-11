@@ -43,6 +43,21 @@ pub const RING_MAGIC: u64 = 0x5359_4E59_414C_5231; // "SYNYALR1"
 ///   `ticks_bookdepth`/`volume_limit`/`flags` eklendi (doğru doldurma modu
 ///   seçimi bunlar olmadan yapılamıyordu), `Cmd.magic` u32→u64,
 ///   `Res`'e `request_id` eklendi.
+/// - v3: durum segmenti (`AccountSnapshot`/`PositionRec`/`OrderRec`) ve
+///   geçmiş kanalı (`HistReq`/`BarRec`) eklendi.
+///
+/// # Sürüm ARTMAYAN değişiklikler
+///
+/// `SymbolEntry`nin sözleşme/taşıma bloğu (`swap_long`, `swap_short`,
+/// `margin_initial`, `margin_hedged`, `swap_mode`, `swap_rollover3d`) mevcut
+/// `_reserved` alanının İÇİNE yerleştirildi: hiçbir eski alanın ofseti kaymadı
+/// ve kayıt 192 baytta kaldı, bu yüzden sürüm artmadı — eski bir EA/çekirdek
+/// ikilisi bağlanmaya devam edebilir ve o baytları sıfır okur.
+///
+/// Ayrımı yapan şey budur: **rezerv alanını doldurmak** sürüm artırmaz,
+/// **var olan bir alanı taşımak/büyütmek** artırır. Rezervi doldururken
+/// tüketicinin "sıfır" ile "veri yok"u ayırabilmesi gerekir; bunun için
+/// [`crate::sym_flag::CONTRACT_DATA`] biti eklendi.
 pub const RING_VERSION: u32 = 3;
 
 /// Başlık boyutu; slotlar bu ofsetten başlar (64'ün katı — hizalama korunur).

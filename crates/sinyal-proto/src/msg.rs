@@ -247,6 +247,60 @@ pub mod exec_mode {
     pub const EXCHANGE: u32 = 3;
 }
 
+/// MT5 `SYMBOL_SWAP_MODE` (`ENUM_SYMBOL_SWAP_MODE`) ham değerleri.
+///
+/// [`SymbolEntry::swap_long`] / [`SymbolEntry::swap_short`] alanlarının
+/// **BİRİMİ** buna bağlıdır — sayıyı moda bakmadan yorumlamak swap'ı
+/// büyüklük mertebesinde yanlış hesaplar:
+///
+/// - [`POINTS`]: değer **point** cinsindendir → para = `swap * point *
+///   contract_size * volume` (tick_value üzerinden hesap para birimine çevrilir).
+/// - [`CURRENCY_SYMBOL`] / [`CURRENCY_MARGIN`] / [`CURRENCY_DEPOSIT`]: değer
+///   **lot başına para** cinsindendir; hangi para birimi olduğu moda göre
+///   değişir → para = `swap * volume` (gerekirse kur çevrimiyle).
+/// - [`INTEREST_CURRENT`] / [`INTEREST_OPEN`]: değer **yıllık faiz yüzdesi**;
+///   günlük tutar pozisyon değerinden türetilir.
+/// - [`REOPEN_CURRENT`] / [`REOPEN_BID`]: swap para olarak işlenmez, pozisyon
+///   yeni fiyattan yeniden açılır.
+///
+/// [`DISABLED`] ise swap hiç uygulanmaz — bu bir "veri yok" değil, açık bir
+/// broker kararıdır.
+pub mod swap_mode {
+    pub const DISABLED: u32 = 0;
+    /// Point cinsinden.
+    pub const POINTS: u32 = 1;
+    /// Sembolün baz para biriminde, lot başına.
+    pub const CURRENCY_SYMBOL: u32 = 2;
+    /// Marjin para biriminde, lot başına.
+    pub const CURRENCY_MARGIN: u32 = 3;
+    /// Hesap (mevduat) para biriminde, lot başına.
+    pub const CURRENCY_DEPOSIT: u32 = 4;
+    /// Yıllık faiz %, GÜNCEL fiyat üzerinden.
+    pub const INTEREST_CURRENT: u32 = 5;
+    /// Yıllık faiz %, AÇILIŞ fiyatı üzerinden.
+    pub const INTEREST_OPEN: u32 = 6;
+    /// Pozisyon kapanış fiyatından yeniden açılır.
+    pub const REOPEN_CURRENT: u32 = 7;
+    /// Pozisyon güncel bid ± swap ile yeniden açılır.
+    pub const REOPEN_BID: u32 = 8;
+}
+
+/// MT5 `ENUM_DAY_OF_WEEK` — [`SymbolEntry::swap_rollover3d`] değerleri.
+///
+/// DİKKAT: haftanın ilk günü **PAZAR (0)**'dır, Pazartesi değil. Üç günlük
+/// swap'ın hangi güne düştüğünü bir eksik/fazla saymak, gecelik taşıma
+/// maliyetini haftada bir gün tamamen yanlış hesaplar. Forex'te tipik değer
+/// [`WEDNESDAY`] (3), borsa enstrümanlarında [`FRIDAY`] (5) görülür.
+pub mod day_of_week {
+    pub const SUNDAY: u32 = 0;
+    pub const MONDAY: u32 = 1;
+    pub const TUESDAY: u32 = 2;
+    pub const WEDNESDAY: u32 = 3;
+    pub const THURSDAY: u32 = 4;
+    pub const FRIDAY: u32 = 5;
+    pub const SATURDAY: u32 = 6;
+}
+
 /// MT5 `ENUM_ORDER_TYPE_TIME` (`Cmd.type_time`).
 pub mod type_time {
     pub const GTC: u8 = 0;
@@ -518,8 +572,46 @@ pub struct SymbolEntry {
     /// Broker'daki GERÇEK sembol adı (`GOLD#`, `XAUUSD.m` gibi).
     /// Kanonik ad eşlemesi çekirdek tarafında yapılandırmadan gelir.
     pub name: [u8; SYMBOL_NAME_LEN],
+
+    // --- Sözleşme/taşıma verisi (eski `_reserved`in ilk 40 baytı) ---
+    //
+    // Bu blok bilinçli olarak `name`den SONRA duruyor: mevcut alanların hiçbiri
+    // kaymadığı için yerleşim sürümü artmadı. Eskiden burası NUL'du, yani eski
+    // bir EA ile çalışıldığında alanlar 0 okunur — "veri yok" ile "sıfır swap"
+    // ayrımı `swap_mode`dan yapılır (DISABLED=0 gerçekten swap yok demektir,
+    // ama o durumda `flags` READY de kurulu olurdu; ham 0 tablo genelinde
+    // görülüyorsa EA eskidir).
+    /// `SYMBOL_SWAP_LONG` — uzun pozisyonun gecelik taşıma bedeli.
+    ///
+    /// BİRİMİ [`SymbolEntry::swap_mode`]e bağlıdır; ham sayıyı para sanma.
+    pub swap_long: f64,
+    /// `SYMBOL_SWAP_SHORT` — kısa pozisyonun gecelik taşıma bedeli.
+    ///
+    /// BİRİMİ [`SymbolEntry::swap_mode`]e bağlıdır.
+    pub swap_short: f64,
+    /// `SYMBOL_MARGIN_INITIAL` — sembol için sabitlenmiş başlangıç marjini
+    /// (1 lot başına, marjin para biriminde).
+    ///
+    /// **0 ise broker sabit değer vermemiştir** ve marjin formülle hesaplanır:
+    /// `volume * contract_size * fiyat / leverage`. Sıfırı "marjin gerekmiyor"
+    /// diye okumak, kaldıraç kontrolünü tamamen devre dışı bırakırdı.
+    pub margin_initial: f64,
+    /// `SYMBOL_MARGIN_MAINTENANCE` — sürdürme/hedge marjini (1 lot başına).
+    ///
+    /// 0 ise sürdürme marjini başlangıç marjinine eşit sayılır.
+    pub margin_hedged: f64,
+    /// `SYMBOL_SWAP_MODE` HAM değeri — [`swap_mode`] sabitleri.
+    ///
+    /// `swap_long`/`swap_short`ın birimini belirleyen tek alan.
+    pub swap_mode: u32,
+    /// `SYMBOL_SWAP_ROLLOVER3DAYS` — üç günlük swap'ın uygulandığı gün.
+    ///
+    /// [`day_of_week`] değerleri; **PAZAR = 0**. Forex'te tipik olarak
+    /// Çarşamba (3).
+    pub swap_rollover3d: u32,
+
     /// Gelecekte alan eklemek için ayrılmış alan (kaydı 192 bayta tamamlar).
-    pub _reserved: [u8; 48],
+    pub _reserved: [u8; 8],
 }
 
 /// [`SymbolEntry::flags`] bitleri.
@@ -548,6 +640,19 @@ pub mod sym_flag {
     /// üretimi hangi sembolde yapılacaksa EA o sembolün grafiğine
     /// bağlanmalıdır.
     pub const CHART: u32 = 1 << 3;
+    /// Sözleşme/taşıma bloğu ([`SymbolEntry::contract_size`],
+    /// `swap_*`, `margin_*`) broker'dan BAŞARIYLA okundu.
+    ///
+    /// Bu bit olmadan o alanların 0 olması "broker swap almıyor" DEĞİL, "veri
+    /// yok" demektir. Ayrım kritik: 0 swap'ı gerçek sanan bir simülatör gecelik
+    /// taşımayı bedava gösterir ve tam da kapatmaya çalıştığımız yönde —
+    /// iyimser tarafa — yanılır. Aynı şekilde `contract_size` 0 iken marjin
+    /// formülü (`volume * contract_size * fiyat / leverage`) 0 verir, yani
+    /// kaldıraç kontrolü sessizce devre dışı kalır.
+    ///
+    /// Alanları protokol sürümü artmadan eklediğimiz için ESKİ bir EA bu
+    /// baytları sıfır bırakır; o durumda da bit kurulmaz ve fark edilir.
+    pub const CONTRACT_DATA: u32 = 1 << 4;
 }
 
 impl Default for SymbolEntry {
@@ -574,7 +679,17 @@ impl Default for SymbolEntry {
             flags: 0,
             _pad0: 0,
             name: [0; SYMBOL_NAME_LEN],
-            _reserved: [0; 48],
+            swap_long: 0.0,
+            swap_short: 0.0,
+            margin_initial: 0.0,
+            margin_hedged: 0.0,
+            // Varsayılan = SIFIRLANMIŞ BELLEK. Bu kasıtlı: paylaşılan segment
+            // sıfırla başlar, bu yüzden `Default` ile ham segmentin anlamı
+            // birebir aynı olmalı. `swap_rollover3d` için Pazar(0) forex'te
+            // hiç görülmez; yani 0 pratikte "EA doldurmadı" demektir.
+            swap_mode: swap_mode::DISABLED,
+            swap_rollover3d: day_of_week::SUNDAY,
+            _reserved: [0; 8],
         }
     }
 }

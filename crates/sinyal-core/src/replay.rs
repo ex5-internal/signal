@@ -665,6 +665,7 @@ pub struct ReplayHandle {
     done_tx: Arc<watch::Sender<Option<ReplayEnd>>>,
     done: watch::Receiver<Option<ReplayEnd>>,
     covered: (i64, i64),
+    gate: Arc<StartGate>,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -683,15 +684,77 @@ impl ReplayHandle {
         self.covered
     }
 
+    /// Oynatımı başlatan kapı — sunucu ilk istemcide açar.
+    pub fn gate(&self) -> Arc<StartGate> {
+        self.gate.clone()
+    }
+
     /// Oynatım bitti mi.
     pub fn finished(&self) -> bool {
         self.done.borrow().is_some()
     }
 
     /// Oynatımın bitmesini bekle (testler ve `--replay-speed 0` için).
+    ///
+    /// Kapı henüz açılmadıysa BURADA açılır. "Bitmesini bekle" diyen bir
+    /// çağıranın oynatımın hiç başlamamış olmasını kastetmesi mümkün değil;
+    /// kapıyı açmadan beklemek sonsuza kadar asılı kalmak olurdu ve bu,
+    /// bulunması pahalı bir kilitlenme sınıfıdır.
     pub fn join(mut self) {
+        self.gate.open();
         if let Some(h) = self.join.take() {
             let _ = h.join();
+        }
+    }
+}
+
+/// Oynatımı **ilk istemci bağlanana kadar** bekleten kapı.
+///
+/// Bu kapı olmadan oynatım süreç başlar başlamaz akardı ve yayın kanalının o
+/// anda hiç abonesi olmadığı için tick'ler BOŞLUĞA yayılırdı. Sonuç, modülün
+/// kendi kullanım örneğinde (`--replay-speed 0`) görülebiliyordu: istemci
+/// bağlandığında oynatım çoktan bitmiş oluyor, `replay_done` geliyor ve
+/// **hiç tick gelmiyordu**. Kaydı aynı protokolden yeniden oynatmanın tüm
+/// amacı tüketiciye o tick'leri vermek olduğu için bu, özelliği sessizce
+/// işlevsiz bırakan bir kusurdu.
+///
+/// Kapı `Condvar` ile kurulu: açan taraf (sunucunun bağlantı yolu) asla
+/// bloklanmaz, bekleyen taraf (oynatım thread'i) meşgul döngü kurmaz.
+#[derive(Debug)]
+pub struct StartGate {
+    opened: Mutex<bool>,
+    cv: std::sync::Condvar,
+}
+
+impl Default for StartGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl StartGate {
+    pub fn new() -> Self {
+        Self { opened: Mutex::new(false), cv: std::sync::Condvar::new() }
+    }
+
+    /// Kapıyı aç. Tekrar çağrılması zararsızdır (her istemci çağırır).
+    pub fn open(&self) {
+        let mut g = self.opened.lock().unwrap_or_else(|e| e.into_inner());
+        if !*g {
+            *g = true;
+            self.cv.notify_all();
+        }
+    }
+
+    pub fn is_open(&self) -> bool {
+        *self.opened.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Kapı açılana kadar blokla.
+    fn wait(&self) {
+        let mut g = self.opened.lock().unwrap_or_else(|e| e.into_inner());
+        while !*g {
+            g = self.cv.wait(g).unwrap_or_else(|e| e.into_inner());
         }
     }
 }
@@ -701,6 +764,9 @@ impl ReplayHandle {
 /// Canlı okuyucu gibi ayrı bir OS thread'i kullanıyor: tempo `sleep` ile
 /// tutuluyor ve bu uykuların tokio çalışma zamanının görev havuzunu meşgul
 /// etmesi için hiçbir sebep yok.
+///
+/// Thread hemen başlar ama **oynatım [`StartGate`] açılana kadar beklemez**:
+/// ilk istemci bağlanmadan tek bir tick bile yayılmaz.
 pub fn spawn(
     rec: Recording,
     registry: Arc<Registry>,
@@ -712,13 +778,16 @@ pub fn spawn(
     let done_tx = Arc::new(done);
     let rx = done_tx.subscribe();
     let engine = done_tx.clone();
+    let gate = Arc::new(StartGate::new());
+    let thread_gate = gate.clone();
     let join = std::thread::Builder::new()
         .name("sinyal-replay".into())
         .spawn(move || {
+            thread_gate.wait();
             play(&rec, &registry, &candles, &tx, &engine);
         })
         .expect("replay thread'i baslatilamadi");
-    ReplayHandle { done_tx, done: rx, covered, join: Some(join) }
+    ReplayHandle { done_tx, done: rx, covered, gate, join: Some(join) }
 }
 
 /// Kaydı oynat. Bu fonksiyon **senkron**dur ve çağıran thread'i tutar.
@@ -1600,6 +1669,9 @@ mod tests {
         let h = spawn(r, registry, candles, tx, dtx);
         assert_eq!(h.covered_span(), (DAY + 10, DAY + 90));
         let done = h.done();
+        // Oynatım başlatma kapısının arkasında bekliyor; sunucuda bunu ilk
+        // istemci açar, burada testin kendisi açmalı.
+        h.gate().open();
         h.join();
 
         assert!(done.borrow().is_some(), "bitis bildirilmeli");
@@ -1704,6 +1776,68 @@ mod tests {
         let r = load(&opts).unwrap();
         assert_eq!(r.len(), 1, "ertesi gune tasan kayit bu gune ait degil");
         assert_eq!(r.items[0].rec.bid, 1.0);
+    }
+
+    // -- başlatma kapısı ---------------------------------------------------
+
+    #[test]
+    fn playback_does_not_start_until_a_client_opens_the_gate() {
+        // GERÇEK KUSURUN TESTİ: kapı olmadan oynatım süreç başlar başlamaz
+        // akıyordu. `--replay-speed 0` ile kayıt, hiçbir istemci bağlanmaya
+        // fırsat bulamadan bitiyor ve istemci yalnızca `replay_done` görüp
+        // TEK BİR TICK almıyordu — özelliğin tüm amacı buydu.
+        let tmp = Tmp::new("gate");
+        let written: Vec<TickRec> =
+            (0..25i64).map(|i| rec(DAY + i * 10, DAY + i * 10, 1.1 + i as f64, 0)).collect();
+        lay_out(tmp.path(), "mt5-1", &written, &one_symbol_table(DAY));
+
+        let mut opts = ReplayOpts::new(tmp.path(), DATE);
+        opts.speed = 0.0; // en hızlı: kapı yoksa anında biter
+        let r = load(&opts).unwrap();
+
+        let registry = Arc::new(Registry::new());
+        let candles = Arc::new(Mutex::new(CandleStore::new()));
+        let (tx, mut rx) = broadcast::channel(4096);
+        let (dtx, _drx) = watch::channel(None);
+
+        let handle = spawn(r, registry, candles, tx, dtx);
+
+        // Kapı KAPALI: oynatımın başlamadığını görmek için gerçekten bekle.
+        // (Sadece "hemen bakıp boş" demek, yarışı kaybetmiş bir testi de
+        // geçirirdi.)
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!handle.gate().is_open(), "kapi kendiliginden acilmamali");
+        assert!(!handle.finished(), "kapi kapaliyken oynatim BITMEMELI");
+        assert!(
+            rx.try_recv().is_err(),
+            "kapi kapaliyken TEK BIR olay bile yayilmamali"
+        );
+
+        // İstemci bağlandı: kapıyı aç.
+        handle.gate().open();
+        handle.join();
+
+        // Artık kaydın TAMAMI, baştan itibaren gelmiş olmalı.
+        let mut ticks = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            if let FeedEvent::Tick { bid, .. } = e {
+                ticks.push(bid);
+            }
+        }
+        assert_eq!(ticks.len(), written.len(), "abone kaydin TAMAMINI gormeli");
+        assert_eq!(ticks[0], written[0].bid, "ilk tick kacirilmamali");
+        assert_eq!(ticks[ticks.len() - 1], written[written.len() - 1].bid);
+    }
+
+    #[test]
+    fn opening_the_gate_twice_is_harmless() {
+        // Her bağlanan istemci kapıyı açmaya çalışır; ikincisi bir şeyi
+        // yeniden başlatmamalı.
+        let g = StartGate::new();
+        assert!(!g.is_open());
+        g.open();
+        g.open();
+        assert!(g.is_open());
     }
 
     // -- diğer -------------------------------------------------------------

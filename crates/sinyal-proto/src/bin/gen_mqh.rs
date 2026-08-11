@@ -26,8 +26,9 @@ use sinyal_proto::state::{
     margin_mode, rec_flag, so_mode, trade_mode, AccountSnapshot, OrderRec, PositionRec,
 };
 use sinyal_proto::{
-    action, book_type, exec_mode, filling, filling_mask, kind, order_type, res_kind, res_source,
-    sym_flag, tick_flag, type_time, COMMENT_LEN, MAX_BOOK_DEPTH, SYMBOL_NAME_LEN,
+    action, book_type, day_of_week, exec_mode, filling, filling_mask, kind, order_type, res_kind,
+    res_source, swap_mode, sym_flag, tick_flag, type_time, COMMENT_LEN, MAX_BOOK_DEPTH,
+    SYMBOL_NAME_LEN,
 };
 
 /// `HistReq.symbol` alanının ofseti — MQL5 gövdesindeki yorumlara girer.
@@ -37,6 +38,23 @@ use sinyal_proto::{
 /// geliyor: adın uzunluğu iki yerde tutulsaydı biri kayar ve service isteğin
 /// ortasından okumaya başlardı.
 const HIST_SYMBOL_OFF: usize = std::mem::offset_of!(HistReq, symbol);
+
+/// `SymbolEntry`nin sözleşme/taşıma bloğunun ofsetleri.
+///
+/// Bu alanlar eski `_reserved`in İÇİNE yerleştiği için yapı boyutu DEĞİŞMEDİ;
+/// yani üretecin en güçlü testi (`generated_mql5_structs_have_the_same_size_as_rust`)
+/// bu bloğu hiç göremez — toplam 192 bayt kalır ve bir alan yanlış sıraya
+/// yazılsa bile test GEÇER. Ofsetleri `offset_of!`tan üretmek, MQL5 gövdesinin
+/// Rust'tan ayrışmasını yakalayan tek gerçek koruma.
+const SYM_SWAP_LONG_OFF: usize = std::mem::offset_of!(SymbolEntry, swap_long);
+const SYM_SWAP_SHORT_OFF: usize = std::mem::offset_of!(SymbolEntry, swap_short);
+const SYM_MARGIN_INITIAL_OFF: usize = std::mem::offset_of!(SymbolEntry, margin_initial);
+const SYM_MARGIN_HEDGED_OFF: usize = std::mem::offset_of!(SymbolEntry, margin_hedged);
+const SYM_SWAP_MODE_OFF: usize = std::mem::offset_of!(SymbolEntry, swap_mode);
+const SYM_SWAP_ROLLOVER_OFF: usize = std::mem::offset_of!(SymbolEntry, swap_rollover3d);
+const SYM_RESERVED_OFF: usize = std::mem::offset_of!(SymbolEntry, _reserved);
+/// Sözleşme bloğundan SONRA kalan dolgu — MQL5 `reserved1[]` uzunluğu.
+const SYM_RESERVED_LEN: usize = size_of::<SymbolEntry>() - SYM_RESERVED_OFF;
 
 fn main() -> std::io::Result<()> {
     let out = render();
@@ -184,11 +202,48 @@ fn render() -> String {
     s.push_str(&def32("SINYAL_EXEMODE_MARKET", exec_mode::MARKET));
     s.push_str(&def32("SINYAL_EXEMODE_EXCHANGE", exec_mode::EXCHANGE));
 
+    s.push_str(
+        "\n//--- SYMBOL_SWAP_MODE ham degeri.\n\
+         //    swap_long/swap_short'un BIRIMINI bu belirler; ham sayiyi para\n\
+         //    sanmak swap'i buyukluk mertebesinde yanlis hesaplar:\n\
+         //      POINTS            -> point cinsinden\n\
+         //      CURRENCY_*        -> lot basina PARA (hangi para birimi moda bagli)\n\
+         //      INTEREST_*        -> YILLIK FAIZ YUZDESI\n\
+         //      REOPEN_*          -> para degil; pozisyon yeniden acilir\n\
+         //    DISABLED (0) gercekten \"swap yok\" demektir, \"veri yok\" degil.\n",
+    );
+    s.push_str(&def32("SINYAL_SWAPMODE_DISABLED", swap_mode::DISABLED));
+    s.push_str(&def32("SINYAL_SWAPMODE_POINTS", swap_mode::POINTS));
+    s.push_str(&def32("SINYAL_SWAPMODE_CURRENCY_SYMBOL", swap_mode::CURRENCY_SYMBOL));
+    s.push_str(&def32("SINYAL_SWAPMODE_CURRENCY_MARGIN", swap_mode::CURRENCY_MARGIN));
+    s.push_str(&def32("SINYAL_SWAPMODE_CURRENCY_DEPOSIT", swap_mode::CURRENCY_DEPOSIT));
+    s.push_str(&def32("SINYAL_SWAPMODE_INTEREST_CURRENT", swap_mode::INTEREST_CURRENT));
+    s.push_str(&def32("SINYAL_SWAPMODE_INTEREST_OPEN", swap_mode::INTEREST_OPEN));
+    s.push_str(&def32("SINYAL_SWAPMODE_REOPEN_CURRENT", swap_mode::REOPEN_CURRENT));
+    s.push_str(&def32("SINYAL_SWAPMODE_REOPEN_BID", swap_mode::REOPEN_BID));
+
+    s.push_str(
+        "\n//--- swap_rollover3d = ENUM_DAY_OF_WEEK ham degeri.\n\
+         //    DIKKAT: haftanin ilk gunu PAZAR (0), Pazartesi DEGIL. Bir gun\n\
+         //    kaydirmak uc gunluk swap'i yanlis gune yazar ve hata sessizdir.\n\
+         //    Forex'te tipik deger CARSAMBA (3).\n",
+    );
+    s.push_str(&def32("SINYAL_DOW_SUNDAY", day_of_week::SUNDAY));
+    s.push_str(&def32("SINYAL_DOW_MONDAY", day_of_week::MONDAY));
+    s.push_str(&def32("SINYAL_DOW_TUESDAY", day_of_week::TUESDAY));
+    s.push_str(&def32("SINYAL_DOW_WEDNESDAY", day_of_week::WEDNESDAY));
+    s.push_str(&def32("SINYAL_DOW_THURSDAY", day_of_week::THURSDAY));
+    s.push_str(&def32("SINYAL_DOW_FRIDAY", day_of_week::FRIDAY));
+    s.push_str(&def32("SINYAL_DOW_SATURDAY", day_of_week::SATURDAY));
+
     s.push_str("\n//--- SymbolEntry.flags bitleri\n");
     s.push_str(&def32("SINYAL_SYMFLAG_BOOK_SUBSCRIBED", sym_flag::BOOK_SUBSCRIBED));
     s.push_str(&def32("SINYAL_SYMFLAG_READY", sym_flag::READY));
     s.push_str(&def32("SINYAL_SYMFLAG_POLLED_ONLY", sym_flag::POLLED_ONLY));
     s.push_str(&def32("SINYAL_SYMFLAG_CHART", sym_flag::CHART));
+    // Bu bit YOKSA swap/marjin alanlarindaki 0 "broker swap almiyor" DEGIL
+    // "veri yok" demektir. Ayrimi kaybetmek simulatoru iyimser tarafa yanıltir.
+    s.push_str(&def32("SINYAL_SYMFLAG_CONTRACT_DATA", sym_flag::CONTRACT_DATA));
 
     s.push_str("\n//--- Res.source: canli olay mi, mutabakat telafisi mi\n");
     s.push_str(&def("SINYAL_RESSRC_LIVE", res_source::LIVE));
@@ -392,6 +447,16 @@ struct SinyalRes
 //|                                                                  |
 //| name : broker'daki GERÇEK ad (GOLD#, XAUUSD.m ...). Kanonik ad    |
 //|        eşlemesi çekirdek yapılandırmasında yapılır.               |
+//|                                                                  |
+//| SÖZLEŞME/TAŞIMA BLOĞU (+{sym_swap_long_off}..) marjin ve gerçekçi PnL için        |
+//| şarttır. Eski `reserved1`in içine yerleştiği için yapı boyutu     |
+//| DEĞİŞMEDİ ve protokol sürümü artmadı; eski bir EA bu baytları     |
+//| sıfır bırakır.                                                    |
+//|                                                                  |
+//| swap_long/swap_short'un BİRİMİ swap_mode'a bağlıdır — ham sayıyı  |
+//| para sanma (SINYAL_SWAPMODE_* açıklamalarına bak).                |
+//| margin_initial 0 ise broker sabit değer VERMEMİŞTİR; marjin       |
+//| formülle bulunur: volume * contract_size * fiyat / leverage.      |
 //+------------------------------------------------------------------+
 struct SinyalSymbolEntry
   {{
@@ -416,7 +481,13 @@ struct SinyalSymbolEntry
    uint              flags;          // +104 SINYAL_SYMFLAG_*
    uint              reserved0;      // +108 dolgu
    uchar             name[SINYAL_SYMBOL_NAME_LEN]; // +112
-   uchar             reserved1[48];  // +144 gelecekte alan eklemek için
+   double            swap_long;      // +{sym_swap_long_off} SYMBOL_SWAP_LONG (birim: swap_mode)
+   double            swap_short;     // +{sym_swap_short_off} SYMBOL_SWAP_SHORT (birim: swap_mode)
+   double            margin_initial; // +{sym_margin_initial_off} SYMBOL_MARGIN_INITIAL (0 -> formul)
+   double            margin_hedged;  // +{sym_margin_hedged_off} SYMBOL_MARGIN_MAINTENANCE
+   uint              swap_mode;      // +{sym_swap_mode_off} SINYAL_SWAPMODE_*
+   uint              swap_rollover3d;// +{sym_swap_rollover_off} SINYAL_DOW_* (PAZAR=0)
+   uchar             reserved1[{sym_reserved_len}];   // +{sym_reserved_off} gelecekte alan eklemek için
   }};
 
 //+------------------------------------------------------------------+
@@ -596,6 +667,14 @@ struct SinyalBarRec
    uchar             reserved1[32];  // +88
   }};
 "#,
+        sym_swap_long_off = SYM_SWAP_LONG_OFF,
+        sym_swap_short_off = SYM_SWAP_SHORT_OFF,
+        sym_margin_initial_off = SYM_MARGIN_INITIAL_OFF,
+        sym_margin_hedged_off = SYM_MARGIN_HEDGED_OFF,
+        sym_swap_mode_off = SYM_SWAP_MODE_OFF,
+        sym_swap_rollover_off = SYM_SWAP_ROLLOVER_OFF,
+        sym_reserved_off = SYM_RESERVED_OFF,
+        sym_reserved_len = SYM_RESERVED_LEN,
         hist_symbol_len = HIST_SYMBOL_LEN,
         hist_symbol_off = HIST_SYMBOL_OFF,
         hist_tail = size_of::<HistReq>() - HIST_SYMBOL_OFF - HIST_SYMBOL_LEN,
@@ -616,16 +695,23 @@ struct SinyalBarRec
     s
 }
 
+// Ad alanı `<31` + AYRI bir boşluk; `<32` DEĞİL.
+//
+// Tam 32 karakterlik bir ad (`SINYAL_SWAPMODE_CURRENCY_DEPOSIT`) `<32` ile
+// hiç boşluk almaz ve `#define SINYAL_SWAPMODE_CURRENCY_DEPOSIT4` üretilirdi:
+// MQL5 bunu "gövdesi boş, adı ...DEPOSIT4 olan makro" diye kabul eder, hata
+// VERMEZ, ve asıl sabit tanımsız kaldığı için EA derlenmez. 31+boşluk aynı
+// sütun hizasını korur ama ayırıcıyı garanti eder.
 fn def(name: &str, val: u8) -> String {
-    format!("#define {name:<32}{val}\n")
+    format!("#define {name:<31} {val}\n")
 }
 
 fn def16(name: &str, val: u16) -> String {
-    format!("#define {name:<32}0x{val:02X}\n")
+    format!("#define {name:<31} 0x{val:02X}\n")
 }
 
 fn def32(name: &str, val: u32) -> String {
-    format!("#define {name:<32}{val}\n")
+    format!("#define {name:<31} {val}\n")
 }
 
 /// Üretilen MQL5 metnindeki bir yapının bayt boyutunu hesapla.
@@ -805,6 +891,143 @@ mod tests {
         }
     }
 
+    /// Sözleşme/taşıma bloğu boyut testiyle KORUNMUYOR — ofsetleri ayrıca doğrula.
+    ///
+    /// Bu alanlar eski `_reserved`in içine yerleşti, yani `SymbolEntry` hâlâ
+    /// 192 bayt. `generated_mql5_structs_have_the_same_size_as_rust` yalnızca
+    /// TOPLAMI karşılaştırdığı için, iki alanın yeri değişse veya biri MQL5
+    /// gövdesinden hiç yazılmasa o test YEŞİL kalırdı — ve çekirdek `swap_mode`
+    /// diye `margin_hedged`in üst yarısını okurdu.
+    #[test]
+    fn symbol_entry_contract_block_matches_rust_offsets() {
+        let out = render();
+        for (decl, off) in [
+            ("double            swap_long;      ", SYM_SWAP_LONG_OFF),
+            ("double            swap_short;     ", SYM_SWAP_SHORT_OFF),
+            ("double            margin_initial; ", SYM_MARGIN_INITIAL_OFF),
+            ("double            margin_hedged;  ", SYM_MARGIN_HEDGED_OFF),
+            ("uint              swap_mode;      ", SYM_SWAP_MODE_OFF),
+            ("uint              swap_rollover3d;", SYM_SWAP_ROLLOVER_OFF),
+        ] {
+            let want = format!("{decl}// +{off}");
+            assert!(out.contains(&want), "başlıkta eksik veya ofseti kaymış: {want}");
+        }
+
+        // Ofsetlerin KENDİSİ de doğru olmalı; yoksa yukarıdaki döngü kaymış bir
+        // yerleşimi kendi kendine onaylardı (iki taraf da offset_of!'tan geliyor).
+        assert_eq!(SYM_SWAP_LONG_OFF, 144, "blok `name`den (112+32) hemen sonra başlamalı");
+        assert_eq!(SYM_SWAP_SHORT_OFF, 152);
+        assert_eq!(SYM_MARGIN_INITIAL_OFF, 160);
+        assert_eq!(SYM_MARGIN_HEDGED_OFF, 168);
+        assert_eq!(SYM_SWAP_MODE_OFF, 176);
+        assert_eq!(SYM_SWAP_ROLLOVER_OFF, 180);
+
+        // Kaydın toplam boyutu DEĞİŞMEMELİ: değişseydi RING_VERSION artmalıydı
+        // ve bu test o kararı unutmayı yakalayan yer.
+        assert_eq!(size_of::<SymbolEntry>(), 192, "boyut değiştiyse RING_VERSION artmalı");
+        assert_eq!(SYM_RESERVED_OFF + SYM_RESERVED_LEN, size_of::<SymbolEntry>());
+    }
+
+    /// GOLD'un contract_size'ı 100'dür, forex'inki 100000 — marjin formülünün
+    /// tek girdisi bu ve alan tabloda GERÇEKTEN taşınabilmeli.
+    #[test]
+    fn contract_and_margin_fields_survive_a_roundtrip() {
+        let mut e = SymbolEntry { contract_size: 100.0, ..Default::default() };
+        e.swap_long = -12.5;
+        e.swap_short = 3.75;
+        e.swap_mode = sinyal_proto::swap_mode::POINTS;
+        e.swap_rollover3d = sinyal_proto::day_of_week::WEDNESDAY;
+        e.margin_initial = 0.0; // 0 = formüle düş
+        e.margin_hedged = 50.0;
+
+        // MQL5 tarafı bu kaydı BAYT OFSETİYLE okur, alan adıyla değil. Bu
+        // yüzden testi de baytlar üzerinden yapıyoruz: alanın Rust'ta doğru
+        // değeri tutması yetmez, doğru BAYTTA durması gerekir.
+        let raw = unsafe {
+            core::slice::from_raw_parts(
+                (&e as *const SymbolEntry).cast::<u8>(),
+                size_of::<SymbolEntry>(),
+            )
+        };
+        let f64_at = |off: usize| f64::from_le_bytes(raw[off..off + 8].try_into().unwrap());
+        let u32_at = |off: usize| u32::from_le_bytes(raw[off..off + 4].try_into().unwrap());
+
+        assert_eq!(f64_at(24), 100.0, "contract_size +24 — GOLD 100, forex 100000");
+        assert_eq!(f64_at(SYM_SWAP_LONG_OFF), -12.5);
+        assert_eq!(f64_at(SYM_SWAP_SHORT_OFF), 3.75);
+        assert_eq!(f64_at(SYM_MARGIN_INITIAL_OFF), 0.0, "0 = sabit marjin yok, formüle düş");
+        assert_eq!(f64_at(SYM_MARGIN_HEDGED_OFF), 50.0);
+        assert_eq!(u32_at(SYM_SWAP_MODE_OFF), sinyal_proto::swap_mode::POINTS);
+        assert_eq!(u32_at(SYM_SWAP_ROLLOVER_OFF), 3, "Çarşamba = 3 (PAZAR=0)");
+
+        // Ad alanı bu bloğun HEMEN ÖNÜNDE duruyor — taşarsa swap_long'un üstüne
+        // yazardı ve hata "swap saçma büyük" diye çok geç fark edilirdi.
+        let mut named = SymbolEntry::default();
+        sinyal_proto::write_fixed_str(&mut named.name, "XAUUSD.somewhatlongsuffix.pro");
+        named.swap_long = -1.0;
+        assert_eq!(named.swap_long, -1.0);
+        assert_eq!(named.name_str(), "XAUUSD.somewhatlongsuffix.pro");
+    }
+
+    /// Her `#define` adı ile değeri arasında BOŞLUK olmalı.
+    ///
+    /// Bu gerçekten oldu: ad alanı `<32` genişlikteydi ve tam 32 karakterlik
+    /// `SINYAL_SWAPMODE_CURRENCY_DEPOSIT` değerine yapışıp
+    /// `#define SINYAL_SWAPMODE_CURRENCY_DEPOSIT4` üretti. MQL5 bunu geçerli
+    /// (gövdesiz) bir makro sayar, HATA VERMEZ — asıl sabit tanımsız kalır ve
+    /// EA "bilinmeyen tanımlayıcı" ile derlenmez. Uzun bir ad eklendiğinde
+    /// tekrarlanmaması için ad uzunluğundan bağımsız test ediyoruz.
+    #[test]
+    fn every_define_separates_name_from_value() {
+        let out = render();
+        for line in out.lines() {
+            let Some(rest) = line.strip_prefix("#define ") else { continue };
+            let tokens: Vec<&str> = rest.split_whitespace().collect();
+            assert!(
+                tokens.len() >= 2,
+                "ad ile değer yapışmış (ad {} karakter?): {line}",
+                rest.len()
+            );
+            assert!(
+                tokens[0].chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'),
+                "makro adında beklenmeyen karakter: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn swap_and_dayofweek_constants_are_emitted() {
+        // Bu sabitler olmadan `swap_long`ın birimi tahmin edilirdi: POINTS ile
+        // CURRENCY_* arasındaki fark, swap'ta büyüklük mertebesi farkıdır.
+        let out = render();
+        for c in [
+            "SINYAL_SWAPMODE_DISABLED",
+            "SINYAL_SWAPMODE_POINTS",
+            "SINYAL_SWAPMODE_CURRENCY_SYMBOL",
+            "SINYAL_SWAPMODE_CURRENCY_MARGIN",
+            "SINYAL_SWAPMODE_CURRENCY_DEPOSIT",
+            "SINYAL_SWAPMODE_INTEREST_CURRENT",
+            "SINYAL_SWAPMODE_INTEREST_OPEN",
+            "SINYAL_SWAPMODE_REOPEN_CURRENT",
+            "SINYAL_SWAPMODE_REOPEN_BID",
+            "SINYAL_DOW_WEDNESDAY",
+        ] {
+            assert!(out.contains(c), "{c} eksik");
+        }
+        // Haftanın PAZAR ile başladığı başlıkta açıkça yazmalı — bir gün
+        // kaydırmak üç günlük swap'ı yanlış güne yazar.
+        assert!(out.contains("PAZAR (0)"));
+        // Değerlerin kendisi de doğru olmalı, yalnızca varlığı değil.
+        assert!(out.contains(&format!(
+            "#define SINYAL_SWAPMODE_POINTS          {}",
+            sinyal_proto::swap_mode::POINTS
+        )));
+        assert!(out.contains(&format!(
+            "#define SINYAL_DOW_WEDNESDAY            {}",
+            sinyal_proto::day_of_week::WEDNESDAY
+        )));
+    }
+
     #[test]
     fn exemode_and_fillmask_constants_are_emitted() {
         // Doğru doldurma modu seçimi bunlar olmadan yapılamaz; başlıkta
@@ -820,6 +1043,7 @@ mod tests {
             "SINYAL_SYMFLAG_READY",
             "SINYAL_SYMFLAG_POLLED_ONLY",
             "SINYAL_SYMFLAG_CHART",
+            "SINYAL_SYMFLAG_CONTRACT_DATA",
         ] {
             assert!(out.contains(c), "{c} eksik");
         }

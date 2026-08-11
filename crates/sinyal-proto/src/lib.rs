@@ -60,9 +60,10 @@ pub mod validate;
 
 pub use bars::{bar_flag, timeframe, BarRec, HistReq, HIST_SYMBOL_LEN};
 pub use msg::{
-    action, book_type, exec_mode, filling, filling_mask, kind, order_type, read_fixed_str, res_kind,
-    res_source, sym_flag, tick_flag, type_time, write_fixed_str, Book, BookLevel, Cmd, Res,
-    SymbolEntry, Tick, COMMENT_LEN, MAX_BOOK_DEPTH, SYMBOL_NAME_LEN,
+    action, book_type, day_of_week, exec_mode, filling, filling_mask, kind, order_type,
+    read_fixed_str, res_kind, res_source, swap_mode, sym_flag, tick_flag, type_time,
+    write_fixed_str, Book, BookLevel, Cmd, Res, SymbolEntry, Tick, COMMENT_LEN, MAX_BOOK_DEPTH,
+    SYMBOL_NAME_LEN,
 };
 pub use ring::{Cell, Ring, RingError, RingHeader};
 pub use state::{
@@ -305,6 +306,21 @@ mod layout {
     const _: () = assert!(offset_of!(SymbolEntry, ticks_bookdepth) == 100);
     const _: () = assert!(offset_of!(SymbolEntry, flags) == 104);
     const _: () = assert!(offset_of!(SymbolEntry, name) == 112);
+    // Sözleşme/taşıma bloğu eski `_reserved`in İÇİNE yerleşti: yukarıdaki
+    // ofsetlerin hiçbiri kaymadı, bu yüzden RING_VERSION artmadı. Bu blok 40
+    // bayt; geriye 8 bayt rezerv kalır. Toplam boyut 192'de SABİT — sabit
+    // kalmasaydı `Cell<SymbolEntry>` değil, doğrudan tablo adımı kayardı.
+    const _: () = assert!(offset_of!(SymbolEntry, swap_long) == 144);
+    const _: () = assert!(offset_of!(SymbolEntry, swap_short) == 152);
+    // margin_initial 0 ise formüle düşülür; yeri kayarsa marjin kontrolü
+    // rastgele bir bayt dizisini "sabit marjin" sanar.
+    const _: () = assert!(offset_of!(SymbolEntry, margin_initial) == 160);
+    const _: () = assert!(offset_of!(SymbolEntry, margin_hedged) == 168);
+    // swap_long/short'un BİRİMİNİ belirleyen alan — kayarsa swap büyüklük
+    // mertebesinde yanlış hesaplanır ve hata sessizdir.
+    const _: () = assert!(offset_of!(SymbolEntry, swap_mode) == 176);
+    const _: () = assert!(offset_of!(SymbolEntry, swap_rollover3d) == 180);
+    const _: () = assert!(offset_of!(SymbolEntry, _reserved) == 184);
 
     // --- Başlıklar: üretici/tüketici sayaçları AYRI önbellek satırlarında ---
     const _: () = assert!(size_of::<RingHeader>() == 256);

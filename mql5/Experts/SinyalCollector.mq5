@@ -260,6 +260,10 @@ void PrepareSymbols(SinyalSymbolEntry &out[], int &out_count)
       double vmin = 0, vmax = 0, vstep = 0, vlimit = 0;
       long digits = 0, fillmode = 0, trademode = 0, exemode = 0;
       long expmode = 0, ordmode = 0, stops = 0, freeze = 0, bookdepth = 0;
+      // Sözleşme/taşıma verisi — marjin ve gerçekçi PnL bunlar olmadan
+      // hesaplanamaz. Simülatör kayma/swap modelliyorsa girdisi buradan gelir.
+      double swap_long = 0, swap_short = 0, margin_init = 0, margin_maint = 0;
+      long swapmode = 0, rollover3d = 0;
 
       bool ok = true;
       ok = ok && SymbolInfoDouble(sym, SYMBOL_POINT, point);
@@ -280,6 +284,21 @@ void PrepareSymbols(SinyalSymbolEntry &out[], int &out_count)
       ok = ok && SymbolInfoInteger(sym, SYMBOL_TRADE_FREEZE_LEVEL, freeze);
       ok = ok && SymbolInfoInteger(sym, SYMBOL_TICKS_BOOKDEPTH, bookdepth);
 
+      // Sözleşme/taşıma bloğu AYRI bir bayrakla okunur, `ok`a bağlanmaz:
+      // burada bir okuma başarısız olursa sembolü tabloya HİÇ ALMAMAK
+      // (emir gönderilemez hale getirmek) orantısız olurdu. Ama sessizce 0
+      // yazmak da olmaz — 0 swap "bedava taşıma" demektir ve simülatörü tam da
+      // kapatmaya çalıştığımız yönde iyimser yapar. Bu yüzden başarı
+      // SINYAL_SYMFLAG_CONTRACT_DATA ile bildirilir; bayrak yoksa tüketici
+      // swap/marjin alanlarını "veri yok" saymalıdır.
+      bool ok_contract = true;
+      ok_contract = ok_contract && SymbolInfoDouble(sym, SYMBOL_SWAP_LONG, swap_long);
+      ok_contract = ok_contract && SymbolInfoDouble(sym, SYMBOL_SWAP_SHORT, swap_short);
+      ok_contract = ok_contract && SymbolInfoDouble(sym, SYMBOL_MARGIN_INITIAL, margin_init);
+      ok_contract = ok_contract && SymbolInfoDouble(sym, SYMBOL_MARGIN_MAINTENANCE, margin_maint);
+      ok_contract = ok_contract && SymbolInfoInteger(sym, SYMBOL_SWAP_MODE, swapmode);
+      ok_contract = ok_contract && SymbolInfoInteger(sym, SYMBOL_SWAP_ROLLOVER3DAYS, rollover3d);
+
       if(!ok || vstep <= 0.0)
         {
          Print("Sinyal: sembol özellikleri okunamadı, ATLANDI: ", sym,
@@ -297,6 +316,17 @@ void PrepareSymbols(SinyalSymbolEntry &out[], int &out_count)
       g_vol_step[i]  = vstep;
 
       uint flags = 0;
+
+      // contract_size marjin formülünün ÇARPANIDIR
+      // (volume * contract_size * fiyat / leverage). 0 kalırsa marjin de 0
+      // çıkar, yani kaldıraç kontrolü tamamen devre dışı kalır — bu yüzden
+      // sıfır sözleşme büyüklüğü "veri var" sayılmaz.
+      if(ok_contract && contract > 0.0)
+         flags |= SINYAL_SYMFLAG_CONTRACT_DATA;
+      else
+         PrintFormat("Sinyal: %s icin sozlesme/swap verisi OKUNAMADI "
+                     "(contract=%.2f hata=%d) — swap ve marjin MODELLENEMEZ",
+                     sym, contract, GetLastError());
 
       // GRAFİK SEMBOLÜ ayrı bir gecikme sınıfıdır ve bunu tüketiciye DOĞRU
       // bildirmek zorundayız: `OnTick` YALNIZCA grafik sembolü için tetiklenir,
@@ -367,6 +397,14 @@ void PrepareSymbols(SinyalSymbolEntry &out[], int &out_count)
       e.flags           = flags;
       e.reserved0       = 0;
       SinyalWriteFixed(e.name, SINYAL_SYMBOL_NAME_LEN, sym);
+      // Sözleşme/taşıma bloğu. Okuma başarısızsa 0 yazılır ve
+      // SINYAL_SYMFLAG_CONTRACT_DATA KURULMAZ — tüketici ayırt edebilsin.
+      e.swap_long       = swap_long;
+      e.swap_short      = swap_short;
+      e.margin_initial  = margin_init;
+      e.margin_hedged   = margin_maint;
+      e.swap_mode       = (uint)swapmode;
+      e.swap_rollover3d = (uint)rollover3d;
       ArrayInitialize(e.reserved1, 0);
 
       out[out_count++] = e;

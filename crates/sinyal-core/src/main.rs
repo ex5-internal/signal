@@ -37,6 +37,7 @@ mod join;
 mod record;
 mod replay;
 mod server;
+mod sim;
 mod source;
 mod state;
 mod wire;
@@ -431,15 +432,18 @@ async fn main() {
             let items = rec.len();
 
             let (done_tx, done_rx) = tokio::sync::watch::channel(None);
+            let run =
+                replay::spawn(rec, registry.clone(), candles.clone(), tx.clone(), done_tx);
+            // Oynatım kapısı sunucuya veriliyor: ilk istemci bağlanınca açılır.
             replay_ctx = Some(Arc::new(Replay::new(
                 &instances,
                 Some(from_ms),
                 Some(to_ms),
                 cfg.balance,
                 done_rx,
+                run.gate(),
             )));
-            replay_run =
-                Some(replay::spawn(rec, registry.clone(), candles.clone(), tx.clone(), done_tx));
+            replay_run = Some(run);
 
             println!("sinyald REPLAY kipinde — diskteki kayittan oynatiliyor");
             println!("  kayit    : {} ({})", cfg.opts.data_dir.display(), cfg.opts.date);

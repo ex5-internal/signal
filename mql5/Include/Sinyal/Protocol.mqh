@@ -100,11 +100,42 @@
 #define SINYAL_EXEMODE_MARKET           2
 #define SINYAL_EXEMODE_EXCHANGE         3
 
+//--- SYMBOL_SWAP_MODE ham degeri.
+//    swap_long/swap_short'un BIRIMINI bu belirler; ham sayiyi para
+//    sanmak swap'i buyukluk mertebesinde yanlis hesaplar:
+//      POINTS            -> point cinsinden
+//      CURRENCY_*        -> lot basina PARA (hangi para birimi moda bagli)
+//      INTEREST_*        -> YILLIK FAIZ YUZDESI
+//      REOPEN_*          -> para degil; pozisyon yeniden acilir
+//    DISABLED (0) gercekten "swap yok" demektir, "veri yok" degil.
+#define SINYAL_SWAPMODE_DISABLED        0
+#define SINYAL_SWAPMODE_POINTS          1
+#define SINYAL_SWAPMODE_CURRENCY_SYMBOL 2
+#define SINYAL_SWAPMODE_CURRENCY_MARGIN 3
+#define SINYAL_SWAPMODE_CURRENCY_DEPOSIT 4
+#define SINYAL_SWAPMODE_INTEREST_CURRENT 5
+#define SINYAL_SWAPMODE_INTEREST_OPEN   6
+#define SINYAL_SWAPMODE_REOPEN_CURRENT  7
+#define SINYAL_SWAPMODE_REOPEN_BID      8
+
+//--- swap_rollover3d = ENUM_DAY_OF_WEEK ham degeri.
+//    DIKKAT: haftanin ilk gunu PAZAR (0), Pazartesi DEGIL. Bir gun
+//    kaydirmak uc gunluk swap'i yanlis gune yazar ve hata sessizdir.
+//    Forex'te tipik deger CARSAMBA (3).
+#define SINYAL_DOW_SUNDAY               0
+#define SINYAL_DOW_MONDAY               1
+#define SINYAL_DOW_TUESDAY              2
+#define SINYAL_DOW_WEDNESDAY            3
+#define SINYAL_DOW_THURSDAY             4
+#define SINYAL_DOW_FRIDAY               5
+#define SINYAL_DOW_SATURDAY             6
+
 //--- SymbolEntry.flags bitleri
 #define SINYAL_SYMFLAG_BOOK_SUBSCRIBED  1
 #define SINYAL_SYMFLAG_READY            2
 #define SINYAL_SYMFLAG_POLLED_ONLY      4
 #define SINYAL_SYMFLAG_CHART            8
+#define SINYAL_SYMFLAG_CONTRACT_DATA    16
 
 //--- Res.source: canli olay mi, mutabakat telafisi mi
 #define SINYAL_RESSRC_LIVE              0
@@ -299,6 +330,16 @@ struct SinyalRes
 //|                                                                  |
 //| name : broker'daki GERÇEK ad (GOLD#, XAUUSD.m ...). Kanonik ad    |
 //|        eşlemesi çekirdek yapılandırmasında yapılır.               |
+//|                                                                  |
+//| SÖZLEŞME/TAŞIMA BLOĞU (+144..) marjin ve gerçekçi PnL için        |
+//| şarttır. Eski `reserved1`in içine yerleştiği için yapı boyutu     |
+//| DEĞİŞMEDİ ve protokol sürümü artmadı; eski bir EA bu baytları     |
+//| sıfır bırakır.                                                    |
+//|                                                                  |
+//| swap_long/swap_short'un BİRİMİ swap_mode'a bağlıdır — ham sayıyı  |
+//| para sanma (SINYAL_SWAPMODE_* açıklamalarına bak).                |
+//| margin_initial 0 ise broker sabit değer VERMEMİŞTİR; marjin       |
+//| formülle bulunur: volume * contract_size * fiyat / leverage.      |
 //+------------------------------------------------------------------+
 struct SinyalSymbolEntry
   {
@@ -323,7 +364,13 @@ struct SinyalSymbolEntry
    uint              flags;          // +104 SINYAL_SYMFLAG_*
    uint              reserved0;      // +108 dolgu
    uchar             name[SINYAL_SYMBOL_NAME_LEN]; // +112
-   uchar             reserved1[48];  // +144 gelecekte alan eklemek için
+   double            swap_long;      // +144 SYMBOL_SWAP_LONG (birim: swap_mode)
+   double            swap_short;     // +152 SYMBOL_SWAP_SHORT (birim: swap_mode)
+   double            margin_initial; // +160 SYMBOL_MARGIN_INITIAL (0 -> formul)
+   double            margin_hedged;  // +168 SYMBOL_MARGIN_MAINTENANCE
+   uint              swap_mode;      // +176 SINYAL_SWAPMODE_*
+   uint              swap_rollover3d;// +180 SINYAL_DOW_* (PAZAR=0)
+   uchar             reserved1[8];   // +184 gelecekte alan eklemek için
   };
 
 //+------------------------------------------------------------------+

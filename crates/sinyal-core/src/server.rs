@@ -119,6 +119,12 @@ pub struct Replay {
     /// Oynatım bitti bildirimi. Motor `Some(..)` yazdığında bağlı tüm
     /// istemcilere `replay_done` gider.
     pub done: tokio::sync::watch::Receiver<Option<ReplayEnd>>,
+    /// Oynatımı başlatan kapı; **ilk bağlanan istemci** açar.
+    ///
+    /// Oynatım süreç başlarken akmaya başlasaydı, yayın kanalının o an hiç
+    /// abonesi olmadığı için tick'ler boşluğa gider ve istemci yalnızca
+    /// `replay_done` görürdü (bkz. `replay::StartGate`).
+    pub start: Arc<crate::replay::StartGate>,
 }
 
 impl Replay {
@@ -128,6 +134,7 @@ impl Replay {
         to_ms: Option<i64>,
         balance: f64,
         done: tokio::sync::watch::Receiver<Option<ReplayEnd>>,
+        start: Arc<crate::replay::StartGate>,
     ) -> Self {
         Self {
             instances: instances.to_vec(),
@@ -138,6 +145,7 @@ impl Replay {
             to_ms,
             sim: Mutex::new(Sim::new(balance)),
             done,
+            start,
         }
     }
 
@@ -429,6 +437,11 @@ async fn handle(stream: TcpStream, ctx: Arc<Ctx>) -> Result<(), String> {
     let mut rx = ctx.events.subscribe();
     let mut subs = Subs::default();
     let auth_required = ctx.token.is_some();
+
+    // NOT: replay oynatım kapısı burada AÇILMAZ. Bağlantı kurulmuş olması,
+    // istemcinin tick almaya hazır olduğu anlamına gelmiyor — kanal
+    // abonelikleri henüz boş. Kapı `subscribe` işlendikten sonra açılıyor
+    // (bkz. `handle_client_msg`).
 
     // Bu bağlantıya ait, GECİKMELİ üretilen cevapların kuyruğu.
     //
@@ -762,6 +775,21 @@ fn handle_client_msg(
                     continue;
                 }
                 subs.add(c);
+            }
+            // REPLAY: oynatımı BURADA başlat — abonelikler kurulduktan SONRA.
+            //
+            // Kapıyı bağlantı kurulurken açmak YETMİYOR ve bu pahalı bir
+            // şekilde öğrenildi: yayın kanalına abone olmak, o istemcinin
+            // hangi kanalları istediğini bilmekle aynı şey değil. Bağlantıda
+            // açsaydık, `--replay-speed 0`da kayıt (binlerce tick, milisaniyeler
+            // içinde) istemcinin `subscribe` mesajı daha gelmeden akıp biterdi;
+            // pompa her tick'i "abone değil" diye ELERDİ ve istemci yine sıfır
+            // tick görürdü. Ölçüldü: bağlantıda açınca 1689 tick'in 0'ı ulaştı.
+            //
+            // Abonelik kurulduktan sonra açmak, ilk tüketicinin kaydın
+            // BAŞINDAN itibaren her tick'i görmesini garanti eder.
+            if let Some(r) = &ctx.replay {
+                r.start.open();
             }
             out
         }
@@ -2315,6 +2343,7 @@ mod tests {
             Some(1_700_000_600_000),
             balance,
             done_rx,
+            Arc::new(crate::replay::StartGate::new()),
         )));
         (ctx, c_rx, done_tx)
     }
