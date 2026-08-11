@@ -7,28 +7,43 @@
 //! sinyald --instance mt5-1 --bind 127.0.0.1:8787
 //! sinyald --instance icmarkets --instance pepperstone --enable-trading --token gizli
 //! sinyald --instance mt5-1 --record ./veri
+//! sinyald --instance mt5-1 --paper-bind 127.0.0.1:8788 --sim-slippage 2
 //! sinyald --replay ./veri --replay-date 20260811 --replay-speed 0
 //! ```
 //!
-//! # İki kip, tek protokol
+//! # Üç kip, tek protokol
 //!
 //! **CANLI** (`--instance`): paylaşımlı bellekten okur, emirleri gerçekten
 //! yürütür.
+//!
+//! **PAPER** (`--paper-bind`): canlı kipin YANINDA açılan ikinci dinleyici.
+//! Veri CANLIDIR — aynı okuyucu, aynı mum deposu — ama yürütme **simüledir**
+//! ve bu porttan paylaşımlı belleğe **hiçbir komut yazılmaz**. Ayrı bir
+//! daemon olamazdı: paylaşımlı halkalar SPSC'dir, ikinci bir okur sözleşmeyi
+//! kırar ve iki taraf da tick kaybeder.
 //!
 //! **REPLAY** (`--replay`): diskteki kayıttan okur, emirleri **simüle** eder
 //! ve paylaşımlı belleğe **hiç dokunmaz** — okuyucu thread'i bile
 //! başlatılmaz, komut kanalı hiç kurulmaz.
 //!
-//! İkisi aynı anda kullanılamaz ve bu bir kolaylık kuralı değil: aynı
-//! süreçte hem kayıttan oynatıp hem gerçek emir gönderebilmek, "test
-//! ediyordum" diye başlayan bir kaza hikâyesinin ilk cümlesi olurdu.
-//! `--replay` ile `--instance` birlikte verilirse çekirdek AÇIK bir hatayla
-//! durur.
+//! `--replay` ile `--instance` birlikte kullanılamaz ve bu bir kolaylık
+//! kuralı değil: aynı süreçte hem kayıttan oynatıp hem gerçek emir
+//! gönderebilmek, "test ediyordum" diye başlayan bir kaza hikâyesinin ilk
+//! cümlesi olurdu. `--replay` ile `--paper-bind` de birlikte kullanılamaz —
+//! replay zaten baştan sona simüledir, paper'ın ekleyeceği bir şey yok.
 //!
-//! Tel üzerindeki fark yalnızca `hello.mode` (`live` / `replay`), `hello`daki
-//! kapsam alanları ve simüle emir olaylarındaki `sim: true`dur. Mesaj
-//! biçimleri, alan adları ve kanal adları birebir aynıdır: amaç sinyal
-//! sisteminin kod yolunun değişmemesi.
+//! Tel üzerindeki fark yalnızca `hello.mode` (`live` / `paper` / `replay`),
+//! `hello`daki kapsam ve simülasyon künyesi alanları, bir de simüle emir
+//! olaylarındaki `sim: true`dur. Mesaj biçimleri, alan adları ve kanal
+//! adları birebir aynıdır: amaç sinyal sisteminin kod yolunun değişmemesi.
+//!
+//! # Simülasyon dürüsttür
+//!
+//! Simülatör (`sim.rs`) spread'i, ALEYHTE kaymayı, bekleyen emir ve SL/TP
+//! tetiklenmesini, `stops_level`i ve marjini modeller; komisyonu, swap'ı ve
+//! requote'u MODELLEMEZ. İkisi de `hello.sim` ile ilan edilir ve açılışta
+//! konsola yazılır — modellenmeyen bir maliyeti tahmin etmektense hiç
+//! eklememek, sonucun ne olduğu konusunda dürüst kalmayı sağlar.
 
 mod candles;
 mod hist_bridge;
@@ -46,8 +61,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use server::{Ctx, OrderTracker, Replay};
-use source::{spawn_reader, ReaderStats};
+use server::{Ctx, OrderTracker, Replay, SimExec};
+use source::{spawn_reader, FeedEvent, ReaderStats};
 use state::Registry;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
@@ -55,13 +70,26 @@ use tokio::sync::broadcast;
 /// Bir gün, ms — replay kapsamını gün içi saate çevirmek için.
 const DAY_MS: i64 = 86_400_000;
 
-/// `--replay-balance` verilmediğinde sentetik başlangıç bakiyesi.
-const DEFAULT_REPLAY_BALANCE: f64 = 10_000.0;
+/// `--replay-balance` / `--paper-balance` verilmediğinde sentetik bakiye.
+const DEFAULT_REPLAY_BALANCE: f64 = sim::DEFAULT_BALANCE;
 
 /// Replay kipinin çözülmüş ayarları.
 struct ReplayCfg {
     opts: replay::ReplayOpts,
     /// Sentetik başlangıç bakiyesi (`--replay-balance`).
+    balance: f64,
+}
+
+/// PAPER kipinin çözülmüş ayarları — **ikinci dinleyici, aynı süreç**.
+///
+/// Ayrı bir daemon neden olmaz: paylaşımlı halkalar SPSC'dir (tek yazar, tek
+/// okur). İkinci bir süreç aynı halkayı okumaya kalksa sözleşme kırılır ve
+/// iki taraf da tick kaybeder. Bu yüzden paper, canlı okuyucunun ürettiği
+/// akışa AYNI süreçte bağlanır.
+struct PaperCfg {
+    /// Dinlenecek adres (`--paper-bind`).
+    bind: String,
+    /// Sentetik başlangıç bakiyesi (`--paper-balance`).
     balance: f64,
 }
 
@@ -87,6 +115,14 @@ impl RawReplay {
     }
 }
 
+/// Ham paper bayrakları.
+#[derive(Default)]
+struct RawPaper {
+    bind: Option<String>,
+    balance: Option<f64>,
+    slippage: Option<f64>,
+}
+
 struct Args {
     instances: Vec<String>,
     bind: String,
@@ -101,6 +137,14 @@ struct Args {
     /// `Some` ise REPLAY kipi (bkz. `replay.rs`); paylaşımlı belleğe hiç
     /// bağlanılmaz.
     replay: Option<ReplayCfg>,
+    /// `Some` ise CANLI kipin yanında AYRICA bir paper dinleyicisi açılır.
+    paper: Option<PaperCfg>,
+    /// Simülasyonda daima ALEYHTE uygulanan kayma (point).
+    ///
+    /// Hem replay hem paper için geçerli: iki kipin dolum fiyatı ayrışırsa
+    /// "kayıttan test ettim" ile "canlı veriyle test ettim" farklı sonuç
+    /// verir ve hangisinin doğru olduğu bilinemezdi.
+    sim_slippage: f64,
 }
 
 impl Args {
@@ -115,6 +159,7 @@ impl Args {
     /// sınanabilir olmalı.
     fn from_argv(argv: Vec<String>) -> Result<Self, String> {
         let mut raw = RawReplay::default();
+        let mut paper = RawPaper::default();
         let mut a = Args {
             instances: Vec::new(),
             // Varsayılan localhost: bu uç EMİR YÜRÜTEBİLİYOR, kazara ağa
@@ -127,6 +172,8 @@ impl Args {
             capacity: 8192,
             record: None,
             replay: None,
+            paper: None,
+            sim_slippage: sim::DEFAULT_SLIPPAGE_POINTS,
         };
         let mut i = 0;
         while i < argv.len() {
@@ -190,6 +237,18 @@ impl Args {
                     raw.balance = Some(num()?);
                     i += 2;
                 }
+                "--paper-bind" => {
+                    paper.bind = Some(val()?);
+                    i += 2;
+                }
+                "--paper-balance" => {
+                    paper.balance = Some(num()?);
+                    i += 2;
+                }
+                "--sim-slippage" => {
+                    paper.slippage = Some(num()?);
+                    i += 2;
+                }
                 "--enable-trading" => {
                     a.trading = true;
                     i += 1;
@@ -222,6 +281,16 @@ impl Args {
                 other => return Err(format!("bilinmeyen argüman: {other}")),
             }
         }
+        // Kayma iki kipte de aynı: burada bir kez çözülüyor.
+        if let Some(s) = paper.slippage {
+            if s < 0.0 {
+                return Err(format!(
+                    "--sim-slippage negatif olamaz (kayma DAIMA aleyhtedir), verilen: {s}"
+                ));
+            }
+            a.sim_slippage = s;
+        }
+
         if let Some(dir) = raw.dir.take() {
             // --- REPLAY kipi ---
             //
@@ -240,6 +309,27 @@ impl Args {
                 return Err(
                     "--replay ile --record birlikte kullanılamaz: bir kaydın oynatımını \
                      yeniden kaydetmek yeni veri değil, kaydın kopyasını üretirdi."
+                        .into(),
+                );
+            }
+            // `--paper-bind`in tek işi CANLI veriyi simüle yürütmeye
+            // bağlamaktır; replay zaten baştan sona simüledir. İkisini
+            // birlikte kabul etmek, operatöre canlı veriyle test ettiğini
+            // sandırırken kayıt oynatmak olurdu — üstelik ikinci port
+            // birincisiyle aynı simülasyonu gösterirdi.
+            if paper.bind.is_some() {
+                return Err(
+                    "--replay ile --paper-bind BİRLİKTE kullanılamaz: replay kipinde \
+                     yürütme ZATEN simüledir ve veri kayıttan gelir; paper kipi ise canlı \
+                     veriyi simüle yürütmeye bağlar. Canlı veriyle kâğıt işlem için \
+                     --instance + --paper-bind, kayıttan oynatım için yalnız --replay kullan."
+                        .into(),
+                );
+            }
+            if paper.balance.is_some() {
+                return Err(
+                    "--paper-balance yalnızca --paper-bind ile kullanılır; replay'de \
+                     karşılığı --replay-balance."
                         .into(),
                 );
             }
@@ -307,6 +397,47 @@ impl Args {
                     .into(),
             );
         }
+
+        // --- PAPER dinleyicisi (canlı kipin yanında) ---
+        match paper.bind.take() {
+            Some(bind) => {
+                // Aynı adres iki kez dinlenemez; bunu çalışma zamanında
+                // "adres kullanımda" hatasıyla keşfetmek, operatörü kendi
+                // ikinci portunu bir başkasının işgal ettiğini sanmaya
+                // yöneltirdi.
+                if bind == a.bind {
+                    return Err(format!(
+                        "--paper-bind ile --bind aynı adres olamaz ({bind}): paper AYRI bir \
+                         dinleyicidir. Aynı portta iki kip sunulsaydı gerçek emir ile simüle \
+                         emir arasındaki fark bağlantı bazında kaybolurdu."
+                    ));
+                }
+                let balance = paper.balance.unwrap_or(DEFAULT_REPLAY_BALANCE);
+                if balance < 0.0 {
+                    return Err(format!("--paper-balance negatif olamaz, verilen: {balance}"));
+                }
+                a.paper = Some(PaperCfg { bind, balance });
+            }
+            None => {
+                if paper.balance.is_some() {
+                    return Err(
+                        "--paper-balance yalnızca --paper-bind ile kullanılır; tek başına \
+                         hiçbir şeyi etkilemezdi."
+                            .into(),
+                    );
+                }
+                // Sessizce yok saymak, "--paper-bind yazmayı unuttum" hatasını
+                // fark edilmez yapardı: operatör kaymayı ayarladığını sanırken
+                // hiçbir simülasyon çalışmıyor olurdu.
+                if paper.slippage.is_some() {
+                    return Err(
+                        "--sim-slippage yalnızca simülasyon çalışan kiplerde anlamlıdır: \
+                         --replay veya --paper-bind ile kullan."
+                            .into(),
+                    );
+                }
+            }
+        }
         Ok(a)
     }
 }
@@ -349,15 +480,57 @@ REPLAY (kayıttan oynatım — paylaşımlı belleğe HİÇ dokunmaz):
   hello.mode replay'de \"replay\" olur ve hello kapsamı (replay_from_ms /
   replay_to_ms) ilan eder; başka hiçbir mesaj biçimi değişmez.
 
-  Emirler REDDEDİLMEZ, SİMÜLE edilir: dolum o andaki KAYITLI bid/ask'ten
-  yapılır (alış -> ask, satış -> bid) ve her emir olayı `sim: true` taşır.
-  Kayma, komisyon ve swap MODELLENMEZ; bekleyen emirler kendiliğinden
-  tetiklenmez. Simüle dolum GERÇEK DOLUM DEĞİLDİR.
+PAPER (canlı veri, simüle yürütme — AYNI süreçte İKİNCİ dinleyici):
+  --paper-bind ADDR   Paper portu. --instance ile birlikte kullanılır,
+                      --replay ile KULLANILAMAZ (replay zaten simüle).
+  --paper-balance N   Sentetik başlangıç bakiyesi (varsayılan 10000)
+
+  Bu porttan gelen bağlantı CANLI tick ve CANLI mumları görür ama emirleri
+  SİMÜLE edilir; paylaşımlı belleğe HİÇBİR komut yazılmaz. hello.mode
+  \"paper\" olur.
+
+SİMÜLASYON (hem --replay hem --paper-bind için):
+  --sim-slippage N    Aleyhte kayma, point (varsayılan 1 — SIFIR DEĞİL)
+
+  MODELLENİR : spread, aleyhte kayma, bekleyen emir tetiklenmesi, SL/TP
+               tetiklenmesi (aynı tick ikisini de vurursa SL kazanır),
+               stops_level (10016), marjin (10019), hacim ızgarası (10014).
+  MODELLENMEZ: komisyon, swap, requote/deviation penceresi, kur çevrimi,
+               kısmi dolum, emir son kullanma, stop-out, freeze_level.
+  Her emir olayı `sim: true` taşır ve hello.sim bu listeyi ilan eder.
+  Simüle dolum GERÇEK DOLUM DEĞİLDİR.
 
 GÜVENLİK:
   Bu uç EMİR YÜRÜTEBİLİR. Varsayılan olarak yalnızca 127.0.0.1'i dinler ve
   emir yürütme kapalıdır. Ağa açacaksan --token KULLAN."
     );
+}
+
+/// Simülasyonun neyi modelleyip neyi MODELLEMEDİĞİNİ açılışta yaz.
+///
+/// Aynı liste `hello.sim` ile tel üzerinden de gider; buradaki kopya
+/// daemon'u terminalden izleyen kişi içindir. Eskiden burada "kayma
+/// modellenmiyor" yazıyordu ve bu artık DOĞRU DEĞİL — yanlış kalmış bir
+/// uyarı, hiç uyarı olmamasından daha kötüdür: okuyan kişi sonucu olduğundan
+/// kötümser sanır ve düzeltmeye çalışır.
+fn print_sim_honesty(slippage: f64) {
+    println!("  MODELLENIR : spread; ALEYHTE kayma ({slippage} point); bekleyen emir ve");
+    println!("               SL/TP tetiklenmesi (ayni tick ikisini de vurursa SL kazanir);");
+    println!("               stops_level (10016); marjin (10019); hacim izgarasi (10014).");
+    println!("  MODELLENMEZ: komisyon, swap, requote/deviation penceresi, kur cevrimi,");
+    println!("               kismi dolum, emir son kullanma, stop-out, freeze_level.");
+    println!("  {}", server::SIM_WARNING);
+    // `--sim-slippage 0` yukarıdaki "MODELLENIR: ALEYHTE kayma" satırını
+    // YALANA çevirir: dolumlar yeniden mükemmelleşir ve strateji burada
+    // kârlı görünüp canlıda kaymaya yenilir — bu işin kapatmaya çalıştığı
+    // boşluğun ta kendisi. Varsayılan 1'dir; 0'a inmek bilinçli bir seçim
+    // olmalı, sessiz bir yan etki değil.
+    if slippage == 0.0 {
+        println!();
+        eprintln!("  UYARI: --sim-slippage 0 — KAYMA KAPALI.");
+        eprintln!("         Her piyasa ve STOP dolumu gordugu fiyattan MUKEMMEL dolar.");
+        eprintln!("         Bu kipte cikan kar egrisi CANLIYA GORE IYIMSERDIR.");
+    }
 }
 
 /// Epoch ms → gün içi `HH:MM:SS.mmm` (UTC).
@@ -384,6 +557,13 @@ async fn main() {
     let candles = Arc::new(Mutex::new(candles::CandleStore::new()));
     let (tx, _) = broadcast::channel(args.capacity);
 
+    // Paper köprüsünün aboneliği OKUYUCULARDAN ÖNCE alınıyor: `broadcast`
+    // yalnızca abone olduktan SONRA gönderilenleri taşır, yani aşağıda
+    // abone olsaydık okuyucunun ilk tick'leri simülatöre hiç ulaşmazdı.
+    // Pratikte EA bağlantısı yavaştır ve fark görünmezdi — görünmeyen bir
+    // veri kaybı tam da en geç fark edileni olurdu.
+    let paper_live_rx = args.paper.as_ref().map(|_| tx.subscribe());
+
     // Kayıt AKIŞTAN ÖNCE kurulur ve başlatılamazsa çıkılır: "kaydediyorum"
     // sanıp kaydetmemek, günler sonra boş bir dizin bulmak demektir.
     // (Örnek sayısı `Args::parse` içinde 1'e sınırlandı; replay kipinde
@@ -406,6 +586,7 @@ async fn main() {
     let mut hist_tx = HashMap::new();
     let mut stats_all = Vec::new();
     let mut replay_ctx: Option<Arc<Replay>> = None;
+    let mut sim_ctx: Option<Arc<SimExec>> = None;
     // Oynatım tutamağı: düşürmek thread'i durdurmaz ama bitişi bekleyebilmek
     // ve kapanışta tanılama yazabilmek için elde tutuluyor.
     let mut replay_run = None;
@@ -432,14 +613,32 @@ async fn main() {
             let items = rec.len();
 
             let (done_tx, done_rx) = tokio::sync::watch::channel(None);
-            let run =
-                replay::spawn(rec, registry.clone(), candles.clone(), tx.clone(), done_tx);
+            // Motor oynatımdan ÖNCE kurulur: oynatım thread'i her tick'te
+            // onu besleyecek, yoksa bekleyen emirler ve SL/TP hiç
+            // tetiklenmez.
+            let sim = Arc::new(SimExec::new(
+                server::MODE_REPLAY,
+                &instances,
+                sim::SimConfig {
+                    balance: cfg.balance,
+                    leverage: sim::DEFAULT_LEVERAGE,
+                    slippage_points: args.sim_slippage,
+                },
+            ));
+            sim_ctx = Some(sim.clone());
+            let run = replay::spawn(
+                rec,
+                registry.clone(),
+                candles.clone(),
+                tx.clone(),
+                done_tx,
+                Some(sim),
+            );
             // Oynatım kapısı sunucuya veriliyor: ilk istemci bağlanınca açılır.
             replay_ctx = Some(Arc::new(Replay::new(
                 &instances,
                 Some(from_ms),
                 Some(to_ms),
-                cfg.balance,
                 done_rx,
                 run.gate(),
             )));
@@ -492,7 +691,7 @@ async fn main() {
 
     let ctx = Arc::new(Ctx {
         registry: registry.clone(),
-        events: tx,
+        events: tx.clone(),
         cmd_tx,
         hist_tx,
         token: args.token.clone(),
@@ -504,10 +703,139 @@ async fn main() {
         // `candles` token istemez ve uç ağa açılabilir; geçmiş çekmek ticaret
         // terminalini meşgul eder. Tavan tüm bağlantılar için ORTAKTIR.
         hist_slots: Arc::new(tokio::sync::Semaphore::new(server::HIST_SLOTS)),
+        // Bu bağlam CANLI ya da REPLAY'dir; paper AYRI bir bağlam kurar.
+        sim: replay_ctx.as_ref().and(sim_ctx.clone()),
         // `None` ise CANLI kip: akış paylaşımlı bellekten geliyor ve emirler
         // gerçekten yürütülür. `Some` ise sunucu hiçbir komut göndermez.
         replay: replay_ctx.clone(),
     });
+
+    // --- PAPER: aynı süreçte İKİNCİ dinleyici, canlı veri + simüle yürütme ---
+    //
+    // Ayrı bir daemon OLMAZ: paylaşımlı halkalar SPSC'dir, ikinci bir okur
+    // sözleşmeyi kırar ve iki taraf da tick kaybeder. Bu yüzden paper aynı
+    // okuyucunun ürettiği akışa bağlanır.
+    //
+    // Ayrı bir yayın kanalı kullanıyor ve bu bilinçli: paper istemcisi canlı
+    // EMİR olaylarını GÖRMEMELİ (kendi işlemi sanardı), canlı istemci de
+    // simüle olayları görmemeli. Piyasa verisi köprüden aynen geçer.
+    let paper_srv = match &args.paper {
+        Some(cfg) => {
+            let (paper_tx, _) = broadcast::channel(args.capacity);
+            let sim = Arc::new(SimExec::new(
+                server::MODE_PAPER,
+                &args.instances,
+                sim::SimConfig {
+                    balance: cfg.balance,
+                    // Kaldıraç canlı hesaptan OKUNMUYOR: hesap görüntüsü
+                    // açılışta henüz yok olabilir ve marjin modelini yarı
+                    // yolda değiştirmek, aynı emrin bir dakika arayla farklı
+                    // sonuç vermesi demekti. Değer `hello.sim`de ilan edilir.
+                    leverage: sim::DEFAULT_LEVERAGE,
+                    slippage_points: args.sim_slippage,
+                },
+            ));
+            let listener = match TcpListener::bind(&cfg.bind).await {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("hata: paper portu {} dinlenemedi: {e}", cfg.bind);
+                    std::process::exit(1);
+                }
+            };
+
+            // Köprü: canlı akıştan oku, simülatörü besle, paper kanalına yaz.
+            let mut live_rx = paper_live_rx.expect("paper aboneligi yukarida alinmis olmali");
+            let bridge_tx = paper_tx.clone();
+            let bridge_sim = sim.clone();
+            tokio::spawn(async move {
+                let mut dropped_total: u64 = 0;
+                loop {
+                    match live_rx.recv().await {
+                        Ok(FeedEvent::Tick {
+                            instance,
+                            symbol,
+                            bid,
+                            ask,
+                            last,
+                            time_msc,
+                            lat_us,
+                        }) => {
+                            // Önce fiyat, sonra o fiyatın doğurduğu dolum:
+                            // istemci görmediği bir fiyattan dolum almamalı.
+                            let _ = bridge_tx.send(FeedEvent::Tick {
+                                instance: instance.clone(),
+                                symbol: symbol.clone(),
+                                bid,
+                                ask,
+                                last,
+                                time_msc,
+                                lat_us,
+                            });
+                            server::pump_tick(
+                                &bridge_sim,
+                                &bridge_tx,
+                                &instance,
+                                &symbol,
+                                bid,
+                                ask,
+                                time_msc,
+                            );
+                        }
+                        // Emir olayı GEÇMEZ: canlı terminalde gerçekleşen bir
+                        // işlemi paper istemcisine göstermek, onu kendi simüle
+                        // emrinin sonucu sanmasına yol açardı.
+                        Ok(FeedEvent::Order { .. }) => {}
+                        Ok(other) => {
+                            let _ = bridge_tx.send(other);
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            // Köprü geride kaldı: DÜŞEN TICK, TETİKLENMEYEN
+                            // STOP demektir. Sessiz kalmak, simülasyonun neden
+                            // canlıdan saptığını aylar sonra sorduracaktı.
+                            dropped_total += n;
+                            eprintln!(
+                                "[paper] UYARI: kopru {n} tick geride kaldi (toplam \
+                                 {dropped_total}). Bu tick'ler simulatore HIC ulasmadi; \
+                                 bekleyen emir ve SL/TP tetiklenmemis olabilir."
+                            );
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return,
+                    }
+                }
+            });
+
+            let paper_ctx = Arc::new(Ctx {
+                registry: registry.clone(),
+                events: paper_tx,
+                // GÜVENLİK SINIRI — BOŞ BIRAKILDI.
+                //
+                // Paper bağlamının paylaşılan belleğe giden bir kanalı
+                // YOKTUR: gönderilecek bir yer olmadığı için kazara gerçek
+                // emir göndermek mümkün değil. `dispatch` içindeki kip
+                // denetimi bunun ikinci hattı.
+                cmd_tx: HashMap::new(),
+                // Geçmiş isteği de paylaşılan belleğe YAZILAN bir komuttur;
+                // sınır mutlak tutuluyor. Barlar canlı akışla dolan ORTAK
+                // mum deposundan geliyor, yani istemci veri kaybetmiyor.
+                hist_tx: HashMap::new(),
+                token: args.token.clone(),
+                // Simüle kipte `--enable-trading` bir riski kapatmıyor.
+                trading: true,
+                allow_live: false,
+                deviation: args.deviation,
+                // AYRI emir defteri: paper istemcisinin aldığı bir kimlik
+                // canlı istemciyi engellememeli ve iki portun olayları
+                // birbirinin kimliğine çözülmemeli.
+                orders: Arc::new(OrderTracker::new()),
+                candles: candles.clone(),
+                hist_slots: Arc::new(tokio::sync::Semaphore::new(server::HIST_SLOTS)),
+                sim: Some(sim),
+                replay: None,
+            });
+            Some((listener, paper_ctx, cfg.bind.clone(), cfg.balance))
+        }
+        None => None,
+    };
 
     let listener = match TcpListener::bind(&args.bind).await {
         Ok(l) => l,
@@ -531,8 +859,17 @@ async fn main() {
         println!("  hello.mode = \"replay\" — istemci canli sanmamali.");
         println!("  Emirler SIMULE edilir; her emir olayi `sim: true` tasir.");
         println!("  Paylasilan bellege HICBIR komut gitmez: gercek emir imkansiz.");
-        println!("  UYARI: kayma, komisyon ve swap MODELLENMIYOR; bekleyen emirler");
-        println!("         kendiliginden tetiklenmez. Simule dolum GERCEK DOLUM DEGILDIR.");
+        print_sim_honesty(args.sim_slippage);
+    }
+    if let Some((_, _, bind, balance)) = &paper_srv {
+        println!();
+        println!("sinyald PAPER portu dinliyor: ws://{bind}");
+        println!("  veri     : CANLI (ayni okuyucu, ayni mum deposu)");
+        println!("  yurutme  : SIMULE — hello.mode = \"paper\"");
+        println!("  bakiye   : {balance} (SENTETIK)");
+        println!("  Bu porttan paylasilan bellege HICBIR komut yazilmaz:");
+        println!("  komut kanali hic kurulmadi, gercek emir imkansiz.");
+        print_sim_honesty(args.sim_slippage);
     }
     let public_bind = !args.bind.starts_with("127.");
     if public_bind {
@@ -652,6 +989,12 @@ async fn main() {
             }
         }
     });
+
+    // Paper dinleyicisi ayrı bir görevde: iki dinleyici birbirini
+    // beklememeli, canlı portun kabul döngüsü paper yüzünden durmamalı.
+    if let Some((paper_listener, paper_ctx, _, _)) = paper_srv {
+        tokio::spawn(server::serve(paper_listener, paper_ctx));
+    }
 
     let srv = server::serve(listener, ctx);
     tokio::select! {
@@ -792,6 +1135,105 @@ mod tests {
             "hizli"
         ])
         .contains("--replay-speed"));
+    }
+
+    // --- PAPER kipi bayrakları ---
+
+    #[test]
+    fn replay_and_paper_bind_together_is_a_clear_error() {
+        // İkisi birlikte ANLAMSIZ: replay zaten baştan sona simüledir.
+        // Sessizce birini seçmek, operatörün canlı veriyle test ettiğini
+        // sanarken kayıt oynatması demekti.
+        let e = err(&[
+            "--replay",
+            "veri",
+            "--replay-date",
+            "20260811",
+            "--paper-bind",
+            "127.0.0.1:8788",
+        ]);
+        assert!(e.contains("--paper-bind"), "hata hangi bayrak oldugunu soylemeli: {e}");
+        assert!(e.contains("--replay"), "hata --replay'i anmali: {e}");
+        // Sıra fark etmemeli.
+        let e = err(&[
+            "--paper-bind",
+            "127.0.0.1:8788",
+            "--replay",
+            "veri",
+            "--replay-date",
+            "20260811",
+        ]);
+        assert!(e.contains("--paper-bind") && e.contains("--replay"), "{e}");
+    }
+
+    #[test]
+    fn paper_listens_on_its_own_address_and_never_shares_the_live_one() {
+        // Aynı portta iki kip sunulsaydı, gerçek emir ile simüle emir
+        // arasındaki fark bağlantı bazında kaybolurdu.
+        let e = err(&["--bind", "127.0.0.1:8787", "--paper-bind", "127.0.0.1:8787"]);
+        assert!(e.contains("--paper-bind") && e.contains("--bind"), "{e}");
+
+        // Varsayılan --bind ile de aynı çakışma yakalanmalı.
+        assert!(err(&["--paper-bind", "127.0.0.1:8787"]).contains("--bind"));
+
+        let a = Args::from_argv(argv(&["--paper-bind", "127.0.0.1:8788"])).unwrap();
+        let p = a.paper.expect("paper kipi kurulmali");
+        assert_eq!(p.bind, "127.0.0.1:8788");
+        assert!((p.balance - DEFAULT_REPLAY_BALANCE).abs() < 1e-12, "varsayilan bakiye");
+        // Paper CANLI veriyle çalışır: canlı örnek varsayılanı korunmalı.
+        assert_eq!(a.instances, vec!["mt5-1".to_string()]);
+        assert!(a.replay.is_none(), "paper bir replay degil");
+    }
+
+    #[test]
+    fn paper_flags_without_paper_bind_are_refused() {
+        // Sessizce yok saymak, "--paper-bind yazmayı unuttum" hatasını fark
+        // edilmez yapardı: operatör bakiyeyi ayarladığını sanırken hiçbir
+        // simülasyon çalışmıyor olurdu.
+        assert!(err(&["--paper-balance", "500"]).contains("--paper-bind"));
+        let e = err(&["--sim-slippage", "3"]);
+        assert!(e.contains("--paper-bind") && e.contains("--replay"), "{e}");
+        // Replay'de bakiye bayrağının adı farklı; karıştırmak sessiz kalmamalı.
+        let e = err(&["--replay", "veri", "--replay-date", "20260811", "--paper-balance", "5"]);
+        assert!(e.contains("--paper-balance"), "{e}");
+    }
+
+    #[test]
+    fn slippage_defaults_to_one_point_and_is_shared_by_both_sim_modes() {
+        // SIFIR varsayılan bir gerileme olurdu: motor "kaymayı modelliyorum"
+        // diye ilan edip pratikte iyimser dolum üretirdi.
+        assert!((sim::DEFAULT_SLIPPAGE_POINTS - 1.0).abs() < 1e-12);
+
+        let a = Args::from_argv(argv(&["--paper-bind", "127.0.0.1:8788"])).unwrap();
+        assert!((a.sim_slippage - sim::DEFAULT_SLIPPAGE_POINTS).abs() < 1e-12);
+
+        // Aynı bayrak replay'de de geçerli: iki kipin dolum fiyatı ayrışırsa
+        // hangisinin doğru olduğu bilinemezdi.
+        let a = Args::from_argv(argv(&[
+            "--replay",
+            "veri",
+            "--replay-date",
+            "20260811",
+            "--sim-slippage",
+            "2.5",
+        ]))
+        .unwrap();
+        assert!((a.sim_slippage - 2.5).abs() < 1e-12);
+
+        let a = Args::from_argv(argv(&[
+            "--paper-bind",
+            "127.0.0.1:8788",
+            "--sim-slippage",
+            "0",
+        ]))
+        .unwrap();
+        assert_eq!(a.sim_slippage, 0.0, "0 acikca istenebilir (ama varsayilan degil)");
+
+        // Negatif kayma LEHTE kayma demekti — simülasyonu iyimser yapardı.
+        assert!(err(&["--paper-bind", "127.0.0.1:8788", "--sim-slippage", "-1"])
+            .contains("--sim-slippage"));
+        assert!(err(&["--paper-bind", "127.0.0.1:8788", "--paper-balance", "-5"])
+            .contains("--paper-balance"));
     }
 
     #[test]

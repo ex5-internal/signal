@@ -194,17 +194,22 @@ pub enum ServerMsg {
     /// Bağlantı kurulduğunda ilk mesaj.
     Hello {
         proto: u32,
-        /// `live` (gerçek MT5) veya `replay` (diskteki kayıttan oynatım).
+        /// `live` | `paper` | `replay`.
         ///
-        /// **Canlı ile replay arasındaki TEK mesaj farkı budur** (bir de
-        /// `sim` bayrağı). Mesaj biçimleri, alan adları ve kanal adları
-        /// birebir aynı kalır ki sinyal sisteminin kod yolu değişmesin.
-        /// Amaç sistemi kandırmak DEĞİL: replay'i canlı sanıp gerçek emir
-        /// göndermek kabul edilemez bir kaza olurdu, bu yüzden fark burada
-        /// AÇIKÇA ilan edilir.
+        /// - `live` — gerçek MT5, gerçek emirler.
+        /// - `paper` — **CANLI veri, simüle yürütme**. Aynı okuyucu, aynı
+        ///   mum deposu; ama paylaşılan belleğe hiçbir komut gitmez.
+        /// - `replay` — diskteki kayıttan oynatım, simüle yürütme.
+        ///
+        /// **Canlı ile simüle kipler arasındaki mesaj farkı budur** (bir de
+        /// `sim` bayrağı ve [`SimNote`]). Mesaj biçimleri, alan adları ve
+        /// kanal adları birebir aynı kalır ki sinyal sisteminin kod yolu
+        /// değişmesin. Amaç sistemi kandırmak DEĞİL: simülasyonu canlı sanıp
+        /// gerçek emir göndermek kabul edilemez bir kaza olurdu, bu yüzden
+        /// fark burada AÇIKÇA ilan edilir.
         mode: &'static str,
         instances: Vec<String>,
-        /// Emir yürütme açık mı. Replay'de daima `true` — emirler
+        /// Emir yürütme açık mı. Simüle kiplerde daima `true` — emirler
         /// reddedilmez, **simüle** edilir (bkz. `OrderEvent::sim`).
         trading: bool,
         /// Piyasa verisi (tick/derinlik/mum/sembol) token'sız erişilebilir mi.
@@ -223,6 +228,13 @@ pub enum ServerMsg {
         /// bildirilir.
         #[serde(skip_serializing_if = "Option::is_none")]
         replay_to_ms: Option<i64>,
+        /// Simülasyonun künyesi. **Canlıda HİÇ gönderilmez.**
+        ///
+        /// `Box`lu: `ServerMsg` her tick için üretiliyor ve künye yalnızca
+        /// bağlantı başına BİR kez gönderiliyor. Satır içi tutmak, sıcak
+        /// yoldaki her mesajı yüzlerce bayt büyütürdü.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        sim: Option<Box<SimNote>>,
     },
 
     Authed { level: &'static str },
@@ -346,6 +358,34 @@ pub enum ServerMsg {
 
 fn is_zero(v: &f64) -> bool {
     *v == 0.0
+}
+
+/// Simülasyonun **dürüst künyesi** — `hello.sim`, yalnızca simüle kiplerde.
+///
+/// Neden tel üzerinde: "neyin modellendiği" bir yayın notu değil, sinyal
+/// sisteminin sonucu yorumlarken ihtiyaç duyduğu VERİDİR. Kaymayı modelleyen
+/// bir koşunun kâr eğrisi ile modellemeyeninki farklı şeylerdir; ikisini aynı
+/// grafikte karşılaştıran bir istemci, aradaki farkı stratejinin başarısı
+/// sanardı. Aynı sebeple `not_modeled` da gider: eksik olanı bilmeyen bir
+/// tüketici, simüle bakiyeyi gerçek getiri sanar.
+///
+/// Listeler `&'static str` çünkü metinler kodda sabittir; kip başına
+/// hesaplanan bir açıklama, iki kipin sessizce ayrışmasına kapı açardı.
+#[derive(Debug, Clone, Serialize)]
+pub struct SimNote {
+    /// Sentetik başlangıç bakiyesi.
+    pub balance: f64,
+    /// Marjin hesabında kullanılan kaldıraç. **Canlı hesabın kaldıracı
+    /// DEĞİLDİR** — simülasyon onu okumaz, bayraktan/varsayılandan alır.
+    pub leverage: i64,
+    /// Her dolumda ALEYHTE uygulanan kayma (point).
+    pub slippage_points: f64,
+    /// Modellenen etkiler.
+    pub modeled: &'static [&'static str],
+    /// **Modellenmeyen** etkiler — tahmin edilmez, gizlenmez.
+    pub not_modeled: &'static [&'static str],
+    /// Tek cümlelik uyarı.
+    pub warning: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -689,11 +729,13 @@ mod tests {
             level: "public",
             replay_from_ms: None,
             replay_to_ms: None,
+            sim: None,
         };
         let j = serde_json::to_string(&live).unwrap();
         assert!(j.contains(r#""mode":"live""#));
         assert!(!j.contains("replay_from_ms"), "canlida kapsam alani olmamali: {j}");
         assert!(!j.contains("replay_to_ms"));
+        assert!(!j.contains(r#""sim""#), "canlida simulasyon kunyesi olmamali: {j}");
 
         let replay = ServerMsg::Hello {
             proto: 3,
@@ -705,11 +747,47 @@ mod tests {
             level: "trader",
             replay_from_ms: Some(1_700_000_000_000),
             replay_to_ms: Some(1_700_086_400_000),
+            sim: None,
         };
         let j = serde_json::to_string(&replay).unwrap();
         assert!(j.contains(r#""mode":"replay""#), "replay ilan edilmeli: {j}");
         assert!(j.contains(r#""replay_from_ms":1700000000000"#));
         assert!(j.contains(r#""replay_to_ms":1700086400000"#));
+    }
+
+    #[test]
+    fn the_sim_note_publishes_what_is_not_modeled_not_only_what_is() {
+        // DÜRÜSTLÜK TESTİ. Yalnızca "neyi modelliyorum" demek, eksik olanı
+        // sessizce gizlemek olurdu: simüle bakiyeyi gerçek getiri sanan bir
+        // tüketici tam olarak buradan yanılır.
+        let hello = ServerMsg::Hello {
+            proto: 3,
+            mode: "paper",
+            instances: vec!["mt5-1".into()],
+            trading: true,
+            public_feed: true,
+            auth_required_for_trading: false,
+            level: "trader",
+            replay_from_ms: None,
+            replay_to_ms: None,
+            sim: Some(Box::new(SimNote {
+                balance: 10_000.0,
+                leverage: 100,
+                slippage_points: 1.0,
+                modeled: &["kayma"],
+                not_modeled: &["komisyon", "swap", "requote"],
+                warning: "Simule dolum GERCEK DOLUM DEGILDIR.",
+            })),
+        };
+        let j = serde_json::to_string(&hello).unwrap();
+        assert!(j.contains(r#""mode":"paper""#), "{j}");
+        assert!(j.contains(r#""slippage_points":1.0"#), "kayma ilan edilmeli: {j}");
+        for eksik in ["komisyon", "swap", "requote"] {
+            assert!(j.contains(eksik), "MODELLENMEYEN '{eksik}' ilan edilmeli: {j}");
+        }
+        assert!(j.contains("GERCEK DOLUM DEGILDIR"), "{j}");
+        // Kapsam alanları paper'da YOK: paper canlıdır, bir kaydın parçası değil.
+        assert!(!j.contains("replay_from_ms"), "paper'da kapsam alani olmamali: {j}");
     }
 
     #[test]

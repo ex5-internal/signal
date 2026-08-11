@@ -13,6 +13,10 @@ use tokio::sync::broadcast;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::history::{HistCmd, HistReply, HistStatus};
+use crate::sim::{
+    retcode as simret, PriceBook, SimCause, SimEvent, SimEventKind, SimOrderKind, SimOrderReq,
+    SimOutcome, SimSymbol,
+};
 use crate::source::FeedEvent;
 use crate::state::Registry;
 use crate::wire::{
@@ -72,16 +76,160 @@ pub struct Ctx {
     pub candles: Arc<Mutex<crate::candles::CandleStore>>,
     /// Eş zamanlı geçmiş çekme tavanı (bkz. [`HIST_SLOTS`]).
     pub hist_slots: Arc<tokio::sync::Semaphore>,
-    /// `Some` ise **REPLAY** kipi: akış diskteki kayıttan geliyor.
+    /// `Some` ise emirler **SİMÜLE** edilir (paper veya replay).
     ///
     /// Bu alan iki şeyi birden yönetir ve ikisi de güvenlik meselesidir:
     ///
-    /// 1. `hello.mode` `"replay"` olur ve emir olayları `sim: true` taşır —
-    ///    istemci replay'i canlı SANMAMALIDIR.
+    /// 1. `hello.mode` `"paper"`/`"replay"` olur ve emir olayları `sim: true`
+    ///    taşır — istemci simülasyonu canlı SANMAMALIDIR.
     /// 2. `Some` iken paylaşılan belleğe **hiçbir komut yazılmaz**; emirler
-    ///    [`Sim`] içinde simüle edilir. Bu sınır [`dispatch`] içinde ayrıca
-    ///    bir kez daha zorlanır: kazara gerçek emir gitmesi kabul edilemez.
+    ///    [`SimExec`] içindeki motorda simüle edilir. Bu sınır [`dispatch`]
+    ///    içinde ayrıca bir kez daha zorlanır: kazara gerçek emir gitmesi
+    ///    kabul edilemez.
+    ///
+    /// **`replay` ile ilişkisi:** `replay.is_some()` ise `sim` de daima
+    /// `Some`tur. Tersi doğru değil — paper kipinde `sim` doludur ama
+    /// `replay` boştur, çünkü veri CANLIDIR.
+    pub sim: Option<Arc<SimExec>>,
+    /// `Some` ise **REPLAY** kipi: akış diskteki kayıttan geliyor.
+    ///
+    /// Yalnızca kayda özgü şeyleri tutar (kapsam, bitiş bildirimi, oynatım
+    /// kapısı). Emir simülasyonu buraya DEĞİL [`Ctx::sim`]e bakar: paper
+    /// kipinde de aynı motor çalışıyor ve iki kipin emir yolu ayrışırsa
+    /// birinde düzeltilen hata diğerinde kalırdı.
     pub replay: Option<Arc<Replay>>,
+}
+
+impl Ctx {
+    /// Simüle yürütme kipi mi (paper veya replay).
+    pub fn sim(&self) -> Option<&SimExec> {
+        self.sim.as_deref()
+    }
+
+    /// `hello.mode` — tek kaynak.
+    pub fn mode(&self) -> &'static str {
+        self.sim().map(|s| s.mode).unwrap_or(MODE_LIVE)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Simüle yürütme kipleri
+// ---------------------------------------------------------------------------
+
+/// Gerçek MT5 terminali, gerçek emirler.
+pub const MODE_LIVE: &str = "live";
+/// **Canlı veri, simüle yürütme.** Paylaşılan belleğe hiçbir komut gitmez.
+pub const MODE_PAPER: &str = "paper";
+/// Diskteki kayıttan oynatım, simüle yürütme.
+pub const MODE_REPLAY: &str = "replay";
+
+/// Simülatörün MODELLEDİĞİ şeyler — `hello` bunu ilan eder.
+///
+/// Liste tel üzerinde gider çünkü "neyin modellendiği" bir yayın notu değil,
+/// sinyal sisteminin sonucu yorumlarken ihtiyaç duyduğu veridir: kaymayı
+/// modellemeyen bir simülasyonun kâr eğrisi ile modelleyeninki farklı
+/// şeylerdir ve ikisini aynı grafikte karşılaştırmak yanlış olurdu.
+pub const SIM_MODELED: &[&str] = &[
+    "spread (alis ASK, satis BID; LONG BID'den, SHORT ASK'ten kapanir)",
+    "aleyhte kayma (piyasa ve STOP dolumlarinda, --sim-slippage)",
+    "bekleyen emir tetiklenmesi (MT5 semantigi)",
+    "SL/TP tetiklenmesi (ayni tick ikisini de vurursa SL kazanir)",
+    "stops_level ihlali (retcode 10016)",
+    "marjin yetersizligi (retcode 10019)",
+    "hacim izgarasi (retcode 10014)",
+];
+
+/// Simülatörün MODELLEMEDİĞİ şeyler — `hello` bunu da ilan eder.
+///
+/// Tahmin EDİLMEZ: modellenmeyen bir maliyeti uydurmak, sonucun ne olduğu
+/// konusunda yalan söylemek olurdu. Ama sessiz kalmak da yalan olurdu —
+/// bu yüzden liste açıkça gider.
+pub const SIM_NOT_MODELED: &[&str] = &[
+    "komisyon",
+    "swap (gecelik tasima maliyeti)",
+    "requote / deviation penceresi",
+    "kur cevrimi (kar sembolun kotasyon biriminde kalir)",
+    "kismi dolum ve likidite derinligi",
+    "emir son kullanma (expiration saklanir, isletilmez)",
+    "teminat tamamlama (stop-out), freeze_level",
+    "hafta sonu bosluklari ve seans kesintileri",
+];
+
+/// Simüle dolumun ne OLMADIĞINI söyleyen tek cümle.
+pub const SIM_WARNING: &str =
+    "Simule dolum GERCEK DOLUM DEGILDIR: komisyon, swap ve requote modellenmez.";
+
+/// Simüle yürütme bağlamı — **paper ve replay kiplerinde dolu, canlıda boş**.
+///
+/// İki kip aynı motoru paylaşır. Ayrı birer simülatör yazmak, birinde
+/// düzeltilen bir hatanın diğerinde yaşamaya devam etmesi demekti; oysa
+/// projenin amacı tam tersi — test ile canlı arasındaki farkı kapatmak.
+pub struct SimExec {
+    /// [`MODE_PAPER`] veya [`MODE_REPLAY`]. `hello.mode` bunu yayar.
+    pub mode: &'static str,
+    /// İlan edilecek örnek adları (paper'da canlı örnekler, replay'de kayıt).
+    pub instances: Vec<String>,
+    /// Örneği çözülemeyen simüle olaylarda kullanılan varsayılan ad.
+    pub primary: Arc<str>,
+    /// Simülasyon motoru. Tek kilit: emir yolu da tick pompası da buradan
+    /// geçer, böylece bir emir ile bir tetiklenme ARASINA giremez.
+    pub engine: Mutex<crate::sim::SimEngine>,
+    /// Motorun ayarları (`hello` ilan eder).
+    pub cfg: crate::sim::SimConfig,
+}
+
+impl SimExec {
+    pub fn new(mode: &'static str, instances: &[String], cfg: crate::sim::SimConfig) -> Self {
+        Self {
+            mode,
+            instances: instances.to_vec(),
+            // Ad uydurmaktansa kipin adını kullanıyoruz.
+            primary: Arc::from(instances.first().map(String::as_str).unwrap_or(mode)),
+            engine: Mutex::new(crate::sim::SimEngine::new(cfg)),
+            cfg,
+        }
+    }
+
+    /// Simüle olayın `src` alanı: sembolün çözüldüğü örnek, yoksa varsayılan.
+    fn src_of(&self, instance: Option<&str>) -> Arc<str> {
+        match instance {
+            Some(i) if self.instances.iter().any(|k| k == i) => Arc::from(i),
+            _ => self.primary.clone(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, crate::sim::SimEngine> {
+        self.engine.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Simüle motoru **HER TİCK'LE** besle ve doğan olayları yayınla.
+///
+/// Bu çağrı olmadan bekleyen emirler ve SL/TP hiç tetiklenmez — eski
+/// simülatörün en büyük yalanı buydu: emir defterinde duran bir stop, fiyat
+/// üstünden geçse bile sonsuza kadar bekliyordu.
+///
+/// Çağıran iki yerdedir ve ikisi de tick'in TEK sahibidir: replay oynatım
+/// döngüsü (kayıt temposu) ve paper köprüsü (canlı yayın). Yayın kanalına
+/// abone olan üçüncü bir pompa yazmadık; `broadcast` geride kalınca tick
+/// DÜŞÜRÜR ve düşen tick, tetiklenmeyen bir stop demektir.
+pub fn pump_tick(
+    sim: &SimExec,
+    events: &broadcast::Sender<FeedEvent>,
+    instance: &str,
+    symbol: &str,
+    bid: f64,
+    ask: f64,
+    time_msc: i64,
+) {
+    let evs = sim.lock().on_tick(symbol, bid, ask, time_msc);
+    if evs.is_empty() {
+        return;
+    }
+    let src = sim.src_of(Some(instance));
+    for ev in &evs {
+        let _ = events.send(feed_order(&src, ev));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -99,23 +247,17 @@ pub struct ReplayEnd {
 /// Replay kipinin bağlamı.
 ///
 /// Kaydı gerçekten oynatan motor ayrı bir modüldedir; burası sunucunun o
-/// kipte bilmesi gereken her şeyi tutar.
+/// kipte bilmesi gereken **kayda özgü** şeyleri tutar. Emir simülasyonu
+/// burada DEĞİL [`SimExec`] içindedir: paper kipi de aynı motoru kullanıyor.
 pub struct Replay {
     /// Kayıtta bulunan örnek adları (sıralı).
     ///
     /// `hello.instances` bunları ilan eder: oynatım motoru sembol tablosunu
     /// yazmadan bağlanan bir istemci de hangi kaydı dinlediğini görmeli.
     pub instances: Vec<String>,
-    /// Örneği çözülemeyen simüle olaylarda kullanılan varsayılan ad.
-    ///
-    /// Sembollü işlemlerde `src` canlıdaki gibi sembolün örneğinden gelir;
-    /// bu yalnızca hiçbir örneğe bağlanamayan durumların etiketi.
-    pub primary: Arc<str>,
     /// İstenen kapsam (epoch ms). `hello` bunları ilan eder.
     pub from_ms: Option<i64>,
     pub to_ms: Option<i64>,
-    /// Simüle hesap/pozisyon/emir durumu.
-    pub sim: Mutex<Sim>,
     /// Oynatım bitti bildirimi. Motor `Some(..)` yazdığında bağlı tüm
     /// istemcilere `replay_done` gider.
     pub done: tokio::sync::watch::Receiver<Option<ReplayEnd>>,
@@ -132,121 +274,11 @@ impl Replay {
         instances: &[String],
         from_ms: Option<i64>,
         to_ms: Option<i64>,
-        balance: f64,
         done: tokio::sync::watch::Receiver<Option<ReplayEnd>>,
         start: Arc<crate::replay::StartGate>,
     ) -> Self {
-        Self {
-            instances: instances.to_vec(),
-            // Kayıt boş örnek listesiyle yüklenemez; yine de bir ad
-            // uydurmaktansa kipin adını kullanıyoruz.
-            primary: Arc::from(instances.first().map(String::as_str).unwrap_or("replay")),
-            from_ms,
-            to_ms,
-            sim: Mutex::new(Sim::new(balance)),
-            done,
-            start,
-        }
+        Self { instances: instances.to_vec(), from_ms, to_ms, done, start }
     }
-
-    /// Simüle olayın `src` alanı: sembolün çözüldüğü örnek, yoksa varsayılan.
-    fn src_of(&self, instance: Option<&str>) -> Arc<str> {
-        match instance {
-            Some(i) if self.instances.iter().any(|k| k == i) => Arc::from(i),
-            _ => self.primary.clone(),
-        }
-    }
-}
-
-/// Simüle pozisyon.
-#[derive(Debug, Clone)]
-pub struct SimPos {
-    ticket: u64,
-    /// Emri gönderen istemcinin wire kimliği (canlıdaki `magic` karşılığı).
-    client_id: u64,
-    symbol: String,
-    buy: bool,
-    volume: f64,
-    price_open: f64,
-    sl: f64,
-    tp: f64,
-    time_msc: i64,
-    comment: String,
-    /// Açılış anında okunan sözleşme büyüklüğü (kâr hesabı için).
-    contract_size: f64,
-}
-
-/// Simüle bekleyen emir.
-///
-/// **Tetiklenme modellenmiyor**: fiyat seviyeye gelse bile bu emir kendi
-/// kendine pozisyona dönüşmez. Bekleyen emrin gönderim/iptal yolunu test
-/// etmek için var; dolum simülasyonu yalnızca piyasa emirlerindedir.
-#[derive(Debug, Clone)]
-pub struct SimOrd {
-    ticket: u64,
-    client_id: u64,
-    symbol: String,
-    kind: &'static str,
-    volume: f64,
-    price: f64,
-    stoplimit: f64,
-    sl: f64,
-    tp: f64,
-    time_setup_msc: i64,
-    expiration: i64,
-    comment: String,
-}
-
-/// Simüle broker durumu.
-///
-/// # Bu bir broker DEĞİLDİR
-///
-/// Modellenen tek şey, kayıttaki o anki bid/ask'ten yapılan dolum ve ondan
-/// çıkan basit kâr/zarar. **Modellenmeyenler**: kayma, komisyon, swap, kur
-/// çevrimi, marjin/teminat tamamlama, bekleyen emir tetiklenmesi, kısmi
-/// dolum, likidite. Simüle dolum GERÇEK DOLUM DEĞİLDİR ve simüle bakiye bir
-/// stratejinin gerçek getirisi sayılamaz.
-#[derive(Debug)]
-pub struct Sim {
-    balance: f64,
-    /// Bilet sayacı. 1'den başlar: 0 "bilet yok" demektir.
-    next_ticket: u64,
-    positions: Vec<SimPos>,
-    pending: Vec<SimOrd>,
-}
-
-impl Sim {
-    pub fn new(balance: f64) -> Self {
-        Self { balance, next_ticket: 1, positions: Vec::new(), pending: Vec::new() }
-    }
-
-    /// Sıradaki bilet. Belirlenimci: aynı kayıt + aynı istekler → aynı
-    /// biletler.
-    fn ticket(&mut self) -> u64 {
-        let t = self.next_ticket;
-        self.next_ticket += 1;
-        t
-    }
-}
-
-/// Simüle kâr/zarar — **modelin tamamı budur**.
-///
-/// `(çıkış − giriş) × hacim × sözleşme_büyüklüğü`, yöne göre işaretli.
-///
-/// **Sözleşme büyüklüğü kayıtta YOKTUR** (`symbols-*.jsonl` bu alanı
-/// taşımaz), yani pratikte 1 kabul edilir ve sonuç "fiyat farkı × hacim"
-/// birimindedir — PARA DEĞİL. Sembol adına bakıp 100000 varsaymak sessizce
-/// yanlış bir para değeri üretirdi; yanlış birimden yanlış para daha
-/// tehlikeli.
-///
-/// Kâr, sembolün kotasyon para biriminde hesaplanır ve hesap para birimine
-/// **çevrilmez**; komisyon, swap ve kayma yoktur. Bu kasıtlı: modellenmeyen
-/// bir maliyeti tahmin etmektense hiç eklememek, sonucun ne olduğu konusunda
-/// dürüst kalmayı sağlar.
-fn sim_profit(buy: bool, entry: f64, exit: f64, volume: f64, contract_size: f64) -> f64 {
-    let cs = if contract_size > 0.0 { contract_size } else { 1.0 };
-    let dir = if buy { 1.0 } else { -1.0 };
-    dir * (exit - entry) * volume * cs
 }
 
 /// İstemci kimliği (metin) ile wire kimliği (u64) arasındaki eşleme.
@@ -605,11 +637,13 @@ where
 
 /// Bağlantının ilk mesajı.
 ///
-/// Canlı ile replay arasındaki fark burada, **tek yerde** doğar: `mode` ve
-/// kapsam alanları. Kanal adları, mesaj biçimleri ve alan adları aynı kalır —
-/// sinyal sisteminin kod yolu iki kipte de aynı olmalı.
+/// Canlı ile simüle kipler arasındaki fark burada, **tek yerde** doğar:
+/// `mode`, kapsam alanları ve simülasyon notu. Kanal adları, mesaj biçimleri
+/// ve alan adları aynı kalır — sinyal sisteminin kod yolu üç kipte de aynı
+/// olmalı.
 fn hello_msg(ctx: &Ctx, level: Level) -> ServerMsg {
     let replay = ctx.replay.as_deref();
+    let sim = ctx.sim();
     let mut instances = ctx.registry.instances();
     if let Some(r) = replay {
         // Kayıttaki örnek adları, motor sembol tablosunu yazmadan önce de
@@ -623,24 +657,50 @@ fn hello_msg(ctx: &Ctx, level: Level) -> ServerMsg {
     }
     ServerMsg::Hello {
         proto: sinyal_proto::ring::RING_VERSION,
-        mode: if replay.is_some() { "replay" } else { "live" },
+        mode: ctx.mode(),
         instances,
-        // Replay'de emir yürütme daima "açık": emirler reddedilmez, simüle
+        // Simüle kipte emir yürütme daima "açık": emirler reddedilmez, simüle
         // edilir. `--enable-trading` orada bir kapı değil, çünkü kapatacağı
         // bir risk yok — gerçek emir zaten hiç gönderilmiyor.
-        trading: replay.is_some() || ctx.trading,
+        trading: sim.is_some() || ctx.trading,
         // Piyasa verisi daima token'sız; yalnızca hesap ve emir kilitli.
         public_feed: true,
         auth_required_for_trading: ctx.token.is_some(),
         level: level.name(),
         replay_from_ms: replay.and_then(|r| r.from_ms),
         replay_to_ms: replay.and_then(|r| r.to_ms),
+        // Canlıda HİÇ gönderilmez; simüle kipte neyin modellendiğini ve
+        // neyin MODELLENMEDİĞİNİ istemci ilk mesajda görür.
+        sim: sim.map(sim_note),
     }
 }
 
-/// Replay kipinde `candles` cevabının açıklaması; canlıda `None`.
-fn replay_hist_note(ctx: &Ctx) -> Option<String> {
-    ctx.replay.as_ref().map(|_| crate::replay::HIST_NOTE.to_owned())
+/// `hello.sim` — simülasyonun dürüst künyesi.
+fn sim_note(s: &SimExec) -> Box<crate::wire::SimNote> {
+    Box::new(crate::wire::SimNote {
+        balance: s.cfg.balance,
+        leverage: s.cfg.leverage,
+        slippage_points: s.cfg.slippage_points,
+        modeled: SIM_MODELED,
+        not_modeled: SIM_NOT_MODELED,
+        warning: SIM_WARNING,
+    })
+}
+
+/// Simüle kipte `candles` cevabının açıklaması; canlıda `None`.
+///
+/// İki kipin sebebi FARKLI ve ikisini aynı cümleyle geçiştirmek istemciyi
+/// yanlış yere baktırırdı: replay'de çekilecek bir terminal YOK; paper'da
+/// terminal var ama ona istek göndermiyoruz — güvenlik sınırı.
+fn sim_hist_note(ctx: &Ctx) -> Option<String> {
+    match ctx.sim()?.mode {
+        MODE_REPLAY => Some(crate::replay::HIST_NOTE.to_owned()),
+        _ => Some(
+            "paper kipinde MT5 gecmisi CEKILMEZ: paylasilan bellege hicbir istek yazilmaz. \
+             Barlar canli akistan dolan ortak depodan geliyor."
+                .to_owned(),
+        ),
+    }
 }
 
 fn replay_done(end: ReplayEnd) -> ServerMsg {
@@ -695,11 +755,12 @@ fn to_wire(ev: &FeedEvent, ctx: &Ctx) -> Option<ServerMsg> {
                 price: (*price != 0.0).then_some(*price),
                 comment: comment.clone(),
                 src: instance.to_string(),
-                // Replay kipinde emir olayının TEK kaynağı simüle motordur
-                // (paylaşılan bellek okuyucusu hiç çalışmaz), canlıda ise
-                // simüle olay hiç üretilmez. Bayrağı kipe bakarak basmak bu
-                // yüzden doğru — ve tek bir yerde kalıyor.
-                sim: ctx.replay.is_some(),
+                // Simüle kipte emir olayının TEK kaynağı simülasyon motorudur
+                // (paper portunun paylaşılan belleğe komut kanalı YOKTUR,
+                // replay'de okuyucu hiç çalışmaz), canlıda ise simüle olay
+                // hiç üretilmez. Bayrağı kipe bakarak basmak bu yüzden
+                // doğru — ve tek bir yerde kalıyor.
+                sim: ctx.sim.is_some(),
             })
         }
     })
@@ -853,29 +914,29 @@ fn handle_client_msg(
         // yetki kuralının tek yerde kalmasını sağlar: `candles` PUBLIC'tir,
         // token istemez.
         ClientMsg::Candles { symbol, tf, count } => {
-            candles_from_store(ctx, symbol, tf, count, "off", replay_hist_note(ctx))
+            candles_from_store(ctx, symbol, tf, count, "off", sim_hist_note(ctx))
         }
 
-        // --- hesap yüzeyi: replay'de simüle durum ---
+        // --- hesap yüzeyi: simüle kipte sentetik durum ---
         //
         // Alan adları ve biçimler canlıyla AYNI; yalnızca değerlerin kaynağı
-        // farklı. İstemci kodu iki kipte de aynı yolu yürümeli.
-        ClientMsg::Account => match ctx.replay.as_deref() {
-            Some(r) => vec![ServerMsg::Account { items: sim_accounts(ctx, r) }],
+        // farklı. İstemci kodu üç kipte de aynı yolu yürümeli.
+        ClientMsg::Account => match ctx.sim() {
+            Some(s) => vec![ServerMsg::Account { items: sim_accounts(ctx, s) }],
             None => vec![ServerMsg::Account { items: collect_accounts(ctx) }],
         },
 
         ClientMsg::Positions => {
-            let (items, total, truncated) = match ctx.replay.as_deref() {
-                Some(r) => sim_positions(ctx, r),
+            let (items, total, truncated) = match ctx.sim() {
+                Some(s) => sim_positions(ctx, s),
                 None => collect_positions(ctx),
             };
             vec![ServerMsg::Positions { items, total, truncated }]
         }
 
         ClientMsg::Orders => {
-            let (items, total, truncated) = match ctx.replay.as_deref() {
-                Some(r) => sim_orders(ctx, r),
+            let (items, total, truncated) = match ctx.sim() {
+                Some(s) => sim_orders(ctx, s),
                 None => collect_orders(ctx),
             };
             vec![ServerMsg::Orders { items, total, truncated }]
@@ -883,26 +944,27 @@ fn handle_client_msg(
 
         // --- emir yüzeyi ---
         //
-        // Replay'de emirler REDDEDİLMEZ, simüle edilir: yoksa sinyal
+        // Simüle kipte emirler REDDEDİLMEZ, simüle edilir: yoksa sinyal
         // sisteminin emir yolu hiç test edilemezdi. Bu dallanma aynı zamanda
-        // güvenlik sınırıdır — sim yolunda `Cmd` üretilmez.
-        ClientMsg::Order(req) => match ctx.replay.as_deref() {
-            Some(r) => sim_submit_order(req, ctx, r),
+        // GÜVENLİK SINIRIDIR — sim yolunda `Cmd` hiç üretilmez, dolayısıyla
+        // paylaşılan belleğe yazılabilecek bir şey de doğmaz.
+        ClientMsg::Order(req) => match ctx.sim() {
+            Some(s) => sim_submit_order(req, ctx, s),
             None => vec![submit_order(req, ctx)],
         },
 
-        ClientMsg::Cancel { id, ticket } => match ctx.replay.as_deref() {
-            Some(r) => sim_cancel(ctx, r, &id, ticket),
+        ClientMsg::Cancel { id, ticket } => match ctx.sim() {
+            Some(s) => sim_cancel(ctx, s, &id, ticket),
             None => vec![submit_simple(ctx, &id, action::REMOVE, ticket, 0.0, 0.0, 0.0)],
         },
-        ClientMsg::Close { id, ticket, volume } => match ctx.replay.as_deref() {
-            Some(r) => sim_close(ctx, r, &id, ticket, volume),
+        ClientMsg::Close { id, ticket, volume } => match ctx.sim() {
+            Some(s) => sim_close(ctx, s, &id, ticket, volume),
             None => {
                 vec![submit_simple(ctx, &id, action::CLOSE_POSITION, ticket, volume, 0.0, 0.0)]
             }
         },
-        ClientMsg::ModifySltp { id, ticket, sl, tp } => match ctx.replay.as_deref() {
-            Some(r) => sim_modify(ctx, r, &id, ticket, sl, tp),
+        ClientMsg::ModifySltp { id, ticket, sl, tp } => match ctx.sim() {
+            Some(s) => sim_modify(ctx, s, &id, ticket, sl, tp),
             None => vec![submit_simple(ctx, &id, action::SLTP, ticket, 0.0, sl, tp)],
         },
     })
@@ -974,13 +1036,16 @@ fn candles_from_store(
 async fn candles_op(ctx: &Ctx, symbol: String, tf: String, count: usize) -> Vec<ServerMsg> {
     let Some(canon) = crate::candles::canon_tf(&tf) else {
         // Geçersiz dilim: aynı hatayı tek yerden üretelim.
-        return candles_from_store(ctx, symbol, tf, count, "off", replay_hist_note(ctx));
+        return candles_from_store(ctx, symbol, tf, count, "off", sim_hist_note(ctx));
     };
-    // Replay'de MT5 geçmişi YOKTUR: çekilecek bir terminal yok. Sebebi
-    // söylemeden `hist: "off"` demek, istemcinin "Service'i açmayı unuttum"
-    // sanmasına yol açardı.
-    if ctx.replay.is_some() {
-        return candles_from_store(ctx, symbol, tf, count, "off", replay_hist_note(ctx));
+    // Simüle kiplerde MT5'ten ÇEKİM YAPILMAZ ve sebep kipe göre farklıdır
+    // (bkz. `sim_hist_note`). Sebebi söylemeden `hist: "off"` demek,
+    // istemcinin "Service'i açmayı unuttum" sanmasına yol açardı.
+    //
+    // Paper'da depo CANLI akışla dolduğu için istemci yine gerçek barları
+    // görür; yalnızca tazeleme isteğini biz göndermiyoruz.
+    if ctx.sim.is_some() {
+        return candles_from_store(ctx, symbol, tf, count, "off", sim_hist_note(ctx));
     }
     let n = count.min(crate::candles::MAX_REQUEST);
 
@@ -1069,7 +1134,7 @@ fn event(ctx: &Ctx, id: &str, kind: &'static str, src: &str) -> OrderEvent {
         id: id.to_owned(),
         kind,
         src: src.to_owned(),
-        sim: ctx.replay.is_some(),
+        sim: ctx.sim.is_some(),
         ..Default::default()
     }
 }
@@ -1088,14 +1153,20 @@ fn rejected(ctx: &Ctx, id: &str, why: &str) -> ServerMsg {
 }
 
 fn dispatch(ctx: &Ctx, instance: &str, cmd: Cmd, id: &str) -> ServerMsg {
-    // GÜVENLİK SINIRI — replay kipinde paylaşılan belleğe HİÇBİR ŞEY yazılmaz.
+    // GÜVENLİK SINIRI — simüle kipte paylaşılan belleğe HİÇBİR ŞEY yazılmaz.
     //
     // Bu noktaya gelinmesi bir programlama hatasıdır (`handle_client_msg`
     // simülasyon yoluna sapmalıydı). Panik atmıyoruz ama komutu da
-    // göndermiyoruz: kayıttan oynatım sırasında canlı bir emrin çıkması,
-    // bu projede kabul edilebilecek en pahalı kaza olurdu.
-    if ctx.replay.is_some() {
-        return rejected(ctx, id, "replay kipinde gercek emir gonderilmez");
+    // göndermiyoruz.
+    //
+    // **PAPER kipinde bu, replay'dekinden daha kritik.** Replay'de komut
+    // kanalı zaten kurulmaz — gönderilecek bir yer yoktur. Paper ise CANLI
+    // bir terminalin yanında, aynı süreçte çalışır; "test ediyordum" diye
+    // başlayan kaza hikâyesinin gerçekten mümkün olduğu tek yer burası.
+    // Paper bağlamının `cmd_tx` haritası da bilerek BOŞ bırakılır, yani bu
+    // kontrol ikinci savunma hattıdır.
+    if let Some(s) = ctx.sim() {
+        return rejected(ctx, id, &format!("{} kipinde gercek emir gonderilmez", s.mode));
     }
     match ctx.cmd_tx.get(instance) {
         Some(tx) => match tx.send(cmd) {
@@ -1253,97 +1324,108 @@ fn submit_order(req: OrderReq, ctx: &Ctx) -> ServerMsg {
 }
 
 // ---------------------------------------------------------------------------
-// Simüle emir motoru — YALNIZCA replay kipinde
+// Simüle emir yolu — PAPER ve REPLAY kiplerinde
 // ---------------------------------------------------------------------------
 //
-// Neden simüle ediyoruz da reddetmiyoruz: emirleri reddeden bir replay,
-// sinyal sisteminin emir yolunu HİÇ test edemez — kaydın tek işe yaramadığı
-// yer tam da en pahalı hataların çıktığı yer olurdu.
+// Neden simüle ediyoruz da reddetmiyoruz: emirleri reddeden bir kip, sinyal
+// sisteminin emir yolunu HİÇ test edemez — en pahalı hataların çıktığı yer
+// tam da orasıdır.
 //
-// Neden yine de gerçeğe benzemiyor: kayma, komisyon, swap, kur çevrimi,
-// marjin ve bekleyen emir tetiklenmesi MODELLENMİYOR (bkz. [`Sim`]). Simüle
-// dolum GERÇEK DOLUM DEĞİLDİR.
+// Motorun kendisi `crate::sim`dedir ve saftır (I/O yok, saat yok, rastgelelik
+// yok). Burası yalnızca TERCÜME katmanı: tel üzerindeki istek → motor isteği,
+// motor olayı → tel üzerindeki olay. Bu ayrımın sebebi, "aynı kayıt aynı
+// sonucu verir" sözünün sunucunun eş zamanlılığından etkilenmemesi.
 //
 // Hangi doğrulamalar canlıyla aynı, hangileri değil:
 //
-// - AYNI olanlar — İSTEMCİNİN İSTEĞİNE dair olan her şey: bilinmeyen sembol,
+// - AYNI olanlar — İSTEMCİNİN İSTEĞİNE dair her şey: bilinmeyen sembol,
 //   geçersiz `side`/`type`, hacim ızgarası, fiyat ızgarası, çift kimlik.
-//   İstemci iki kipte de aynı hatayı görmeli.
+// - EKLENENLER — BROKER'IN reddedeceği şeyler: `stops_level` ihlali (10016),
+//   yetersiz marjin (10019). Bunlar canlıda MT5'ten gelirdi; simülasyonda
+//   üretilmezlerse strateji canlıda çalışmayan bir stop yönetimine alışır.
 // - ATLANAN — BROKER BAĞLANTISINA dair olanlar: doldurma modu (`filling`),
 //   hesap izinleri, canlı para kilidi. Simüle dolumun doldurma moduyla işi
-//   yok; üstelik `filling_mask`/`exec_mode` kayıttan gelir ve eksik bir
-//   kayıt yüzünden canlıda kabul edilen emri replay'de reddetmek, kod
-//   yolunu test etmek yerine sahte bir hata üretirdi.
+//   yok; üstelik `filling_mask`/`exec_mode` kayıttan gelir ve eksik bir kayıt
+//   yüzünden canlıda kabul edilen emri simülasyonda reddetmek, kod yolunu
+//   test etmek yerine sahte bir hata üretirdi.
 
-/// `TRADE_RETCODE_PLACED` — istek sunucuya iletildi. **Dolum DEĞİL.**
-const RET_ACK: u32 = 10008;
-/// `TRADE_RETCODE_DONE` — istek tamamlandı.
-const RET_DONE: u32 = 10009;
+/// Sembolün simülasyon için gereken tüm görüntüsü.
+struct SimLook {
+    instance: String,
+    sym: SimSymbol,
+    entry: sinyal_proto::SymbolEntry,
+    /// Son bilinen fiyat; yoksa 0/0 — motor bunu `PRICE_OFF` ile reddeder.
+    /// **Uydurulmuş bir fiyattan dolum yapmak**, simülasyonu sessizce yalancı
+    /// yapardı.
+    bid: f64,
+    ask: f64,
+    time_msc: i64,
+}
 
-/// Kayıttaki O ANKİ fiyat.
+/// O ANKİ fiyat.
 ///
 /// Kaynak canlıdakiyle aynı: sembol kaydına işlenmiş son tick. Replay'de bu
-/// kaydı oynatım motoru besler. Fiyat yoksa `None` döner ve emir reddedilir —
-/// **uydurulmuş bir fiyattan dolum yapmak**, simülasyonu sessizce yalancı
-/// yapardı.
+/// kaydı oynatım motoru, paper'da canlı okuyucu besler — ikisi de aynı
+/// `Registry` üzerinden.
 fn sim_last(ctx: &Ctx, symbol: &str) -> Option<crate::state::LastTick> {
     let filter = [symbol.to_owned()];
     ctx.registry.snapshot(&filter).into_iter().next().map(|(_, _, t)| t)
 }
 
-/// Fiyatı sembolün ızgarasına oturt; kayıt o sembolü tanımıyorsa olduğu gibi.
-fn sim_norm(ctx: &Ctx, symbol: &str, p: f64) -> f64 {
-    if p == 0.0 {
-        return 0.0;
-    }
-    match ctx.registry.resolve_any(symbol).and_then(|(i, id)| ctx.registry.symbol(&i, id)) {
-        Some(e) => sinyal_proto::normalize_price(p, e.tick_size, e.digits),
-        None => p,
-    }
+fn sim_lookup(ctx: &Ctx, symbol: &str) -> Result<SimLook, (u32, String)> {
+    let Some((instance, symbol_id)) = ctx.registry.resolve_any(symbol) else {
+        return Err((simret::INVALID, "sembol bulunamadi".into()));
+    };
+    let Some(entry) = ctx.registry.symbol(&instance, symbol_id) else {
+        return Err((simret::INVALID, "sembol kaydi okunamadi".into()));
+    };
+    let last = sim_last(ctx, symbol);
+    Ok(SimLook {
+        instance,
+        sym: SimSymbol::from_entry(&entry),
+        entry,
+        bid: last.map(|l| l.bid).unwrap_or(0.0),
+        ask: last.map(|l| l.ask).unwrap_or(0.0),
+        time_msc: last.map(|l| l.time_msc).unwrap_or(0),
+    })
 }
 
-/// Replay'de emir kapısı.
+/// Tüm sembollerin son fiyatı — pozisyon değerlemesi için.
+///
+/// Motorun kendi defteri yerine `Registry` kullanılıyor: pompa bir tick'i
+/// kaçırsa bile değerleme akışın SON halini göstermeli. Aynı ad birden çok
+/// örnekte varsa sonuncusu kazanır; simüle cüzdan tektir ve sembolü örneğe
+/// göre ayırmıyoruz.
+fn sim_book(ctx: &Ctx) -> PriceBook {
+    let mut b = PriceBook::new();
+    for (_, name, t) in ctx.registry.snapshot(&[]) {
+        b.set(&name, t.bid, t.ask, t.time_msc);
+    }
+    b
+}
+
+/// Simüle kipte emir kapısı.
 ///
 /// Canlı kapılardan geçmez (`--enable-trading`, canlı para kilidi, hesap
 /// izinleri): hiçbiri burada bir riski kapatmıyor, çünkü gerçek emir zaten
 /// gönderilmiyor. **Idempotency denetimi aynen korunur** — çift kimlik
-/// davranışı kod yolunun parçasıdır ve replay'de de aynı görünmelidir.
+/// davranışı kod yolunun parçasıdır ve simülasyonda da aynı görünmelidir.
 fn sim_gate(ctx: &Ctx, id: &str) -> Result<u64, ServerMsg> {
     ctx.orders.register(id).map_err(|_| duplicate(ctx, id))
 }
 
-/// Simüle emir olayının değişken alanları.
-#[derive(Default)]
-struct SimEvt {
-    order: u64,
-    deal: u64,
-    position: u64,
-    volume: f64,
-    price: f64,
-}
-
-/// Emir olaylarını **canlıyla aynı sırada** yayınla: `ack`(10008) → `txn`(10009).
+/// Reddedilen simüle istek — **gerçek MT5 retcode'uyla**.
 ///
-/// Sıra tesadüf değil: istemci `ack`i dolum sanmamalı (bkz. [`OrderEvent`]).
-/// Replay bu ayrımı da yeniden üretmezse, ayrımı yanlış kuran bir istemci
-/// hatası ancak canlıda ortaya çıkardı.
-fn sim_ack_then_txn(ctx: &Ctx, src: &Arc<str>, client_id: u64, txn: SimEvt) {
-    let publish = |kind: &'static str, retcode: u32, e: &SimEvt| {
-        let _ = ctx.events.send(FeedEvent::Order {
-            instance: src.clone(),
-            client_id,
-            kind,
-            retcode,
-            order: e.order,
-            deal: e.deal,
-            position: e.position,
-            volume: e.volume,
-            price: e.price,
-            comment: String::new(),
-        });
-    };
-    publish("ack", RET_ACK, &SimEvt { order: txn.order, ..Default::default() });
-    publish("txn", RET_DONE, &txn);
+/// Canlı `rejected` retcode taşımaz (istek MT5'e hiç gitmemiştir); simülasyon
+/// taşır, çünkü burada reddeden şey broker'ın ta kendisidir. İstemci aynı
+/// hatayı iki kipte de aynı sayıyla görmeli, yoksa simülasyonda yazılan hata
+/// işleme kodu canlıda çalışmaz.
+fn sim_rejected(ctx: &Ctx, id: &str, retcode: u32, why: &str) -> ServerMsg {
+    ServerMsg::Order(OrderEvent {
+        comment: why.to_owned(),
+        retcode: Some(retcode),
+        ..event(ctx, id, "rejected", "")
+    })
 }
 
 /// `queued` — isteğin kabul edildiği, canlıdaki ile aynı ilk cevap.
@@ -1352,250 +1434,236 @@ fn sim_queued(ctx: &Ctx, src: &Arc<str>, id: &str) -> ServerMsg {
 }
 
 /// Bir sembolün ait olduğu örnek — `src` alanı canlıdaki gibi buradan gelir.
-fn sim_src(ctx: &Ctx, r: &Replay, symbol: &str) -> Arc<str> {
-    r.src_of(ctx.registry.resolve_any(symbol).map(|(i, _)| i).as_deref())
+fn sim_src(ctx: &Ctx, s: &SimExec, symbol: &str) -> Arc<str> {
+    s.src_of(ctx.registry.resolve_any(symbol).map(|(i, _)| i).as_deref())
 }
 
-fn sim_submit_order(req: OrderReq, ctx: &Ctx, r: &Replay) -> Vec<ServerMsg> {
+/// Tetiklenmenin sebebini tel üzerinde taşı.
+///
+/// İstemcinin isteğiyle olan olaylarda boş (canlıdaki gibi); kendiliğinden
+/// olanlarda sebep yazılır. Bir dolumun SL mi TP mi bekleyen emir mi olduğunu
+/// ayırt edememek, kayıttan strateji analizini imkânsız kılardı.
+fn cause_comment(c: SimCause) -> String {
+    if c == SimCause::Request {
+        String::new()
+    } else {
+        c.as_str().to_owned()
+    }
+}
+
+/// Motor olayını yayın olayına çevir.
+fn feed_order(src: &Arc<str>, ev: &SimEvent) -> FeedEvent {
+    FeedEvent::Order {
+        instance: src.clone(),
+        client_id: ev.client_id,
+        kind: ev.kind.as_str(),
+        retcode: ev.retcode,
+        order: ev.order,
+        deal: ev.deal,
+        position: ev.position,
+        volume: ev.volume,
+        price: ev.price,
+        comment: cause_comment(ev.cause),
+    }
+}
+
+/// Motor sonucunu tel cevabına çevir ve `ack`/`txn`'i yayınla.
+///
+/// Olay sırası canlıyla AYNI: `queued` → `ack`(10008) → `txn`(10009). Sıra
+/// tesadüf değil — istemci `ack`i dolum sanmamalı (bkz. [`OrderEvent`]).
+/// Simülasyon bu ayrımı yeniden üretmezse, ayrımı yanlış kuran bir istemci
+/// hatası ancak canlıda ortaya çıkardı.
+///
+/// `client_id` BU isteğinkiyle ezilir: motor olayları pozisyonu AÇAN isteğin
+/// kimliğiyle damgalar (kapanış kârını doğru emre bağlayabilmek için), ama
+/// tel üzerinde bir `close` cevabının `close` isteğinin kimliğini taşıması
+/// gerekir — canlıda da öyle.
+fn sim_reply(
+    ctx: &Ctx,
+    s: &SimExec,
+    instance: &str,
+    id: &str,
+    wire: u64,
+    out: SimOutcome,
+) -> Vec<ServerMsg> {
+    let src = s.src_of(Some(instance));
+    match out {
+        SimOutcome::Rejected(r) => vec![sim_rejected(ctx, id, r.retcode, &r.reason)],
+        SimOutcome::Accepted { events, .. } => {
+            for ev in events.iter().filter(|e| e.kind != SimEventKind::Queued) {
+                let mut ev = ev.clone();
+                ev.client_id = wire;
+                let _ = ctx.events.send(feed_order(&src, &ev));
+            }
+            vec![sim_queued(ctx, &src, id)]
+        }
+    }
+}
+
+fn sim_submit_order(req: OrderReq, ctx: &Ctx, s: &SimExec) -> Vec<ServerMsg> {
     let wire = match sim_gate(ctx, &req.id) {
         Ok(w) => w,
         Err(m) => return vec![m],
     };
     // Doğrulama sırası canlıyla AYNI: istemci iki kipte de aynı hatayı görsün.
-    let (is_pending, otype) = match resolve_order_type(&req) {
+    let (_, otype) = match resolve_order_type(&req) {
         Ok(v) => v,
-        Err(why) => return vec![rejected(ctx, &req.id, why)],
+        Err(why) => return vec![sim_rejected(ctx, &req.id, simret::INVALID, why)],
     };
-    let Some((instance, symbol_id)) = ctx.registry.resolve_any(&req.symbol) else {
-        return vec![rejected(ctx, &req.id, "sembol bulunamadi")];
+    // Tel adı üzerinden çeviriyoruz: iki tarafın adları ayrışırsa derleme
+    // değil, sessiz bir yanlış emir tipi doğardı.
+    let Some(kind) = SimOrderKind::parse(order_kind_name(otype)) else {
+        return vec![sim_rejected(ctx, &req.id, simret::INVALID, "emir tipi cevrilemedi")];
     };
-    let Some(entry) = ctx.registry.symbol(&instance, symbol_id) else {
-        return vec![rejected(ctx, &req.id, "sembol kaydi okunamadi")];
+    let look = match sim_lookup(ctx, &req.symbol) {
+        Ok(l) => l,
+        Err((rc, why)) => return vec![sim_rejected(ctx, &req.id, rc, &why)],
     };
+
+    // HACİM: canlı yolun TAM AYNISI.
+    //
+    // `normalize_volume` ızgaraya OTURTUR, reddetmez — canlıda 0.015 lot
+    // 0.01'e yuvarlanıp gönderilir. Motorun kendi ızgara denetimi (10014)
+    // burada bir kez daha çalışır ama oturtulmuş hacmi zaten kabul eder.
+    // Simülasyonun burada reddetmesi, canlıda dolan bir emrin testte
+    // reddedilmesi demek olurdu; bu işin amacı tam tersi.
     let volume = match sinyal_proto::normalize_volume(
         req.volume,
-        entry.volume_min,
-        entry.volume_max,
-        entry.volume_step,
+        look.entry.volume_min,
+        look.entry.volume_max,
+        look.entry.volume_step,
     ) {
         Ok(v) => v,
-        Err(e) => return vec![rejected(ctx, &req.id, &format!("hacim: {e}"))],
+        Err(e) => {
+            return vec![sim_rejected(
+                ctx,
+                &req.id,
+                simret::INVALID_VOLUME,
+                &format!("hacim: {e}"),
+            )]
+        }
     };
     let norm = |p: f64| {
         if p == 0.0 {
             0.0
         } else {
-            sinyal_proto::normalize_price(p, entry.tick_size, entry.digits)
+            sinyal_proto::normalize_price(p, look.entry.tick_size, look.entry.digits)
         }
     };
-    let buy = matches!(
-        otype,
-        order_type::BUY | order_type::BUY_LIMIT | order_type::BUY_STOP | order_type::BUY_STOP_LIMIT
-    );
-    let comment = if req.comment.is_empty() { short(&req.id) } else { req.comment.clone() };
-    let src = r.src_of(Some(&instance));
 
-    let mut sim = r.sim.lock().unwrap_or_else(|e| e.into_inner());
-
-    if is_pending {
-        let price = norm(req.price);
-        if price <= 0.0 {
-            return vec![rejected(ctx, &req.id, "bekleyen emir fiyat ister")];
-        }
-        let ticket = sim.ticket();
-        sim.pending.push(SimOrd {
-            ticket,
-            client_id: wire,
-            symbol: req.symbol.clone(),
-            kind: order_kind_name(otype),
-            volume,
-            price,
-            stoplimit: norm(req.stoplimit),
-            sl: norm(req.sl),
-            tp: norm(req.tp),
-            // Kaydın saati; yoksa 0 — yerel saat yazmak kaydın zamanıyla
-            // çelişen bir damga üretirdi.
-            time_setup_msc: sim_last(ctx, &req.symbol).map(|l| l.time_msc).unwrap_or(0),
-            expiration: req.expiration,
-            comment,
-        });
-        drop(sim);
-        sim_ack_then_txn(
-            ctx,
-            &src,
-            wire,
-            SimEvt { order: ticket, volume, price, ..Default::default() },
-        );
-        return vec![sim_queued(ctx, &src, &req.id)];
-    }
-
-    // Piyasa emri: **alış ASK'ten, satış BID'den** dolar. Kayma yok.
-    let Some(last) = sim_last(ctx, &req.symbol) else {
-        return vec![rejected(ctx, &req.id, "kayitta bu an icin fiyat yok — simule dolum yapilamaz")];
-    };
-    let price = if buy { last.ask } else { last.bid };
-    if price <= 0.0 {
-        return vec![rejected(ctx, &req.id, "kayitta bu an icin fiyat yok — simule dolum yapilamaz")];
-    }
-
-    let ticket = sim.ticket();
-    let deal = sim.ticket();
-    sim.positions.push(SimPos {
-        ticket,
+    let sreq = SimOrderReq {
+        id: req.id.clone(),
         client_id: wire,
         symbol: req.symbol.clone(),
-        buy,
+        kind,
         volume,
-        price_open: price,
+        price: norm(req.price),
+        stoplimit: norm(req.stoplimit),
         sl: norm(req.sl),
         tp: norm(req.tp),
-        time_msc: last.time_msc,
-        comment,
-        contract_size: entry.contract_size,
-    });
-    drop(sim);
-
-    // MT5'te yeni pozisyonun kimliği, onu açan emrin biletidir.
-    sim_ack_then_txn(ctx, &src, wire, SimEvt { order: ticket, deal, position: ticket, volume, price });
-    vec![sim_queued(ctx, &src, &req.id)]
+        expiration: req.expiration,
+        comment: if req.comment.is_empty() { short(&req.id) } else { req.comment.clone() },
+        // Akışın saati; yoksa 0 — yerel saat yazmak veri akışının zamanıyla
+        // çelişen bir damga üretirdi.
+        time_msc: look.time_msc,
+    };
+    let out = s.lock().place(&sreq, &look.sym, look.bid, look.ask);
+    sim_reply(ctx, s, &look.instance, &req.id, wire, out)
 }
 
-fn sim_close(ctx: &Ctx, r: &Replay, id: &str, ticket: u64, volume: f64) -> Vec<ServerMsg> {
+/// Biletin sembolünü çöz; bulunamazsa canlıdaki gibi açık ret.
+fn sim_symbol_of(s: &SimExec, ticket: u64) -> Option<String> {
+    s.lock().symbol_of(ticket).map(str::to_owned)
+}
+
+fn sim_close(ctx: &Ctx, s: &SimExec, id: &str, ticket: u64, volume: f64) -> Vec<ServerMsg> {
     let wire = match sim_gate(ctx, id) {
         Ok(w) => w,
         Err(m) => return vec![m],
     };
-    let mut sim = r.sim.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(ix) = sim.positions.iter().position(|p| p.ticket == ticket) else {
-        return vec![rejected(ctx, id, "simule pozisyon bulunamadi")];
+    let Some(symbol) = sim_symbol_of(s, ticket) else {
+        return vec![sim_rejected(ctx, id, simret::INVALID, "simule pozisyon bulunamadi")];
     };
-    let (buy, entry_price, cs, pos_vol, symbol) = {
-        let p = &sim.positions[ix];
-        (p.buy, p.price_open, p.contract_size, p.volume, p.symbol.clone())
+    let look = match sim_lookup(ctx, &symbol) {
+        Ok(l) => l,
+        Err((rc, why)) => return vec![sim_rejected(ctx, id, rc, &why)],
     };
-    // Alış pozisyonu BID'den, satış pozisyonu ASK'ten kapanır.
-    let price = match sim_last(ctx, &symbol) {
-        Some(l) if buy && l.bid > 0.0 => l.bid,
-        Some(l) if !buy && l.ask > 0.0 => l.ask,
-        _ => return vec![rejected(ctx, id, "kayitta bu an icin fiyat yok — simule kapanis yapilamaz")],
-    };
-
-    // 0 veya fazlası "tamamını kapat" demek (canlıdaki ile aynı gevşeklik).
-    let vol = if volume <= 0.0 || volume >= pos_vol { pos_vol } else { volume };
-    sim.balance += sim_profit(buy, entry_price, price, vol, cs);
-    if vol >= pos_vol {
-        sim.positions.remove(ix);
-    } else {
-        sim.positions[ix].volume -= vol;
-    }
-    let ord = sim.ticket();
-    let deal = sim.ticket();
-    drop(sim);
-
-    let src = sim_src(ctx, r, &symbol);
-    sim_ack_then_txn(ctx, &src, wire, SimEvt { order: ord, deal, position: ticket, volume: vol, price });
-    vec![sim_queued(ctx, &src, id)]
+    // Kilit ARADA bırakıldı: bu sırada bir tick pozisyonu SL'den kapatmış
+    // olabilir ve o zaman motor `INVALID` döner. Doğru davranış bu — kilidi
+    // fiyat okuması boyunca tutmak, tick pompasını emir yolunun arkasında
+    // bekletirdi.
+    let out = s.lock().close(ticket, volume, look.bid, look.ask);
+    sim_reply(ctx, s, &look.instance, id, wire, out)
 }
 
-fn sim_cancel(ctx: &Ctx, r: &Replay, id: &str, ticket: u64) -> Vec<ServerMsg> {
+fn sim_cancel(ctx: &Ctx, s: &SimExec, id: &str, ticket: u64) -> Vec<ServerMsg> {
     let wire = match sim_gate(ctx, id) {
         Ok(w) => w,
         Err(m) => return vec![m],
     };
-    let mut sim = r.sim.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(ix) = sim.pending.iter().position(|o| o.ticket == ticket) else {
-        return vec![rejected(ctx, id, "simule bekleyen emir bulunamadi")];
-    };
-    let o = sim.pending.remove(ix);
-    drop(sim);
-
-    let src = sim_src(ctx, r, &o.symbol);
-    sim_ack_then_txn(
-        ctx,
-        &src,
-        wire,
-        SimEvt { order: o.ticket, volume: o.volume, price: o.price, ..Default::default() },
-    );
-    vec![sim_queued(ctx, &src, id)]
+    // İptal fiyat istemez; örnek adını yine de sembolden çözüyoruz ki olayın
+    // `src`si canlıdakiyle aynı anlamı taşısın.
+    let instance = sim_symbol_of(s, ticket)
+        .and_then(|sym| ctx.registry.resolve_any(&sym).map(|(i, _)| i))
+        .unwrap_or_else(|| s.primary.to_string());
+    let out = s.lock().cancel(ticket);
+    sim_reply(ctx, s, &instance, id, wire, out)
 }
 
-fn sim_modify(ctx: &Ctx, r: &Replay, id: &str, ticket: u64, sl: f64, tp: f64) -> Vec<ServerMsg> {
+fn sim_modify(ctx: &Ctx, s: &SimExec, id: &str, ticket: u64, sl: f64, tp: f64) -> Vec<ServerMsg> {
     let wire = match sim_gate(ctx, id) {
         Ok(w) => w,
         Err(m) => return vec![m],
     };
-    let mut sim = r.sim.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(p) = sim.positions.iter().position(|p| p.ticket == ticket) {
-        let symbol = sim.positions[p].symbol.clone();
-        let (nsl, ntp) = (sim_norm(ctx, &symbol, sl), sim_norm(ctx, &symbol, tp));
-        sim.positions[p].sl = nsl;
-        sim.positions[p].tp = ntp;
-        drop(sim);
-        let src = sim_src(ctx, r, &symbol);
-        sim_ack_then_txn(ctx, &src, wire, SimEvt { position: ticket, ..Default::default() });
-        return vec![sim_queued(ctx, &src, id)];
-    }
-    if let Some(o) = sim.pending.iter().position(|o| o.ticket == ticket) {
-        let symbol = sim.pending[o].symbol.clone();
-        let (nsl, ntp) = (sim_norm(ctx, &symbol, sl), sim_norm(ctx, &symbol, tp));
-        sim.pending[o].sl = nsl;
-        sim.pending[o].tp = ntp;
-        drop(sim);
-        let src = sim_src(ctx, r, &symbol);
-        sim_ack_then_txn(ctx, &src, wire, SimEvt { order: ticket, ..Default::default() });
-        return vec![sim_queued(ctx, &src, id)];
-    }
-    vec![rejected(ctx, id, "simule pozisyon/emir bulunamadi")]
-}
-
-/// Simüle pozisyonun o anki fiyatı (kapanış tarafından) — yoksa açılış fiyatı.
-fn sim_mark(ctx: &Ctx, p: &SimPos) -> f64 {
-    sim_last(ctx, &p.symbol)
-        .map(|l| if p.buy { l.bid } else { l.ask })
-        .filter(|v| *v > 0.0)
-        .unwrap_or(p.price_open)
+    let Some(symbol) = sim_symbol_of(s, ticket) else {
+        return vec![sim_rejected(ctx, id, simret::INVALID, "simule pozisyon/emir bulunamadi")];
+    };
+    let look = match sim_lookup(ctx, &symbol) {
+        Ok(l) => l,
+        Err((rc, why)) => return vec![sim_rejected(ctx, id, rc, &why)],
+    };
+    let norm = |p: f64| {
+        if p == 0.0 {
+            0.0
+        } else {
+            sinyal_proto::normalize_price(p, look.entry.tick_size, look.entry.digits)
+        }
+    };
+    let out = s.lock().modify_sltp(ticket, norm(sl), norm(tp), &look.sym, look.bid, look.ask);
+    sim_reply(ctx, s, &look.instance, id, wire, out)
 }
 
 /// Sentetik hesap durumu.
 ///
 /// Alan adları canlıyla birebir aynı; değerlerin **anlamı** farklı ve bu
-/// `hello.mode == "replay"` ile ilan edilmiştir. `mode` daima `demo`: simüle
-/// bir hesabın canlı para kilidinin yanlış tarafına düşmesi kabul edilemez.
+/// `hello.mode` ile ilan edilmiştir. `mode` daima `demo`: simüle bir hesabın
+/// canlı para kilidinin yanlış tarafına düşmesi kabul edilemez.
 ///
-/// Kayıtta birden çok örnek olsa bile **tek** hesap dönülür: simüle bakiye
-/// tek bir cüzdandır, onu örnek başına tekrarlamak aynı parayı iki kez
-/// saydırırdı.
-fn sim_accounts(ctx: &Ctx, r: &Replay) -> Vec<AccountInfo> {
-    let sim = r.sim.lock().unwrap_or_else(|e| e.into_inner());
-    // `+ 0.0`: boş bir f64 toplamı `-0.0` verir ve tel üzerinde `"profit":-0.0`
-    // görünürdü. Sayısal olarak aynı ama "-0.00 kâr" gösteren bir istemci
-    // arayüzü, olmayan bir zararı varmış gibi gösterir.
-    let profit: f64 = sim
-        .positions
-        .iter()
-        .map(|p| sim_profit(p.buy, p.price_open, sim_mark(ctx, p), p.volume, p.contract_size))
-        .sum::<f64>()
-        + 0.0;
-    let equity = sim.balance + profit;
+/// Birden çok örnek olsa bile **tek** hesap dönülür: simüle bakiye tek bir
+/// cüzdandır, onu örnek başına tekrarlamak aynı parayı iki kez saydırırdı.
+fn sim_accounts(ctx: &Ctx, s: &SimExec) -> Vec<AccountInfo> {
+    let a = s.lock().account(&sim_book(ctx));
     vec![AccountInfo {
-        src: r.primary.to_string(),
+        src: s.primary.to_string(),
         login: 0,
-        server: "replay".into(),
-        company: "replay".into(),
-        // Para birimi kayıtta yok; uydurmak yerine boş bırakılıyor.
+        server: s.mode.to_owned(),
+        company: s.mode.to_owned(),
+        // Para birimi bilinmiyor; uydurmak yerine boş bırakılıyor. Kâr
+        // sembolün kotasyon biriminde kalır, hesap birimine ÇEVRİLMEZ.
         currency: String::new(),
-        leverage: 0,
-        balance: sim.balance,
-        credit: 0.0,
-        profit,
-        equity,
-        // Marjin modellenmiyor: 0 "marjin yok" değil "hesaplanmıyor" demek.
-        margin: 0.0,
-        margin_free: equity,
-        margin_level: 0.0,
+        leverage: a.leverage,
+        balance: a.balance,
+        credit: a.credit,
+        profit: a.profit,
+        equity: a.equity,
+        margin: a.margin,
+        margin_free: a.margin_free,
+        margin_level: a.margin_level,
         mode: "demo",
         // Aynı sembolde birden çok pozisyon tutulabiliyor — davranış hedging.
         margin_mode: "hedging",
+        // Teminat tamamlama MODELLENMİYOR; bir eşik uydurmak yerine
+        // "bilinmiyor" diyoruz.
         so_mode: "unknown",
         margin_so_call: 0.0,
         margin_so_so: 0.0,
@@ -1605,32 +1673,29 @@ fn sim_accounts(ctx: &Ctx, r: &Replay) -> Vec<AccountInfo> {
     }]
 }
 
-fn sim_positions(ctx: &Ctx, r: &Replay) -> (Vec<PositionInfo>, u32, bool) {
-    let sim = r.sim.lock().unwrap_or_else(|e| e.into_inner());
-    let items: Vec<PositionInfo> = sim
-        .positions
-        .iter()
-        .map(|p| {
-            let cur = sim_mark(ctx, p);
-            PositionInfo {
-                // Canlıdaki gibi: pozisyonun `src`'si sembolün örneği.
-                src: sim_src(ctx, r, &p.symbol).to_string(),
-                ticket: p.ticket,
-                identifier: p.ticket,
-                client_id: p.client_id,
-                symbol: p.symbol.clone(),
-                side: if p.buy { "buy" } else { "sell" },
-                volume: p.volume,
-                price_open: p.price_open,
-                price_current: cur,
-                sl: p.sl,
-                tp: p.tp,
-                profit: sim_profit(p.buy, p.price_open, cur, p.volume, p.contract_size),
-                // Swap modellenmiyor; 0 burada "hesaplanmıyor" demek.
-                swap: 0.0,
-                time_msc: p.time_msc,
-                comment: p.comment.clone(),
-            }
+fn sim_positions(ctx: &Ctx, s: &SimExec) -> (Vec<PositionInfo>, u32, bool) {
+    let items: Vec<PositionInfo> = s
+        .lock()
+        .positions(&sim_book(ctx))
+        .into_iter()
+        .map(|p| PositionInfo {
+            // Canlıdaki gibi: pozisyonun `src`'si sembolün örneği.
+            src: sim_src(ctx, s, &p.symbol).to_string(),
+            ticket: p.ticket,
+            identifier: p.ticket,
+            client_id: p.client_id,
+            symbol: p.symbol,
+            side: p.side,
+            volume: p.volume,
+            price_open: p.price_open,
+            price_current: p.price_current,
+            sl: p.sl,
+            tp: p.tp,
+            profit: p.profit,
+            // Swap modellenmiyor; 0 burada "hesaplanmıyor" demek.
+            swap: p.swap,
+            time_msc: p.time_msc,
+            comment: p.comment,
         })
         .collect();
     let total = items.len() as u32;
@@ -1638,27 +1703,26 @@ fn sim_positions(ctx: &Ctx, r: &Replay) -> (Vec<PositionInfo>, u32, bool) {
     (items, total, false)
 }
 
-fn sim_orders(ctx: &Ctx, r: &Replay) -> (Vec<OrderInfo>, u32, bool) {
-    let sim = r.sim.lock().unwrap_or_else(|e| e.into_inner());
-    let items: Vec<OrderInfo> = sim
-        .pending
-        .iter()
+fn sim_orders(ctx: &Ctx, s: &SimExec) -> (Vec<OrderInfo>, u32, bool) {
+    let items: Vec<OrderInfo> = s
+        .lock()
+        .orders()
+        .into_iter()
         .map(|o| OrderInfo {
-            src: sim_src(ctx, r, &o.symbol).to_string(),
+            src: sim_src(ctx, s, &o.symbol).to_string(),
             ticket: o.ticket,
             client_id: o.client_id,
-            symbol: o.symbol.clone(),
+            symbol: o.symbol,
             kind: o.kind,
-            volume_initial: o.volume,
-            // Tetiklenme modellenmiyor: kalan hacim daima ilk hacim.
-            volume_current: o.volume,
+            volume_initial: o.volume_initial,
+            volume_current: o.volume_current,
             price: o.price,
             stoplimit: o.stoplimit,
             sl: o.sl,
             tp: o.tp,
             time_setup_msc: o.time_setup_msc,
             expiration: o.expiration,
-            comment: o.comment.clone(),
+            comment: o.comment,
         })
         .collect();
     let total = items.len() as u32;
@@ -1968,8 +2032,16 @@ mod tests {
             orders: Arc::new(OrderTracker::new()),
             candles: Arc::new(Mutex::new(crate::candles::CandleStore::new())),
             hist_slots: Arc::new(tokio::sync::Semaphore::new(HIST_SLOTS)),
+            sim: None,
             replay: None,
         }
+    }
+
+    /// Kaymasız simülasyon: dolum fiyatı beklentileri sade kalsın diye
+    /// **açıkça** kapatılıyor. Kaymanın kendi testi ayrı (bkz.
+    /// `slippage_is_applied_against_the_client_on_the_paper_port`).
+    fn sim_cfg_no_slip(balance: f64) -> crate::sim::SimConfig {
+        crate::sim::SimConfig { balance, leverage: 100, slippage_points: 0.0 }
     }
 
     /// Bağlantının başlangıç seviyesi — `serve_conn` ile aynı kural.
@@ -2036,6 +2108,54 @@ mod tests {
         // Artık geçmeli.
         let out = handle_client_msg(ClientMsg::Positions, &ctx, &mut subs, &mut level).unwrap();
         assert!(!matches!(out.first(), Some(ServerMsg::Error { .. })));
+    }
+
+    #[test]
+    fn replay_playback_starts_on_subscribe_not_on_connect() {
+        // Kapının NEREDE açıldığı, "açılıyor mu"dan daha önemli.
+        //
+        // Bağlantı kurulduğunda açmak yetmiyor: yayın kanalına abone olmak,
+        // istemcinin hangi KANALLARI istediğini bilmek demek değil. Kapı
+        // bağlantıda açılsaydı `--replay-speed 0`da kayıt, `subscribe` mesajı
+        // gelmeden akıp biter ve pompa her tick'i "abone değil" diye elerdi.
+        // Gerçek ikili ile ölçüldü: bağlantıda açınca 1689 tick'in 0'ı,
+        // abonelikte açınca 1689'unun 1689'u ulaştı.
+        let (ctx, _rx, _done) = replay_ctx(10_000.0);
+        let gate = ctx.replay.as_ref().unwrap().start.clone();
+        let mut level = start_level(&ctx);
+        let mut subs = Subs::default();
+
+        // Bağlantı kurulmuş ve hello gönderilmiş olsa bile kapı KAPALI.
+        assert!(!gate.is_open(), "kapi baglantida acilmamali");
+        handle_client_msg(ClientMsg::Ping, &ctx, &mut subs, &mut level).unwrap();
+        assert!(!gate.is_open(), "ping oynatimi baslatmamali");
+
+        handle_client_msg(
+            ClientMsg::Subscribe { channels: vec!["tick.*".into()] },
+            &ctx,
+            &mut subs,
+            &mut level,
+        )
+        .unwrap();
+        assert!(subs.tick_all, "abonelik kurulmali");
+        assert!(gate.is_open(), "abonelikten SONRA oynatim baslamali");
+    }
+
+    #[test]
+    fn a_live_server_has_no_gate_to_open() {
+        // Canlıda replay bağlamı yok; abonelik yolu buna rağmen çalışmalı.
+        let ctx = ctx_with(None);
+        let mut level = start_level(&ctx);
+        let mut subs = Subs::default();
+        assert!(ctx.replay.is_none());
+        handle_client_msg(
+            ClientMsg::Subscribe { channels: vec!["tick.*".into()] },
+            &ctx,
+            &mut subs,
+            &mut level,
+        )
+        .unwrap();
+        assert!(subs.tick_all);
     }
 
     #[test]
@@ -2334,22 +2454,51 @@ mod tests {
     /// gerçek kurulumdan sapardık.
     fn replay_ctx(balance: f64) -> ReplayFixture {
         let mut ctx = ctx_with(None);
+        // Komut kanalı BİLEREK bağlı ve dinleniyor: "hiçbir komut gitmedi"
+        // iddiası ancak gidebileceği bir yer varken anlamlıdır.
         let (c_tx, c_rx) = std::sync::mpsc::channel::<Cmd>();
         ctx.cmd_tx.insert("mt5-1".into(), c_tx);
         let (done_tx, done_rx) = tokio::sync::watch::channel(None);
+        ctx.sim = Some(Arc::new(SimExec::new(
+            MODE_REPLAY,
+            &["mt5-1".to_string()],
+            sim_cfg_no_slip(balance),
+        )));
         ctx.replay = Some(Arc::new(Replay::new(
             &["mt5-1".to_string()],
             Some(1_700_000_000_000),
             Some(1_700_000_600_000),
-            balance,
             done_rx,
             Arc::new(crate::replay::StartGate::new()),
         )));
         (ctx, c_rx, done_tx)
     }
 
-    /// EURUSD'yi kayıttan gelmiş gibi tanıt ve bir fiyat yaz.
+    /// PAPER bağlamı — canlı veri, simüle yürütme.
+    ///
+    /// `replay` alanı BOŞ: paper bir kaydın parçası değil. Komut kanalı yine
+    /// bağlı bırakılıyor ki "paylaşılan belleğe hiçbir komut gitmedi" iddiası
+    /// gerçekten sınanabilsin — gerçek daemon'da bu harita boştur ve bu
+    /// fixture kasten ONDAN DAHA TEHLİKELİ bir kurulum kuruyor.
+    fn paper_ctx(balance: f64) -> (Ctx, std::sync::mpsc::Receiver<Cmd>) {
+        paper_ctx_cfg(sim_cfg_no_slip(balance))
+    }
+
+    fn paper_ctx_cfg(cfg: crate::sim::SimConfig) -> (Ctx, std::sync::mpsc::Receiver<Cmd>) {
+        let mut ctx = ctx_with(None);
+        let (c_tx, c_rx) = std::sync::mpsc::channel::<Cmd>();
+        ctx.cmd_tx.insert("mt5-1".into(), c_tx);
+        ctx.sim =
+            Some(Arc::new(SimExec::new(MODE_PAPER, &["mt5-1".to_string()], cfg)));
+        (ctx, c_rx)
+    }
+
+    /// EURUSD'yi tanıt ve bir fiyat yaz (kayıttan ya da canlıdan gelmiş gibi).
     fn seed_symbol(ctx: &Ctx, bid: f64, ask: f64) {
+        seed_symbol_stops(ctx, bid, ask, 0);
+    }
+
+    fn seed_symbol_stops(ctx: &Ctx, bid: f64, ask: f64, stops_level: u32) {
         let mut e = sinyal_proto::SymbolEntry {
             symbol_id: 1,
             digits: 5,
@@ -2359,6 +2508,7 @@ mod tests {
             volume_max: 100.0,
             volume_step: 0.01,
             contract_size: 100_000.0,
+            stops_level,
             flags: sinyal_proto::sym_flag::READY,
             ..Default::default()
         };
@@ -2748,6 +2898,412 @@ mod tests {
             }
             other => panic!("beklenmeyen: {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // PAPER kipi — canlı veri, simüle yürütme
+    // -----------------------------------------------------------------------
+
+    /// Yayından çıkan emir olaylarını tel biçiminde topla.
+    fn drain_orders(ctx: &Ctx, rx: &mut broadcast::Receiver<FeedEvent>) -> Vec<OrderEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            match to_wire(&ev, ctx) {
+                Some(ServerMsg::Order(e)) => out.push(e),
+                _ => continue,
+            }
+        }
+        out
+    }
+
+    fn pending_order(id: &str, kind: &str, price: f64, sl: f64, tp: f64) -> ClientMsg {
+        ClientMsg::Order(OrderReq {
+            id: id.into(),
+            action: "pending".into(),
+            symbol: "EURUSD".into(),
+            side: String::new(),
+            order_type: kind.into(),
+            volume: 0.10,
+            price,
+            stoplimit: 0.0,
+            sl,
+            tp,
+            deviation: 0,
+            time: String::new(),
+            expiration: 0,
+            filling: String::new(),
+            comment: String::new(),
+        })
+    }
+
+    #[test]
+    fn hello_mode_is_correct_in_all_three_modes() {
+        // Kipi yanlış ilan etmek, bu projede yapılabilecek en pahalı yalan:
+        // istemci paper'ı canlı sanarsa risk yönetimini gerçek para
+        // varmış gibi kurar, canlıyı paper sanarsa hiç kurmaz.
+        let live = ctx_with(None);
+        match hello_msg(&live, Level::Trader) {
+            ServerMsg::Hello { mode, sim, replay_from_ms, .. } => {
+                assert_eq!(mode, "live");
+                assert!(sim.is_none(), "canlida simulasyon kunyesi OLMAMALI");
+                assert!(replay_from_ms.is_none());
+            }
+            other => panic!("beklenmeyen: {other:?}"),
+        }
+
+        let (paper, _cmd) = paper_ctx(10_000.0);
+        match hello_msg(&paper, Level::Trader) {
+            ServerMsg::Hello { mode, trading, sim, replay_from_ms, replay_to_ms, .. } => {
+                assert_eq!(mode, "paper", "paper kipi ILAN EDILMELI");
+                assert!(trading, "simule kipte emir yolu acik");
+                let note = sim.expect("paper'da simulasyon kunyesi gonderilmeli");
+                assert!(!note.not_modeled.is_empty(), "MODELLENMEYENLER ilan edilmeli");
+                assert!(
+                    note.not_modeled.iter().any(|s| s.contains("komisyon")),
+                    "komisyon modellenmiyor, soylenmeli: {:?}",
+                    note.not_modeled
+                );
+                assert!(note.not_modeled.iter().any(|s| s.contains("swap")));
+                assert!(note.not_modeled.iter().any(|s| s.contains("requote")));
+                // Paper CANLIDIR: bir kaydın kapsamı yoktur.
+                assert!(
+                    replay_from_ms.is_none() && replay_to_ms.is_none(),
+                    "paper bir kayit degil, kapsam ilan etmemeli"
+                );
+            }
+            other => panic!("beklenmeyen: {other:?}"),
+        }
+
+        let (rep, _rx, _done) = replay_ctx(10_000.0);
+        match hello_msg(&rep, Level::Trader) {
+            ServerMsg::Hello { mode, sim, replay_from_ms, .. } => {
+                assert_eq!(mode, "replay");
+                assert!(sim.is_some(), "replay'de de kunye gonderilmeli");
+                assert!(replay_from_ms.is_some(), "replay kapsam ilan eder");
+            }
+            other => panic!("beklenmeyen: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_paper_order_is_simulated_and_marked_sim() {
+        let (ctx, _cmd) = paper_ctx(10_000.0);
+        seed_symbol(&ctx, 1.10000, 1.10002);
+        let mut events = ctx.events.subscribe();
+
+        let out = ask(&ctx, market_order("p1", "buy", 0.10));
+        match &out[0] {
+            ServerMsg::Order(e) => {
+                assert_eq!(e.kind, "queued", "canlidaki ilk cevapla ayni olmali: {e:?}");
+                assert!(e.sim, "paper dolumu simule oldugunu SOYLEMELI");
+                assert_eq!(e.src, "mt5-1");
+            }
+            other => panic!("beklenmeyen: {other:?}"),
+        }
+
+        let evs = drain_orders(&ctx, &mut events);
+        assert_eq!(evs.len(), 2, "ack ve txn bekleniyordu: {evs:?}");
+        assert!(evs.iter().all(|e| e.sim), "her paper olayi sim tasimali: {evs:?}");
+        assert!(evs.iter().all(|e| e.id == "p1"), "istemci kimligi geri eslenmeli: {evs:?}");
+        assert_eq!((evs[0].kind, evs[0].retcode), ("ack", Some(10008)));
+        assert_eq!((evs[1].kind, evs[1].retcode), ("txn", Some(10009)));
+        // Alış ASK'ten dolar (fixture kaymasız).
+        assert_eq!(evs[1].price, Some(1.10002));
+
+        match &ask(&ctx, ClientMsg::Positions)[0] {
+            ServerMsg::Positions { items, total, .. } => {
+                assert_eq!(*total, 1);
+                assert_eq!(items[0].side, "buy");
+                assert!((items[0].price_open - 1.10002).abs() < 1e-12);
+            }
+            other => panic!("beklenmeyen: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_paper_port_never_writes_a_single_command_to_shared_memory() {
+        // GÜVENLİK SINIRI — bu testin varlık sebebi tek cümle: yanlışlıkla
+        // gerçek emir gitmesi kabul edilemez.
+        //
+        // Fixture, gerçek daemon'dan KASTEN daha tehlikeli: orada paper
+        // bağlamının `cmd_tx` haritası boştur, burada kanal bağlı ve
+        // dinleniyor. Yani "komut gitmedi" iddiası, gidebileceği bir yer
+        // varken sınanıyor.
+        let (ctx, cmd_rx) = paper_ctx(10_000.0);
+        seed_symbol(&ctx, 1.10000, 1.10002);
+
+        ask(&ctx, market_order("o1", "buy", 0.10));
+        let ticket = match &ask(&ctx, ClientMsg::Positions)[0] {
+            ServerMsg::Positions { items, .. } => items[0].ticket,
+            other => panic!("beklenmeyen: {other:?}"),
+        };
+        ask(&ctx, ClientMsg::ModifySltp { id: "m1".into(), ticket, sl: 1.09, tp: 1.11 });
+        ask(&ctx, ClientMsg::Close { id: "c1".into(), ticket, volume: 0.0 });
+        ask(&ctx, ClientMsg::Cancel { id: "x1".into(), ticket: 4242 });
+        ask(&ctx, pending_order("p1", "buy_limit", 1.09000, 0.0, 0.0));
+        // Tick akışı da komut doğurmamalı: tetiklenen bir emir simüle kalır.
+        seed_symbol(&ctx, 1.08990, 1.08992);
+        pump_tick(
+            ctx.sim().unwrap(),
+            &ctx.events,
+            "mt5-1",
+            "EURUSD",
+            1.08990,
+            1.08992,
+            1_700_000_001_000,
+        );
+
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "paper portundan paylasilan bellege HICBIR komut gitmemeli"
+        );
+
+        // Son savunma hattı: `dispatch` doğrudan çağrılsa bile göndermez.
+        match dispatch(&ctx, "mt5-1", Cmd::default(), "zorla") {
+            ServerMsg::Order(e) => {
+                assert_eq!(e.kind, "rejected");
+                assert!(e.comment.contains("paper"), "hangi kip oldugu soylenmeli: {e:?}");
+            }
+            other => panic!("beklenmeyen: {other:?}"),
+        }
+        assert!(cmd_rx.try_recv().is_err(), "dispatch bile komut yazmamali");
+    }
+
+    #[test]
+    fn a_real_order_never_carries_the_sim_field_while_a_paper_one_always_does() {
+        // "Yok" ile "false" arasındaki fark kasıtlı: istemci alanın VARLIĞINA
+        // bakarak da karar verebilmeli. Bu yüzden iki kip aynı testte
+        // karşılaştırılıyor — biri değişip diğeri değişmezse yakalanır.
+        let order_ev = || FeedEvent::Order {
+            instance: Arc::from("mt5-1"),
+            client_id: 0,
+            kind: "txn",
+            retcode: 10009,
+            order: 5,
+            deal: 6,
+            position: 7,
+            volume: 0.1,
+            price: 1.2345,
+            comment: String::new(),
+        };
+
+        let live = ctx_with(None);
+        let j = serde_json::to_string(&to_wire(&order_ev(), &live).unwrap()).unwrap();
+        assert!(!j.contains("sim"), "GERCEK emir olayinda sim alani HIC olmamali: {j}");
+        // Canlı ret de temiz kalmalı.
+        let j = serde_json::to_string(&rejected(&live, "o1", "test")).unwrap();
+        assert!(!j.contains("sim"), "{j}");
+
+        let (paper, _cmd) = paper_ctx(10_000.0);
+        let j = serde_json::to_string(&to_wire(&order_ev(), &paper).unwrap()).unwrap();
+        assert!(j.contains(r#""sim":true"#), "paper olayi simule oldugunu soylemeli: {j}");
+    }
+
+    #[test]
+    fn a_pending_order_is_triggered_by_the_tick_stream() {
+        // EN BÜYÜK EKSİK BUYDU: eski simülatörde bekleyen emir fiyat
+        // seviyesinden geçse bile sonsuza kadar bekliyordu. Uçtan uca test:
+        // istemci emri koyar, akıştan tick gelir, emir POZİSYONA döner.
+        let (ctx, cmd_rx) = paper_ctx(10_000.0);
+        seed_symbol(&ctx, 1.10000, 1.10002);
+        let mut events = ctx.events.subscribe();
+
+        // ASK 1.10002 iken 1.09500'e buy_limit: henüz tetiklenmemeli.
+        let out = ask(&ctx, pending_order("p1", "buy_limit", 1.09500, 1.09000, 1.10000));
+        assert!(matches!(&out[0], ServerMsg::Order(e) if e.kind == "queued"), "{out:?}");
+        drain_orders(&ctx, &mut events);
+
+        match &ask(&ctx, ClientMsg::Positions)[0] {
+            ServerMsg::Positions { items, .. } => {
+                assert!(items.is_empty(), "seviyeye gelmeden pozisyon acilmamali");
+            }
+            other => panic!("beklenmeyen: {other:?}"),
+        }
+
+        // Fiyat seviyenin ALTINA iner: BUY_LIMIT ask <= price ile tetiklenir.
+        let (bid, ask_p) = (1.09490, 1.09492);
+        ctx.registry.update_last(
+            "mt5-1",
+            1,
+            crate::state::LastTick { bid, ask: ask_p, last: 0.0, time_msc: 1_700_000_002_000 },
+        );
+        pump_tick(
+            ctx.sim().unwrap(),
+            &ctx.events,
+            "mt5-1",
+            "EURUSD",
+            bid,
+            ask_p,
+            1_700_000_002_000,
+        );
+
+        let evs = drain_orders(&ctx, &mut events);
+        assert_eq!(evs.len(), 1, "tetiklenen emir TAM BIR dolum olayi uretmeli: {evs:?}");
+        let fill = &evs[0];
+        assert_eq!(fill.kind, "txn");
+        assert_eq!(fill.retcode, Some(10009));
+        assert!(fill.sim, "tetiklenen dolum da simule: {fill:?}");
+        assert_eq!(fill.comment, "pending_triggered", "sebep soylenmeli: {fill:?}");
+        assert_eq!(fill.id, "p1", "dolum, emri KOYAN istege baglanmali: {fill:?}");
+        // Limit emri fiyatından KÖTÜ dolamaz: kayma limit'e uygulanmaz.
+        assert_eq!(fill.price, Some(1.09500));
+
+        // Emir defterinden düştü, pozisyon açıldı.
+        match &ask(&ctx, ClientMsg::Orders)[0] {
+            ServerMsg::Orders { items, .. } => {
+                assert!(items.is_empty(), "tetiklenen emir bekleyenlerde kalmamali");
+            }
+            other => panic!("beklenmeyen: {other:?}"),
+        }
+        let pos_ticket = match &ask(&ctx, ClientMsg::Positions)[0] {
+            ServerMsg::Positions { items, total, .. } => {
+                assert_eq!(*total, 1, "tetiklenen emir POZISYONA donmeli");
+                assert_eq!(items[0].side, "buy");
+                assert!((items[0].sl - 1.09000).abs() < 1e-12, "SL tasinmali: {:?}", items[0]);
+                items[0].ticket
+            }
+            other => panic!("beklenmeyen: {other:?}"),
+        };
+
+        // --- ve SL de akıştan tetiklenir ---
+        let (bid, ask_p) = (1.08900, 1.08902);
+        ctx.registry.update_last(
+            "mt5-1",
+            1,
+            crate::state::LastTick { bid, ask: ask_p, last: 0.0, time_msc: 1_700_000_003_000 },
+        );
+        pump_tick(
+            ctx.sim().unwrap(),
+            &ctx.events,
+            "mt5-1",
+            "EURUSD",
+            bid,
+            ask_p,
+            1_700_000_003_000,
+        );
+        let evs = drain_orders(&ctx, &mut events);
+        assert_eq!(evs.len(), 1, "SL tek kapanis olayi uretmeli: {evs:?}");
+        assert_eq!(evs[0].comment, "sl", "kapanis sebebi SL olmali: {:?}", evs[0]);
+        assert_eq!(evs[0].position, Some(pos_ticket));
+        // LONG BID'den kapanır (fixture kaymasız).
+        assert_eq!(evs[0].price, Some(1.08900));
+
+        match &ask(&ctx, ClientMsg::Positions)[0] {
+            ServerMsg::Positions { items, .. } => {
+                assert!(items.is_empty(), "SL pozisyonu kapatmali");
+            }
+            other => panic!("beklenmeyen: {other:?}"),
+        }
+        // Zarar sentetik bakiyeye yansımalı: (1.08900 − 1.09500) × 0.1 × 100000 = −60
+        match &ask(&ctx, ClientMsg::Account)[0] {
+            ServerMsg::Account { items } => {
+                assert!(
+                    (items[0].balance - 9_940.0).abs() < 1e-6,
+                    "SL zarari bakiyeye islemeli: {}",
+                    items[0].balance
+                );
+            }
+            other => panic!("beklenmeyen: {other:?}"),
+        }
+
+        // Tüm bu tetiklenmeler boyunca paylaşılan belleğe hiçbir şey gitmedi.
+        assert!(cmd_rx.try_recv().is_err(), "tetiklenme de komut dogurmamali");
+    }
+
+    #[test]
+    fn slippage_is_applied_against_the_client_on_the_paper_port() {
+        // Kayma DAİMA aleyhte: alışta yukarı, satışta aşağı. Lehte kayan bir
+        // simülasyon, stratejiyi canlıda karşılığı olmayan bir kârla besler.
+        let (ctx, _cmd) = paper_ctx_cfg(crate::sim::SimConfig {
+            balance: 10_000.0,
+            leverage: 100,
+            slippage_points: 2.0, // point = 0.00001 → 0.00002
+        });
+        seed_symbol(&ctx, 1.10000, 1.10002);
+        let mut events = ctx.events.subscribe();
+
+        ask(&ctx, market_order("b1", "buy", 0.10));
+        let evs = drain_orders(&ctx, &mut events);
+        assert_eq!(evs.last().unwrap().price, Some(1.10004), "alis ASK+kayma: {evs:?}");
+
+        ask(&ctx, market_order("s1", "sell", 0.10));
+        let evs = drain_orders(&ctx, &mut events);
+        assert_eq!(evs.last().unwrap().price, Some(1.09998), "satis BID−kayma: {evs:?}");
+    }
+
+    #[test]
+    fn broker_side_rejections_carry_the_real_mt5_retcode() {
+        // Simülatörün kendine ait hata kodu YOKTUR: istemci aynı hatayı iki
+        // kipte de aynı sayıyla görmeli, yoksa simülasyonda yazılan hata
+        // işleme kodu canlıda çalışmaz.
+        let (ctx, _cmd) = paper_ctx(10_000.0);
+        // stops_level = 100 point (0.001): SL fiyata bu kadar yakın olamaz.
+        seed_symbol_stops(&ctx, 1.10000, 1.10002, 100);
+
+        let mut req = match market_order("o1", "buy", 0.10) {
+            ClientMsg::Order(r) => r,
+            _ => unreachable!(),
+        };
+        req.sl = 1.09999; // BID'e 1 point uzaklıkta — ihlal.
+        match &ask(&ctx, ClientMsg::Order(req))[0] {
+            ServerMsg::Order(e) => {
+                assert_eq!(e.kind, "rejected");
+                assert_eq!(e.retcode, Some(10016), "MT5'in gercek kodu: {e:?}");
+                assert!(e.sim, "ret de simule yolun cevabi: {e:?}");
+            }
+            other => panic!("beklenmeyen: {other:?}"),
+        }
+
+        // Marjin: 10 lot × 100000 × ~1.1 / 100 = ~11000 > 10000 bakiye.
+        match &ask(&ctx, market_order("o2", "buy", 10.0))[0] {
+            ServerMsg::Order(e) => {
+                assert_eq!(e.kind, "rejected");
+                assert_eq!(e.retcode, Some(10019), "yetersiz marjin 10019 olmali: {e:?}");
+            }
+            other => panic!("beklenmeyen: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn paper_snaps_volume_exactly_like_the_live_path_instead_of_rejecting_it() {
+        // AYRIŞMA TESTİ. Canlı yol (`normalize_volume`) ızgaraya OTURTUR,
+        // reddetmez; motorun kendi denetimi ise ızgara dışını 10014 ile
+        // reddeder. Bağlama katmanı bilerek canlı yolu kullanıyor: aksi
+        // halde canlıda 0.01'e yuvarlanıp DOLAN bir emir, testte
+        // REDDEDİLİRDİ — "test ile canlı arasında fark olmamalı" kuralının
+        // tam ihlali.
+        let (ctx, _cmd) = paper_ctx(10_000.0);
+        seed_symbol(&ctx, 1.10000, 1.10002); // volume_step = 0.01
+
+        let out = ask(&ctx, market_order("v1", "buy", 0.015));
+        assert!(
+            matches!(&out[0], ServerMsg::Order(e) if e.kind == "queued"),
+            "izgara disi hacim canlidaki gibi OTURTULMALI, reddedilmemeli: {out:?}"
+        );
+        match &ask(&ctx, ClientMsg::Positions)[0] {
+            ServerMsg::Positions { items, .. } => {
+                assert!(
+                    (items[0].volume - 0.02).abs() < 1e-9,
+                    "canli yolun yuvarlamasiyla ayni olmali: {:?}",
+                    items[0].volume
+                );
+            }
+            other => panic!("beklenmeyen: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn paper_and_live_keep_separate_order_books() {
+        // İki portun emir defteri ORTAK olsaydı, paper istemcisinin aldığı
+        // bir kimlik canlı istemcinin aynı kimlikli emrini "duplicate" diye
+        // reddederdi — bir test koşusu gerçek işlemi engellerdi.
+        let (paper, _cmd) = paper_ctx(10_000.0);
+        let live = ctx_with(None);
+        assert!(paper.orders.register("ayni-id").is_ok());
+        assert!(
+            live.orders.register("ayni-id").is_ok(),
+            "paper defteri canli defteri kirletmemeli"
+        );
     }
 
     #[test]

@@ -44,11 +44,6 @@
 //! Her pozisyon marjinini açılışta kilitler ve kapanışta (kısmi kapanışta
 //! oranında) serbest bırakır.
 
-// Motor şu an yalnızca kendi testleri tarafından kullanılıyor; replay ve paper
-// kipine bağlanması ayrı bir iş. Bağlandığında bu satır KALDIRILMALI — aksi
-// halde gerçekten ölü kalan kod da sessizce görünmez olur.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
@@ -136,6 +131,14 @@ impl Default for SimConfig {
 pub struct SimSymbol {
     pub digits: u32,
     pub point: f64,
+    /// `SYMBOL_TRADE_TICK_SIZE` — kotasyonun en küçük adımı.
+    ///
+    /// `point` ile AYNI DEĞİLDİR: bazı endeks ve CFD'lerde tick_size point'in
+    /// katıdır (ör. point 0.01, tick_size 0.05). Canlı yol fiyatları bu
+    /// ızgaraya oturtuyor (`normalize_price`); simülatör oturtmazsa broker'ın
+    /// hiç veremeyeceği bir fiyattan dolum raporlar ve iki kip ayrışır.
+    /// 0 = broker vermemiş, yalnızca `digits`e yuvarlanır.
+    pub tick_size: f64,
     pub volume_step: f64,
     pub volume_min: f64,
     pub volume_max: f64,
@@ -143,9 +146,13 @@ pub struct SimSymbol {
     pub stops_level: u32,
     /// `SYMBOL_TRADE_CONTRACT_SIZE`.
     ///
-    /// **0 ise kayıt bu alanı taşımıyordur**; motor 1 kabul eder ve kâr
-    /// "fiyat farkı × hacim" birimindedir — PARA DEĞİL. Sembol adına bakıp
-    /// 100000 varsaymak sessizce yanlış bir para değeri üretirdi.
+    /// **0 ise emir REDDEDİLİR** (bkz. [`check_contract`]). Bu alan hem
+    /// marjinin hem kârın çarpanıdır; yokken 1 varsaymak forex'te 100 000 kat
+    /// küçük bir kâr ve pratikte sonsuz kaldıraç üretirdi — yani marjin
+    /// denetimi (10019) sessizce ölür, kâr eğrisi anlamsızlaşır ve strateji
+    /// simülasyonda kârlı görünürdü. Sembol adına bakıp 100000 varsaymak da
+    /// aynı yalanın başka bir biçimidir. Eksik veriyle simüle etmektense
+    /// gürültüyle durmak doğrudur.
     pub contract_size: f64,
 }
 
@@ -155,6 +162,7 @@ impl SimSymbol {
         Self {
             digits: e.digits,
             point: e.point,
+            tick_size: e.tick_size,
             volume_step: e.volume_step,
             volume_min: e.volume_min,
             volume_max: e.volume_max,
@@ -163,7 +171,12 @@ impl SimSymbol {
         }
     }
 
-    /// Kâr/marjin hesabında kullanılan sözleşme büyüklüğü (bkz. alan notu).
+    /// Kâr/marjin hesabında kullanılan sözleşme büyüklüğü.
+    ///
+    /// Buraya 0 ULAŞAMAZ: [`check_contract`] emri `place` içinde reddeder ve
+    /// pozisyon/emir kaydı ancak o denetimden geçmiş bir sembolle doğar.
+    /// Yine de savunmacı olarak 1 dönüyoruz — burada `unwrap` etmek, veri
+    /// eksikliğini daemon çökmesine çevirirdi.
     fn cs(&self) -> f64 {
         if self.contract_size > 0.0 {
             self.contract_size
@@ -367,9 +380,12 @@ pub struct SimEvent {
     pub kind: SimEventKind,
     /// 0 = retcode yok (`queued`); çağıran bunu `None`a çevirir.
     pub retcode: u32,
-    /// İsteğin kimliği. `place` ve ondan doğan tetiklenmelerde doludur;
-    /// `close`/`cancel`/`modify_sltp` imzaları kimlik almadığı için orada
-    /// boştur — çağıran kendi istek kimliğini bilir ve doldurur.
+    /// Olayı DOĞURAN isteğin kimliği — yani pozisyonu/emri açan `place`
+    /// isteğinin `id`si. Tetiklenen dolumda, SL/TP kapanışında ve
+    /// `close`/`cancel`/`modify_sltp` sonucunda da bu taşınır, çünkü o üç
+    /// imza kendi istek kimliğini almıyor. Çağıran tel üzerinde kendi istek
+    /// kimliğini göstermek istiyorsa üzerine yazar; motorun bildiği tek
+    /// bağlantı budur ve boş bırakmak bilgiyi yok etmek olurdu.
     pub id: String,
     pub client_id: u64,
     pub symbol: String,
@@ -410,6 +426,11 @@ pub enum SimOutcome {
     Rejected(SimReject),
 }
 
+// Bu sorgulayıcılar motorun SINAMA yüzeyidir: bağlama katmanı (`server.rs`)
+// sonucu doğrudan desen eşlemesiyle çözüyor ve olayların SAHİPLİĞİNİ alıyor,
+// bu yüzden ödünç veren bu yolları kullanmıyor. Yine de silmiyoruz — motorun
+// sözleşmesini test eden kod tam olarak buradan okuyor.
+#[allow(dead_code)]
 impl SimOutcome {
     fn reject(retcode: u32, reason: impl Into<String>) -> Self {
         Self::Rejected(SimReject { retcode, reason: reason.into() })
@@ -482,14 +503,6 @@ impl PriceBook {
 
     pub fn get(&self, symbol: &str) -> Option<SimQuote> {
         self.map.get(symbol).copied()
-    }
-
-    pub fn len(&self) -> usize {
-        self.map.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
     }
 }
 
@@ -623,10 +636,12 @@ impl SimEngine {
         }
     }
 
-    pub fn config(&self) -> SimConfig {
-        self.cfg
-    }
-
+    /// Ham bakiye — gerçekleşmiş kâr/zarar dâhil, açık pozisyonlar HARİÇ.
+    ///
+    /// Bağlama katmanı bunu değil [`account`](Self::account) kullanıyor
+    /// (özkaynak ve marjin de gerekiyor); burası motorun kendi testlerinin
+    /// okuma noktası.
+    #[allow(dead_code)]
     pub fn balance(&self) -> f64 {
         self.balance
     }
@@ -652,12 +667,19 @@ impl SimEngine {
         }
         self.prices.set(&req.symbol, bid, ask, req.time_msc);
 
+        // Sembol tablosu eksikse SİMÜLE ETME. Bu denetim hacimden ÖNCE:
+        // eksik veriyle üretilen bir dolum, reddedilen bir emirden çok daha
+        // pahalıdır (bkz. [`check_contract`]).
+        if let Err(r) = check_contract(sym) {
+            return SimOutcome::Rejected(r);
+        }
+
         let volume = match check_volume(req.volume, sym) {
             Ok(v) => v,
             Err(r) => return SimOutcome::Rejected(r),
         };
-        let sl = round_px(req.sl, sym.digits);
-        let tp = round_px(req.tp, sym.digits);
+        let sl = round_px(req.sl, sym);
+        let tp = round_px(req.tp, sym);
         let buy = req.kind.is_buy();
 
         if req.kind.is_market() {
@@ -706,7 +728,7 @@ impl SimEngine {
         }
 
         // --- bekleyen emir ---
-        let price = round_px(req.price, sym.digits);
+        let price = round_px(req.price, sym);
         if !(price > 0.0) {
             return SimOutcome::reject(retcode::INVALID_PRICE, "bekleyen emir fiyat ister");
         }
@@ -724,7 +746,7 @@ impl SimEngine {
             return SimOutcome::Rejected(stops_reject(sym, "bekleyen emir fiyati"));
         }
 
-        let stoplimit = round_px(req.stoplimit, sym.digits);
+        let stoplimit = round_px(req.stoplimit, sym);
         if matches!(req.kind, SimOrderKind::BuyStopLimit | SimOrderKind::SellStopLimit) {
             if !(stoplimit > 0.0) {
                 return SimOutcome::reject(
@@ -972,9 +994,19 @@ impl SimEngine {
                 "kayitta bu an icin fiyat yok — simule kapanis yapilamaz",
             );
         }
-        let (buy, sym, symbol) =
-            (self.positions[ix].buy, self.positions[ix].sym, self.positions[ix].symbol.clone());
-        self.prices.set(&symbol, bid, ask, self.positions[ix].time_msc);
+        // Pozisyonun kimlik bilgileri DEĞİŞİKLİKTEN ÖNCE alınır: tam kapanışta
+        // `remove(ix)` sonrası o indekste BAŞKA bir pozisyon durur ve olayı
+        // yanlış istemciye damgalamak, `client_id`nin var oluş sebebini
+        // (kimin emri olduğunu bilmek) çöpe atardı.
+        let (buy, sym, symbol, client_id, origin_id) = {
+            let p = &self.positions[ix];
+            (p.buy, p.sym, p.symbol.clone(), p.client_id, p.id.clone())
+        };
+        // Fiyat defterine yeni kotasyon yazılır ama ZAMAN DAMGASI KORUNUR:
+        // `close` imzası saat almıyor, pozisyonun açılış saatini "şimdi" diye
+        // yazmak kaydın zamanıyla çelişen bir damga üretirdi.
+        let ts = self.prices.get(&symbol).map(|q| q.time_msc).unwrap_or(0);
+        self.prices.set(&symbol, bid, ask, ts);
 
         let exit = self.market_exit(buy, &sym, bid, ask);
         let pos_vol = self.positions[ix].volume;
@@ -992,10 +1024,10 @@ impl SimEngine {
             p.volume -= vol;
         }
 
-        let client_id = self.positions.get(ix).map(|p| p.client_id).unwrap_or(0);
         let order = self.ticket();
         let deal = self.ticket();
         let mut txn = SimEvent::new(SimEventKind::Txn, retcode::DONE);
+        txn.id = origin_id;
         txn.client_id = client_id;
         txn.symbol = symbol;
         txn.order = order;
@@ -1045,8 +1077,8 @@ impl SimEngine {
                 "kayitta bu an icin fiyat yok — simule degisiklik yapilamaz",
             );
         }
-        let nsl = round_px(sl, sym.digits);
-        let ntp = round_px(tp, sym.digits);
+        let nsl = round_px(sl, sym);
+        let ntp = round_px(tp, sym);
 
         if let Some(ix) = self.positions.iter().position(|p| p.ticket == ticket) {
             let buy = self.positions[ix].buy;
@@ -1162,8 +1194,32 @@ impl SimEngine {
     }
 
     /// Motorun kendi fiyat defteri (çağıranın defteri yoksa bunu verebilir).
+    ///
+    /// Bağlama katmanı bunun yerine `Registry`den defter kuruyor: pompa bir
+    /// tick'i kaçırsa bile değerleme akışın SON halini göstermeli.
+    #[allow(dead_code)]
     pub fn prices(&self) -> &PriceBook {
         &self.prices
+    }
+
+    /// Biletin sembolü — pozisyonlarda ve bekleyen emirlerde arar.
+    ///
+    /// [`close`](Self::close) ve [`modify_sltp`](Self::modify_sltp) fiyat
+    /// parametresi alıyor ama bileti sembole ÇEVİRMİYOR; çağıranın o fiyatı
+    /// nereden okuyacağını bilmesi için bu eşlemeye ihtiyacı var. Tüm listeyi
+    /// dışarıya döküp (`positions()`) içinden aramak, her emir isteğinde
+    /// bütün pozisyonları klonlamak demekti.
+    pub fn symbol_of(&self, ticket: u64) -> Option<&str> {
+        self.positions
+            .iter()
+            .find(|p| p.ticket == ticket)
+            .map(|p| p.symbol.as_str())
+            .or_else(|| {
+                self.pending
+                    .iter()
+                    .find(|o| o.ticket == ticket)
+                    .map(|o| o.symbol.as_str())
+            })
     }
 
     // --- iç yardımcılar ----------------------------------------------------
@@ -1194,14 +1250,14 @@ impl SimEngine {
         }
         let slip = sym.slip(self.cfg.slippage_points);
         let raw = if kind.is_buy() { ask + slip } else { bid - slip };
-        round_px(raw, sym.digits)
+        round_px(raw, sym)
     }
 
     /// Kapanış dolum fiyatı: LONG BID'den, SHORT ASK'ten — aleyhte kaymayla.
     fn market_exit(&self, buy: bool, sym: &SimSymbol, bid: f64, ask: f64) -> f64 {
         let slip = sym.slip(self.cfg.slippage_points);
         let raw = if buy { bid - slip } else { ask + slip };
-        round_px(raw, sym.digits)
+        round_px(raw, sym)
     }
 
     /// Serbest marjin denetimi. `leverage <= 0` ise marjin modellenmiyordur.
@@ -1252,12 +1308,15 @@ impl SimEngine {
 // Saf yardımcılar
 // ---------------------------------------------------------------------------
 
-/// Kimliksiz istekler (`close`/`cancel`/`modify_sltp`) için olay dizisi.
+/// `close`/`cancel`/`modify_sltp` için olay dizisi — sıra `place` ile aynı:
+/// `queued` → `ack`(10008) → `txn`(10009).
 fn seq(txn: SimEvent) -> Vec<SimEvent> {
     let mut queued = SimEvent::new(SimEventKind::Queued, 0);
+    queued.id = txn.id.clone();
     queued.client_id = txn.client_id;
     queued.symbol = txn.symbol.clone();
     let mut ack = SimEvent::new(SimEventKind::Ack, retcode::PLACED);
+    ack.id = txn.id.clone();
     ack.client_id = txn.client_id;
     ack.symbol = txn.symbol.clone();
     ack.order = txn.order;
@@ -1268,14 +1327,17 @@ fn quotes_ok(bid: f64, ask: f64) -> bool {
     bid > 0.0 && ask > 0.0 && bid.is_finite() && ask.is_finite() && ask >= bid
 }
 
-/// Fiyatı sembolün ondalık hassasiyetine oturt.
-fn round_px(p: f64, digits: u32) -> f64 {
+/// Fiyatı sembolün kotasyon ızgarasına oturt.
+///
+/// **Canlı yolun tam aynısı** (`server::submit_order` içindeki `norm`):
+/// `tick_size` varsa ona, yoksa `digits`e. Yalnızca `digits`e yuvarlamak,
+/// tick_size'ı point'in katı olan sembollerde (endeks/CFD) broker'ın hiç
+/// veremeyeceği bir fiyattan dolum raporlardı — iki kip ayrışırdı.
+fn round_px(p: f64, sym: &SimSymbol) -> f64 {
     if p == 0.0 || !p.is_finite() {
         return p;
     }
-    // `tick_size` yok: [`SimSymbol`] onu taşımıyor, o yüzden yalnızca digits'e
-    // yuvarlanır. Aynı yuvarlama canlı yolda da kullanılıyor.
-    sinyal_proto::normalize_price(p, 0.0, digits)
+    sinyal_proto::normalize_price(p, sym.tick_size, sym.digits)
 }
 
 fn round_dec(v: f64, decimals: i32) -> f64 {
@@ -1302,6 +1364,43 @@ fn stops_reject(sym: &SimSymbol, what: &str) -> SimReject {
             sym.stops_level
         ),
     }
+}
+
+/// Simülasyonun yürüyebilmesi için sembol tablosundan ZORUNLU olan alanlar.
+///
+/// İkisi de eksikken motor çalışmaya devam edebilirdi — ve tam olarak bu
+/// yüzden edememeli:
+///
+/// - `contract_size` yoksa marjin `hacim × fiyat / kaldıraç` kadar, yani
+///   forex'te olması gerekenin 100 000'de biri çıkar: serbest marjin denetimi
+///   (10019) hiçbir zaman tetiklenmez ve kâr para biriminde DEĞİLDİR.
+/// - `point` yoksa kayma fiyata çevrilemez ([`SimSymbol::slip`] 0 döner), yani
+///   `--sim-slippage` sessizce devre dışı kalır ve `stops_level` mesafesi
+///   ölçülemez.
+///
+/// Her iki durumda da simülatör "modelliyorum" dediği şeyi modellemeden
+/// iyimser dolum üretirdi. Emri reddetmek gürültülüdür ama yalan değildir;
+/// sebep metni ne yapılacağını da söyler.
+fn check_contract(sym: &SimSymbol) -> Result<(), SimReject> {
+    if !(sym.contract_size > 0.0) {
+        return Err(SimReject {
+            retcode: retcode::INVALID,
+            reason: "sembol tablosunda contract_size YOK: marjin ve kar hesaplanamaz. \
+                     Kayittan oynatiyorsan kayit bu alani tasimayan eski bir surumdendir \
+                     (yeniden kaydet); canli/paper kipinde EA'nin sembol tablosunu \
+                     dolduramadigi anlamina gelir."
+                .into(),
+        });
+    }
+    if !(sym.point > 0.0) {
+        return Err(SimReject {
+            retcode: retcode::INVALID,
+            reason: "sembol tablosunda point YOK: kayma fiyata cevrilemez ve stops_level \
+                     olculemez — simule dolum iyimser olurdu."
+                .into(),
+        });
+    }
+    Ok(())
 }
 
 /// Hacmi doğrula. **Adıma oturmayan hacim REDDEDİLİR, sessizce
@@ -1384,6 +1483,7 @@ mod tests {
         SimSymbol {
             digits: 5,
             point: 0.00001,
+            tick_size: 0.00001,
             volume_step: 0.01,
             volume_min: 0.01,
             volume_max: 100.0,
@@ -2012,6 +2112,29 @@ mod tests {
         let acc = e.account(&book);
         assert!(near(acc.equity, acc.balance + acc.profit));
         assert!(acc.margin_level > 0.0);
+    }
+
+    #[test]
+    fn sim_close_event_belongs_to_the_closed_positions_client() {
+        // Gerileme testi: tam kapanışta pozisyon listeden silinince o
+        // indekste BAŞKA pozisyon kalır. Kimlik silmeden önce alınmazsa
+        // kapanış olayı yanlış istemciye damgalanır — çok istemcili
+        // daemon'da bir müşterinin işlemi başkasının hesabında görünürdü.
+        let mut e = engine();
+        let first = SimOrderReq { id: "a".into(), client_id: 11, ..req(SimOrderKind::Buy, 0.10) };
+        let second = SimOrderReq { id: "b".into(), client_id: 22, ..req(SimOrderKind::Buy, 0.10) };
+        let t1 = e.place(&first, &eurusd(), 1.10000, 1.10010).ticket().unwrap();
+        assert!(e.place(&second, &eurusd(), 1.10000, 1.10010).is_accepted());
+
+        let out = e.close(t1, 0.0, 1.10000, 1.10010);
+        let txn = &out.events()[2];
+        assert_eq!(txn.client_id, 11, "kapanan pozisyonun istemcisi");
+        assert_eq!(txn.id, "a", "kapanan pozisyonu acan istegin kimligi");
+        assert_eq!(txn.position, t1);
+        // Hayatta kalan pozisyon dokunulmadan duruyor.
+        let rest = e.positions(&PriceBook::new());
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].client_id, 22);
     }
 
     #[test]

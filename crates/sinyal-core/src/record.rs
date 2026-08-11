@@ -144,7 +144,7 @@ impl TickRec {
 
     /// Diskteki gösterimi (little-endian, sabit ofsetler).
     #[inline]
-    pub fn to_bytes(&self) -> [u8; REC_SIZE] {
+    pub fn to_bytes(self) -> [u8; REC_SIZE] {
         let mut b = [0u8; REC_SIZE];
         b[0..8].copy_from_slice(&self.recv_ms.to_le_bytes());
         b[8..16].copy_from_slice(&self.time_msc.to_le_bytes());
@@ -906,6 +906,12 @@ impl Writer {
                 volume_min: e.volume_min,
                 volume_max: e.volume_max,
                 volume_step: e.volume_step,
+                // OLMAZSA REPLAY'DE MARJIN VE KÂR SESSİZCE YANLIŞ ÇIKAR:
+                // simülatör kârı `fiyat farkı × hacim × contract_size` ile
+                // hesaplıyor ve alan 0 gelirse forex'te 100 000 kat küçük bir
+                // kâr, pratikte de sonsuz kaldıraç doğar. Kayıt bu alanı
+                // taşımadığı sürece replay'in kâr eğrisi anlamsızdı.
+                contract_size: e.contract_size,
                 exec_mode: e.trade_exemode,
                 filling_mask: e.filling_mode,
                 stops_level: e.stops_level,

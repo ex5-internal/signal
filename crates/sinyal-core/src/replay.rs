@@ -126,6 +126,18 @@ pub struct SymbolItem {
     pub volume_max: f64,
     #[serde(default)]
     pub volume_step: f64,
+    /// `SYMBOL_TRADE_CONTRACT_SIZE`.
+    ///
+    /// **Simülasyonun para birimine geçişi bu alandadır.** Marjin
+    /// (`hacim × contract_size × fiyat / kaldıraç`) ve kâr
+    /// (`fiyat farkı × hacim × contract_size`) ikisi de buna dayanır; alan
+    /// yoksa forex'te 100 000 kat küçük bir kâr ve pratikte sonsuz kaldıraç
+    /// çıkar — yani marjin denetimi (10019) sessizce ölür ve kâr eğrisi
+    /// anlamsızlaşır. Kayıtta bu alan YOKKEN 0 gelir ve simülatör emri
+    /// açıkça reddeder; sessizce 1 varsaymak tam da bu işin kapatmaya
+    /// çalıştığı yanılgıyı üretirdi.
+    #[serde(default)]
+    pub contract_size: f64,
     #[serde(default)]
     pub exec_mode: u32,
     #[serde(default)]
@@ -162,12 +174,20 @@ impl SymbolItem {
         if self.book_depth > 0 {
             flags |= sym_flag::BOOK_SUBSCRIBED;
         }
+        // Kayıt yalnızca `contract_size`ı taşıyor (swap/marjin bloğunun geri
+        // kalanını değil), bu yüzden bayrağı ANCAK o alan doluysa kuruyoruz.
+        // Bayrağı taşımadığımız veriye dayandırmak, "sözleşme verisi var"
+        // diyip swap alanlarını 0 bırakmak olurdu.
+        if self.contract_size > 0.0 {
+            flags |= sym_flag::CONTRACT_DATA;
+        }
         let mut e = SymbolEntry {
             point: self.point,
             tick_size: self.tick_size,
             volume_min: self.volume_min,
             volume_max: self.volume_max,
             volume_step: self.volume_step,
+            contract_size: self.contract_size,
             symbol_id: self.id,
             digits: self.digits,
             filling_mode: self.filling_mask,
@@ -773,6 +793,7 @@ pub fn spawn(
     candles: Arc<Mutex<CandleStore>>,
     tx: broadcast::Sender<FeedEvent>,
     done: watch::Sender<Option<ReplayEnd>>,
+    sim: Option<Arc<crate::server::SimExec>>,
 ) -> ReplayHandle {
     let covered = rec.span();
     let done_tx = Arc::new(done);
@@ -784,7 +805,7 @@ pub fn spawn(
         .name("sinyal-replay".into())
         .spawn(move || {
             thread_gate.wait();
-            play(&rec, &registry, &candles, &tx, &engine);
+            play(&rec, &registry, &candles, &tx, &engine, sim.as_deref());
         })
         .expect("replay thread'i baslatilamadi");
     ReplayHandle { done_tx, done: rx, covered, gate, join: Some(join) }
@@ -798,12 +819,20 @@ pub fn spawn(
 ///
 /// Bitince `done` kanalına **tam bir kez** özet yazılır; bağlantı DÜŞÜRÜLMEZ,
 /// akış son durumda kalır.
+///
+/// `sim` verilirse motor **her tick'le** beslenir; bekleyen emirler ve SL/TP
+/// ancak böyle tetiklenir. Besleme yayın kanalına abone bir görevle DEĞİL,
+/// tam burada yapılıyor: `broadcast` geride kalınca mesaj DÜŞÜRÜR ve düşen
+/// bir tick, tetiklenmeyen bir stop demektir. Buradan beslemek aynı zamanda
+/// belirlenimciliği koruyor — motorun gördüğü tick dizisi kaydın kendisidir,
+/// sunucunun o anki yüküne bağlı değildir.
 pub fn play(
     rec: &Recording,
     registry: &Registry,
     candles: &Mutex<CandleStore>,
     tx: &broadcast::Sender<FeedEvent>,
     done: &watch::Sender<Option<ReplayEnd>>,
+    sim: Option<&crate::server::SimExec>,
 ) -> ReplayEnd {
     let names: Vec<Arc<str>> = rec.instances.iter().map(|s| Arc::from(s.as_str())).collect();
     // Örnek başına sembol görüntüsü imleci.
@@ -870,6 +899,13 @@ pub fn play(
             // söylerdi. 0 = "ölçüm yok".
             lat_us: 0,
         });
+
+        // Tetiklenmeler tick'ten SONRA yayılır: istemci önce fiyatı, sonra o
+        // fiyatın doğurduğu dolumu görür. Ters sıra, henüz görmediği bir
+        // fiyattan dolum almış gibi görünürdü.
+        if let Some(s) = sim {
+            crate::server::pump_tick(s, tx, inst_name, &name, t.bid, t.ask, t.time_msc);
+        }
 
         end.ticks += 1;
         // Yayılan SON tick'in broker saati. İsimlendirilemediği için atlanan
@@ -1062,7 +1098,7 @@ mod tests {
         let (tx, mut rx) = broadcast::channel(8192);
         let (dtx, drx) = watch::channel(None);
 
-        let end = play(r, &registry, &candles, &tx, &dtx);
+        let end = play(r, &registry, &candles, &tx, &dtx, None);
         assert_eq!(*drx.borrow(), Some(end), "bitis kanala TAM olarak yazilmali");
 
         let mut evs = Vec::new();
@@ -1550,7 +1586,7 @@ mod tests {
         let candles = Arc::new(Mutex::new(CandleStore::new()));
         let (tx, mut rx) = broadcast::channel(8192);
         let (dtx, _drx) = watch::channel(None);
-        play(&r, &registry, &candles, &tx, &dtx);
+        play(&r, &registry, &candles, &tx, &dtx, None);
 
         let mut closed = 0;
         while let Ok(e) = rx.try_recv() {
@@ -1568,6 +1604,92 @@ mod tests {
         // MT5 tarafına HİÇ dokunulmamalı: replay'de broker geçmişi yoktur.
         assert_eq!(cs.bar_counts().1, 0);
         assert!(cs.mt5_status("EURUSD", "M1").is_none());
+    }
+
+    #[test]
+    fn playback_feeds_the_simulator_so_pending_orders_actually_trigger() {
+        // UÇTAN UCA: kayıt → oynatım → simülatör.
+        //
+        // Beslemeyi yayın kanalına abone bir görev yapsaydı bu test yeşil
+        // kalır ama üretimde `--replay-speed 0`da kanal taşar ve tick'ler
+        // motora HİÇ ulaşmazdı. Bu yüzden besleme oynatım döngüsünün
+        // içindedir ve test onu oradan sınıyor.
+        let tmp = Tmp::new("replay-sim-pending");
+        let base = DAY + 9 * 3_600_000;
+        // Fiyat düşüyor: 1.1000 → 1.0940 (ask = bid + 0.0002).
+        let written = vec![
+            rec(base, base, 1.1000, 0),
+            rec(base + 1_000, base + 1_000, 1.0970, 0),
+            rec(base + 2_000, base + 2_000, 1.0940, 0),
+        ];
+        lay_out(tmp.path(), "mt5-1", &written, &one_symbol_table(DAY));
+
+        let mut opts = ReplayOpts::new(tmp.path(), DATE);
+        opts.speed = 0.0;
+        let r = load(&opts).unwrap();
+
+        // Kaymasız: dolum fiyatı beklentisi sade kalsın.
+        let sim = crate::server::SimExec::new(
+            crate::server::MODE_REPLAY,
+            &["mt5-1".to_string()],
+            crate::sim::SimConfig { balance: 10_000.0, leverage: 100, slippage_points: 0.0 },
+        );
+        let sym = crate::sim::SimSymbol {
+            digits: 5,
+            point: 0.00001,
+            volume_step: 0.01,
+            volume_min: 0.01,
+            volume_max: 100.0,
+            stops_level: 0,
+            contract_size: 100_000.0,
+        };
+        // ASK 1.1002 iken 1.0950'ye buy_limit.
+        let req = crate::sim::SimOrderReq {
+            id: "p1".into(),
+            client_id: 7,
+            symbol: "EURUSD".into(),
+            kind: crate::sim::SimOrderKind::BuyLimit,
+            volume: 0.10,
+            price: 1.09500,
+            time_msc: base,
+            ..Default::default()
+        };
+        let placed = sim
+            .engine
+            .lock()
+            .unwrap()
+            .place(&req, &sym, 1.10000, 1.10020);
+        assert!(placed.is_accepted(), "bekleyen emir kurulmali: {placed:?}");
+
+        let registry = Arc::new(Registry::new());
+        let candles = Arc::new(Mutex::new(CandleStore::new()));
+        let (tx, mut rx) = broadcast::channel(8192);
+        let (dtx, _drx) = watch::channel(None);
+        play(&r, &registry, &candles, &tx, &dtx, Some(&sim));
+
+        // Yayında TAM BİR dolum olayı olmalı, kaynağı da kayıttaki örnek.
+        let mut fills = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            if let FeedEvent::Order { kind, retcode, price, position, comment, instance, .. } = e {
+                fills.push((kind, retcode, price, position, comment, instance.to_string()));
+            }
+        }
+        assert_eq!(fills.len(), 1, "tetiklenen emir tam bir dolum uretmeli: {fills:?}");
+        let (kind, retcode, price, position, comment, instance) = &fills[0];
+        assert_eq!(*kind, "txn");
+        assert_eq!(*retcode, 10009);
+        assert_eq!(*comment, "pending_triggered", "sebep soylenmeli");
+        assert_eq!(instance, "mt5-1", "src kayittaki ornek olmali");
+        // Limit emri fiyatından KÖTÜ dolamaz.
+        assert!((price - 1.09500).abs() < 1e-12, "limit fiyatindan dolmali: {price}");
+
+        let eng = sim.engine.lock().unwrap();
+        assert!(eng.orders().is_empty(), "tetiklenen emir bekleyenlerde kalmamali");
+        let book = crate::sim::PriceBook::new();
+        let pos = eng.positions(&book);
+        assert_eq!(pos.len(), 1, "emir POZISYONA donmeli");
+        assert_eq!(pos[0].ticket, *position, "olay ile durum ayni bileti gostermeli");
+        assert_eq!(pos[0].client_id, 7, "pozisyon emri KOYAN istemciye ait kalmali");
     }
 
     #[test]
@@ -1599,7 +1721,7 @@ mod tests {
         let (dtx, mut drx) = watch::channel(None);
         assert!(drx.borrow().is_none(), "baslamadan bitmis gorunmemeli");
 
-        let end = play(&r, &registry, &candles, &tx, &dtx);
+        let end = play(&r, &registry, &candles, &tx, &dtx, None);
         assert_eq!(end.ticks, 2, "oynatilan tick sayisi bildirilmeli");
         // Son tick'in BROKER saati — alım zamanı değil.
         assert_eq!(end.last_ms, DAY + 22);
@@ -1641,7 +1763,7 @@ mod tests {
         let candles = Arc::new(Mutex::new(CandleStore::new()));
         let (tx, _rx) = broadcast::channel(64);
         let (dtx, _drx) = watch::channel(None);
-        play(&load(&opts).unwrap(), &registry, &candles, &tx, &dtx);
+        play(&load(&opts).unwrap(), &registry, &candles, &tx, &dtx, None);
 
         // Bitiş yazıldıktan SONRA abone ol.
         let late = dtx.subscribe();
@@ -1666,7 +1788,7 @@ mod tests {
         let candles = Arc::new(Mutex::new(CandleStore::new()));
         let (tx, mut rx) = broadcast::channel(64);
         let (dtx, _drx) = watch::channel(None);
-        let h = spawn(r, registry, candles, tx, dtx);
+        let h = spawn(r, registry, candles, tx, dtx, None);
         assert_eq!(h.covered_span(), (DAY + 10, DAY + 90));
         let done = h.done();
         // Oynatım başlatma kapısının arkasında bekliyor; sunucuda bunu ilk
@@ -1800,7 +1922,7 @@ mod tests {
         let (tx, mut rx) = broadcast::channel(4096);
         let (dtx, _drx) = watch::channel(None);
 
-        let handle = spawn(r, registry, candles, tx, dtx);
+        let handle = spawn(r, registry, candles, tx, dtx, None);
 
         // Kapı KAPALI: oynatımın başlamadığını görmek için gerçekten bekle.
         // (Sadece "hemen bakıp boş" demek, yarışı kaybetmiş bir testi de
