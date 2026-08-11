@@ -1,0 +1,26 @@
+[package]
+name = "sinyal-bridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "MT5 terminaline yüklenen köprü DLL'i — EA ile paylaşımlı bellek arasındaki C ABI"
+
+[lints]
+workspace = true
+
+[lib]
+# Çıktı: sinyal_bridge.dll — EA bunu `#import "sinyal_bridge.dll"` ile yükler.
+#
+# DLL'i `SinyalBridge.dll` diye adlandırıp derleme sonrası yeniden adlandırmak
+# daha "şık" görünürdü ama derlenen dosya adı ile dağıtılan dosya adının
+# farklı olması gereksiz bir karışıklık kaynağı. MQL5 `#import` hangi adı
+# verirsek onu kullanıyor, o yüzden tek ad her yerde geçerli.
+name = "sinyal_bridge"
+# cdylib: MQL5 #import ile yüklenen DLL.
+# rlib: testlerin ve latency-bench'in aynı kodu kullanabilmesi için.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+sinyal-proto = { path = "../sinyal-proto" }
+sinyal-shm = { path = "../sinyal-shm" }

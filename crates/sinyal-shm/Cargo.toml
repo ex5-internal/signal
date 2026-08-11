@@ -1,0 +1,15 @@
+[package]
+name = "sinyal-shm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Windows paylaşımlı bellek + yüksek çözünürlüklü saat (bağımlılıksız)"
+
+[lints]
+workspace = true
+
+# Bağımlılık YOK: bu kod MT5 terminalinin süreç alanına yüklenen bir DLL'in
+# parçası olacak. Gereken 8 Win32 fonksiyonunu doğrudan bildirmek, bir bağımlılık
+# ağacını terminale taşımaktan hem daha küçük hem daha öngörülebilir.
+[dependencies]

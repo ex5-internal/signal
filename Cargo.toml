@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sinyal-proto",
+    "crates/sinyal-shm",
+    "crates/sinyal-bridge",
+    "crates/sinyal-core",
+    "tools/latency-bench",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+license = "UNLICENSED"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "debuginfo"
+
+# DİKKAT: `panic = "abort"` KULLANMA.
+#
+# `sinyal-bridge` MT5 terminalinin süreç alanına yüklenen bir cdylib. Abort
+# modunda köprüdeki herhangi bir panik TÜM TERMİNALİ öldürür — açık
+# pozisyonları olan bir ticaret terminalini. Unwind açık kaldığında dışa açık
+# her fonksiyon `catch_unwind` ile paniği yakalayıp MQL5'e hata kodu
+# döndürebiliyor; EA bunu loglar ve terminal ayakta kalır.

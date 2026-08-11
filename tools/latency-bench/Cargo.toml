@@ -1,0 +1,15 @@
+[package]
+name = "latency-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Faz 1 kapisi: paylasimli bellek turu gecikmesi ve tick kaybi olcumu"
+
+[lints]
+workspace = true
+
+[dependencies]
+sinyal-proto = { path = "../../crates/sinyal-proto" }
+sinyal-shm = { path = "../../crates/sinyal-shm" }
+sinyal-bridge = { path = "../../crates/sinyal-bridge" }

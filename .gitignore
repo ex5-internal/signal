@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# MT5 derleme çıktıları
+*.ex5
+*.log
+
+# yerel yapılandırma (sırlar)
+/config/local.toml
+.env
+
+# eski, terk edilen adaptör (referans için tutuluyor, versiyonlanmıyor)
+/supersam-agent

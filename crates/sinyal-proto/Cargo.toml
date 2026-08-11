@@ -1,0 +1,16 @@
+[package]
+name = "sinyal-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Sinyal MT5 adaptörü — MQL5 ve Rust tarafının paylaştığı bellek yerleşimi (tek doğruluk kaynağı)"
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[[bin]]
+name = "gen-mqh"
+path = "src/bin/gen_mqh.rs"
