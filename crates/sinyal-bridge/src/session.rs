@@ -603,7 +603,9 @@ impl Session {
 ///
 /// # Güvenlik
 /// Çağıran, dönen `SharedMem`'i `Ring` yaşadığı sürece canlı tutmalıdır.
-unsafe fn open_ring_auto<T: Copy>(name: &str) -> Result<(SharedMem, Ring<T>), SessionError> {
+pub(crate) unsafe fn open_ring_auto<T: Copy>(
+    name: &str,
+) -> Result<(SharedMem, Ring<T>), SessionError> {
     let capacity = {
         let probe = SharedMem::open(name, sinyal_proto::ring::RING_HEADER_SIZE)?;
         // Güvenlik: önizleme en az başlık kadar eşlendi.
@@ -620,7 +622,7 @@ unsafe fn open_ring_auto<T: Copy>(name: &str) -> Result<(SharedMem, Ring<T>), Se
 ///
 /// # Güvenlik
 /// `mem` en az `bytes_needed::<T>(capacity)` bayt eşlenmiş olmalı.
-unsafe fn init_or_attach_ring<T: Copy>(
+pub(crate) unsafe fn init_or_attach_ring<T: Copy>(
     mem: &SharedMem,
     capacity: u64,
 ) -> Result<Ring<T>, SessionError> {
@@ -633,7 +635,7 @@ unsafe fn init_or_attach_ring<T: Copy>(
     }
 }
 
-fn check_pow2(which: &'static str, v: u64) -> Result<(), SessionError> {
+pub(crate) fn check_pow2(which: &'static str, v: u64) -> Result<(), SessionError> {
     if v == 0 || !v.is_power_of_two() {
         Err(SessionError::BadCapacity(which, v))
     } else {

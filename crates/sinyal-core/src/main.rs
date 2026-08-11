@@ -9,6 +9,8 @@
 //! ```
 
 mod candles;
+mod hist_bridge;
+mod history;
 mod join;
 mod server;
 mod source;
@@ -157,12 +159,25 @@ async fn main() {
     let (tx, _) = broadcast::channel(args.capacity);
 
     let mut cmd_tx = HashMap::new();
+    let mut hist_tx = HashMap::new();
     let mut stats_all = Vec::new();
     for inst in &args.instances {
         let (ctx_tx, ctx_rx) = std::sync::mpsc::channel();
+        // Geçmiş isteği ayrı kanal: emir kuyruğuyla aynı yolu paylaşsaydı
+        // binlerce barlık bir geçmiş turu emir gönderimini geciktirebilirdi.
+        let (h_tx, h_rx) = std::sync::mpsc::channel();
         let stats = Arc::new(Mutex::new(ReaderStats::default()));
-        spawn_reader(inst.clone(), registry.clone(), tx.clone(), ctx_rx, stats.clone(), candles.clone());
+        spawn_reader(
+            inst.clone(),
+            registry.clone(),
+            tx.clone(),
+            ctx_rx,
+            h_rx,
+            stats.clone(),
+            candles.clone(),
+        );
         cmd_tx.insert(inst.clone(), ctx_tx);
+        hist_tx.insert(inst.clone(), h_tx);
         stats_all.push((inst.clone(), stats));
     }
 
@@ -170,12 +185,16 @@ async fn main() {
         registry: registry.clone(),
         events: tx,
         cmd_tx,
+        hist_tx,
         token: args.token.clone(),
         trading: args.trading,
         allow_live: args.allow_live,
         deviation: args.deviation,
         orders: Arc::new(OrderTracker::new()),
         candles: candles.clone(),
+        // `candles` token istemez ve uç ağa açılabilir; geçmiş çekmek ticaret
+        // terminalini meşgul eder. Tavan tüm bağlantılar için ORTAKTIR.
+        hist_slots: Arc::new(tokio::sync::Semaphore::new(server::HIST_SLOTS)),
     });
 
     let listener = match TcpListener::bind(&args.bind).await {
@@ -214,9 +233,9 @@ async fn main() {
         tick.tick().await;
         loop {
             tick.tick().await;
-            let bars = {
+            let (tick_bars, mt5_bars) = {
                 let cs = telemetry_candles.lock().unwrap_or_else(|e| e.into_inner());
-                cs.total_bars()
+                cs.bar_counts()
             };
             for (inst, st) in &stats_all {
                 let s = *st.lock().unwrap_or_else(|e| e.into_inner());
@@ -225,18 +244,36 @@ async fn main() {
                     continue;
                 }
                 println!(
-                    "[{inst}] tick={} dom={} emir={} bar={} | EA-kayip={} birikmis={} \
-                     | eslesme: bekleyen={} gec={} kimliksiz={}",
+                    "[{inst}] tick={} dom={} emir={} bar={}(mt5={}) | EA-kayip={} birikmis={} \
+                     | eslesme: bekleyen={} gec={} kimliksiz={} \
+                     | gecmis: {} istek={} bekleyen={} eksik={} hata={} zamanasimi={}",
                     s.ticks,
                     s.books,
                     s.orders,
-                    bars,
+                    tick_bars,
+                    mt5_bars,
                     s.ea_tick_loss,
                     s.backlog,
                     s.join_pending,
                     s.join_late,
                     s.join_unattributed,
+                    if s.hist_ready { "acik" } else { "kapali" },
+                    s.hist_reqs,
+                    s.hist_pending,
+                    s.hist_incomplete,
+                    s.hist_failed,
+                    s.hist_timeout,
                 );
+                // Eksik teslimat = bar halkası dolmuş demektir ve barlar
+                // KALICI kaybolmuştur; sessiz kalması grafiği delikli
+                // bırakırdı.
+                if s.hist_incomplete > 0 {
+                    println!(
+                        "[{inst}] UYARI: {} gecmis istegi EKSIK teslim edildi \
+                         — bar halkasi dolmus olabilir.",
+                        s.hist_incomplete
+                    );
+                }
                 if s.ea_tick_loss > 0 {
                     println!("[{inst}] UYARI: EA halkaya yazamadı — tick KAYBEDİLDİ.");
                 }

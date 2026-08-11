@@ -110,10 +110,14 @@ Write-Step "DLL doğrulandı: x64, $([math]::Round((Get-Item $dll).Length / 1KB)
 $targets = @{
     'Libraries'      = @(@{ Src = $dll; Name = 'sinyal_bridge.dll' })
     'Include\Sinyal' = @(
-        @{ Src = Join-Path $repo 'mql5\Include\Sinyal\Protocol.mqh'; Name = 'Protocol.mqh' }
-        @{ Src = Join-Path $repo 'mql5\Include\Sinyal\Bridge.mqh';   Name = 'Bridge.mqh' }
+        @{ Src = Join-Path $repo 'mql5\Include\Sinyal\Protocol.mqh';    Name = 'Protocol.mqh' }
+        @{ Src = Join-Path $repo 'mql5\Include\Sinyal\Bridge.mqh';      Name = 'Bridge.mqh' }
+        @{ Src = Join-Path $repo 'mql5\Include\Sinyal\HistBridge.mqh';  Name = 'HistBridge.mqh' }
     )
     'Experts'        = @(@{ Src = Join-Path $repo 'mql5\Experts\SinyalCollector.mq5'; Name = 'SinyalCollector.mq5' })
+    # Gecmis besleyici AYRI bir programdir (Service): CopyRates EA thread'ini
+    # bloklar, o yuzden tick toplama yolunda olamaz.
+    'Services'       = @(@{ Src = Join-Path $repo 'mql5\Services\SinyalHistory.mq5'; Name = 'SinyalHistory.mq5' })
 }
 
 foreach ($sub in $targets.Keys) {
@@ -184,22 +188,34 @@ if ($Compile) {
         Write-Warn 'EA''yı MetaEditor''de açıp F7 ile elle derleyebilirsin.'
     }
     else {
-        Write-Step "EA derleniyor ($editor)"
-        $ea = Join-Path $DataDir 'MQL5\Experts\SinyalCollector.mq5'
-        $log = Join-Path $env:TEMP 'sinyal-compile.log'
-        # metaeditor derleme başarısında da sıfır olmayan kod dönebilir;
-        # gerçek sonuç log dosyasındadır.
-        & $editor "/compile:$ea" "/log:$log" | Out-Null
-        Start-Sleep -Milliseconds 500
-        if (Test-Path $log) {
-            $content = Get-Content $log -Encoding Unicode -ErrorAction SilentlyContinue
-            if (-not $content) { $content = Get-Content $log -ErrorAction SilentlyContinue }
-            $content | Where-Object { $_ -match 'error|warning|result' } | ForEach-Object {
-                if ($_ -match '\berror\b') { Write-Host "    $_" -ForegroundColor Red }
-                else { Write-Host "    $_" }
+        # EA ve Service AYRI programlardır ve ikisi de derlenmelidir. Service
+        # derlenmezse Navigator'da hiç görünmez ve tek belirtisi "geçmiş
+        # gelmiyor" olur — sessiz bir başarısızlık.
+        $toCompile = @(
+            @{ Path = Join-Path $DataDir 'MQL5\Experts\SinyalCollector.mq5'; Label = 'EA' }
+            @{ Path = Join-Path $DataDir 'MQL5\Services\SinyalHistory.mq5';  Label = 'Service' }
+        )
+        foreach ($item in $toCompile) {
+            if (-not (Test-Path $item.Path)) {
+                Write-Warn "$($item.Label) kaynağı bulunamadı: $($item.Path)"
+                continue
             }
-            if ($content -match '0 error') { Write-Step 'Derleme başarılı' }
-            else { Write-Warn 'Derlemede hata olabilir — yukarıdaki loga bak.' }
+            Write-Step "$($item.Label) derleniyor ($editor)"
+            $log = Join-Path $env:TEMP "sinyal-compile-$($item.Label).log"
+            # metaeditor derleme başarısında da sıfır olmayan kod dönebilir;
+            # gerçek sonuç log dosyasındadır.
+            & $editor "/compile:$($item.Path)" "/log:$log" | Out-Null
+            Start-Sleep -Milliseconds 500
+            if (Test-Path $log) {
+                $content = Get-Content $log -Encoding Unicode -ErrorAction SilentlyContinue
+                if (-not $content) { $content = Get-Content $log -ErrorAction SilentlyContinue }
+                $content | Where-Object { $_ -match 'error|warning|result' } | ForEach-Object {
+                    if ($_ -match '\berror\b') { Write-Host "    $_" -ForegroundColor Red }
+                    else { Write-Host "    $_" }
+                }
+                if ($content -match '0 error') { Write-Step "$($item.Label) derlemesi başarılı" }
+                else { Write-Warn "$($item.Label) derlemesinde hata olabilir — yukarıdaki loga bak." }
+            }
         }
     }
 }

@@ -534,8 +534,20 @@ pub mod sym_flag {
     /// Tick'ler yalnızca `OnTimer` taramasıyla toplanıyor (DOM/OnTick yok).
     ///
     /// Bu sembollerin gecikme sınıfı farklıdır: timer çözünürlüğü ~10-16 ms
-    /// olduğu için ortalama ~8 ms ek gecikme taşırlar.
+    /// olduğu için ortalama ~8 ms ek gecikme taşırlar. Ayrıca iki tarama
+    /// arasında birden fazla tick oluşursa **aradakiler görülmez** — yalnızca
+    /// son fiyat okunur.
     pub const POLLED_ONLY: u32 = 1 << 2;
+    /// EA'nın bağlı olduğu grafiğin sembolü — `OnTick` ile OLAY GÜDÜMLÜ akar.
+    ///
+    /// MQL5'te `OnTick` yalnızca grafik sembolü için tetiklenir. Bu sembol
+    /// terminalin verdiği her tick olayını alır; taramaya bağlı değildir ve
+    /// [`POLLED_ONLY`] ile birlikte GELMEZ.
+    ///
+    /// Tüketici için anlamı: **en yüksek sadakat bu semboldedir.** Sinyal
+    /// üretimi hangi sembolde yapılacaksa EA o sembolün grafiğine
+    /// bağlanmalıdır.
+    pub const CHART: u32 = 1 << 3;
 }
 
 impl Default for SymbolEntry {

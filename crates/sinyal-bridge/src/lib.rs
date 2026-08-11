@@ -11,6 +11,8 @@
 //! ## Katmanlar
 //!
 //! - [`session`] — saf Rust API. Testler ve `latency-bench` bunu kullanır.
+//! - [`hist`] — geçmiş bar kanalının oturumu. AYRI bir yazar (MQL5 Service)
+//!   kullandığı için EA oturumundan bağımsızdır ve onun kilidine dokunmaz.
 //! - [`ffi`] — MQL5'in gördüğü C ABI. Her export `catch_unwind` ile sarılıdır.
 //!
 //! ## MT5 kurulumu
@@ -28,8 +30,10 @@
 #![allow(non_snake_case)]
 
 pub mod ffi;
+pub mod hist;
 pub mod session;
 
+pub use hist::{HistCapacities, HistSession};
 pub use session::{Capacities, Session, SessionError};
 
 // C ABI yüzeyini yeniden dışa aktar ki `rlib` olarak kullananlar (testler,

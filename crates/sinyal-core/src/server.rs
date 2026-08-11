@@ -12,6 +12,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::history::{HistCmd, HistReply, HistStatus};
 use crate::source::FeedEvent;
 use crate::state::Registry;
 use crate::wire::{
@@ -19,12 +20,42 @@ use crate::wire::{
     TickSnap,
 };
 
+/// MT5 görüntüsü bu yaştan eskiyse `candles` isteği yeniden çekim tetikler.
+///
+/// Her istekte çekmek `CopyRates`'i sürekli meşgul ederdi; hiç çekmemek bayat
+/// seri servis etmek olurdu. Oluşmakta olan barın da makul bir sıklıkta
+/// tazelenmesi gerekiyor.
+const HIST_REFRESH_MS: i64 = 20_000;
+
+/// WebSocket tarafının geçmiş cevabı için beklediği azami süre.
+///
+/// Okuyucu tarafındaki zaman aşımından (`history::DEFAULT_TIMEOUT`) biraz
+/// uzun: normalde cevabı oradan alırız, bu yalnızca okuyucu thread'i tamamen
+/// tıkanırsa devreye giren son çare.
+const HIST_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Aynı anda MT5'e gidebilecek azami geçmiş isteği (tüm bağlantılar toplamı).
+///
+/// `candles` işlemi **token istemez** ve uç ağa açılabilir. Sınırsız bıraksak
+/// bir istemci `CopyRates`'i sürekli meşgul ederek ticaret terminalini
+/// yavaşlatabilirdi — geçmiş çekmek ucuz değil. Sınır dolduğunda istek
+/// reddedilmez, depodaki görüntüyle cevaplanır ve `hist: "refused"` denir.
+///
+/// NOT: bu bir eş zamanlılık tavanıdır, hız sınırı DEĞİL. Sürekli yeniden
+/// istek gönderen bir istemci hâlâ terminali meşgul edebilir.
+pub const HIST_SLOTS: usize = 4;
+
 /// Sunucunun paylaşılan bağlamı.
 pub struct Ctx {
     pub registry: Arc<Registry>,
     pub events: broadcast::Sender<FeedEvent>,
     /// Örnek adı → o örneğin okuyucu thread'ine giden komut kanalı.
     pub cmd_tx: HashMap<String, std::sync::mpsc::Sender<Cmd>>,
+    /// Örnek adı → geçmiş bar isteği kanalı.
+    ///
+    /// Emir kanalından AYRI: binlerce barlık bir geçmiş turu emir gönderimini
+    /// geciktirmemeli.
+    pub hist_tx: HashMap<String, std::sync::mpsc::Sender<HistCmd>>,
     /// Boşsa kimlik doğrulama gerekmez.
     pub token: Option<String>,
     /// `false` ise hiçbir emir kabul edilmez (EA'daki bayrağa ek ikinci kapı).
@@ -39,6 +70,8 @@ pub struct Ctx {
     pub orders: Arc<OrderTracker>,
     /// Mum deposu — okuyucu thread'i yazar, WS okur.
     pub candles: Arc<Mutex<crate::candles::CandleStore>>,
+    /// Eş zamanlı geçmiş çekme tavanı (bkz. [`HIST_SLOTS`]).
+    pub hist_slots: Arc<tokio::sync::Semaphore>,
 }
 
 /// İstemci kimliği (metin) ile wire kimliği (u64) arasındaki eşleme.
@@ -230,6 +263,15 @@ async fn handle(stream: TcpStream, ctx: Arc<Ctx>) -> Result<(), String> {
     let mut subs = Subs::default();
     let auth_required = ctx.token.is_some();
 
+    // Bu bağlantıya ait, GECİKMELİ üretilen cevapların kuyruğu.
+    //
+    // Geçmiş isteği MT5'ten saniyeler sürebilir. Cevabı burada `await`
+    // etseydik o süre boyunca tick akışını pompalamayı bırakırdık; yayın
+    // kanalı dolar ve istemci `lagged` yerdi — bir grafik isteği yüzünden
+    // FİYAT KAYBI. Bu yüzden bekleme ayrı bir göreve alınıyor ve cevabı bu
+    // kuyruktan geçiyor.
+    let (local_tx, mut local_rx) = tokio::sync::mpsc::channel::<ServerMsg>(64);
+
     // Token TANIMLI DEĞİLSE bağlantı doğrudan Trader başlar.
     //
     // Aksi halde `--token` verilmeyen bir kurulumda hiçbir istemci Trader'a
@@ -255,6 +297,11 @@ async fn handle(stream: TcpStream, ctx: Arc<Ctx>) -> Result<(), String> {
 
     loop {
         tokio::select! {
+            // --- gecikmeli üretilmiş cevaplar (geçmiş) ---
+            Some(m) = local_rx.recv() => {
+                send(&mut out, &m).await?;
+            }
+
             // --- akıştan gelen olaylar ---
             ev = rx.recv() => {
                 match ev {
@@ -290,6 +337,43 @@ async fn handle(stream: TcpStream, ctx: Arc<Ctx>) -> Result<(), String> {
                             }).await?;
                             continue;
                         };
+                        // Geçmiş isteği MT5'e gidebilir ve saniyeler sürebilir;
+                        // burada beklemek tick akışını durdururdu. Ayrı göreve
+                        // alıp cevabı `local_tx` üzerinden geri veriyoruz.
+                        if let ClientMsg::Candles { symbol, tf, count } = cm {
+                            match ctx.hist_slots.clone().try_acquire_owned() {
+                                Ok(permit) => {
+                                    let ctx2 = ctx.clone();
+                                    let tx2 = local_tx.clone();
+                                    tokio::spawn(async move {
+                                        let _permit = permit;
+                                        for m in candles_op(&ctx2, symbol, tf, count).await {
+                                            if tx2.send(m).await.is_err() {
+                                                break; // bağlantı kapandı
+                                            }
+                                        }
+                                    });
+                                }
+                                // Tavan dolu: MT5'i daha fazla meşgul etmiyoruz
+                                // ama istemciyi de eli boş göndermiyoruz —
+                                // depodaki görüntüyü, neden tazelenmediğini
+                                // söyleyerek veriyoruz.
+                                Err(_) => {
+                                    let msgs = candles_from_store(
+                                        &ctx,
+                                        symbol,
+                                        tf,
+                                        count,
+                                        "refused",
+                                        Some("es zamanli gecmis cekme tavani dolu".into()),
+                                    );
+                                    for m in msgs {
+                                        send(&mut out, &m).await?;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
                         if let Some(reply) = handle_client_msg(cm, &ctx, &mut subs, &mut level) {
                             for m in reply {
                                 send(&mut out, &m).await?;
@@ -334,9 +418,13 @@ fn to_wire(ev: &FeedEvent, ctx: &Ctx) -> Option<ServerMsg> {
             asks: asks.clone(),
             src: instance.to_string(),
         },
+        // Canlı kapanan bar DAİMA tick kaynaklıdır (MID). İstemci bunu bir
+        // `mt5` dizisinin (BID) sonuna eklememeli; bunu ancak kaynağı
+        // söylersek bilebilir.
         FeedEvent::Candle { symbol, tf, bar } => ServerMsg::Candle {
             s: symbol.to_string(),
             tf,
+            src_kind: crate::candles::BarSource::Tick.name(),
             bar: *bar,
         },
         FeedEvent::Order {
@@ -459,6 +547,7 @@ fn handle_client_msg(
                     stops_level: e.stops_level,
                     book_depth: e.ticks_bookdepth,
                     polled_only: e.flags & sym_flag::POLLED_ONLY != 0,
+                    chart: e.flags & sym_flag::CHART != 0,
                     ready: e.flags & sym_flag::READY != 0,
                     src,
                 })
@@ -488,24 +577,12 @@ fn handle_client_msg(
             vec![ServerMsg::Snapshot { items }]
         }
 
+        // Normal yolda bu istek `candles_op` üzerinden gider (MT5'ten çekmeyi
+        // de tetikler). Buradaki karşılık yalnız DEPODAN servis eder ve
+        // yetki kuralının tek yerde kalmasını sağlar: `candles` PUBLIC'tir,
+        // token istemez.
         ClientMsg::Candles { symbol, tf, count } => {
-            if crate::candles::tf_millis(&tf).is_none() {
-                let names: Vec<&str> =
-                    crate::candles::TIMEFRAMES.iter().map(|(n, _)| *n).collect();
-                vec![ServerMsg::Error {
-                    msg: format!("gecersiz tf '{tf}' — gecerli: {}", names.join(", ")),
-                }]
-            } else {
-                // Üst sınır: bir istemci 10 milyon bar isteyip belleği
-                // şişirmesin.
-                let n = count.min(crate::candles::MAX_REQUEST);
-                let items = ctx
-                    .candles
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .get(&symbol, &tf, n);
-                vec![ServerMsg::Candles { s: symbol, tf: tf.to_ascii_uppercase(), items }]
-            }
+            candles_from_store(ctx, symbol, tf, count, "off", None)
         }
 
         ClientMsg::Account => vec![ServerMsg::Account { items: collect_accounts(ctx) }],
@@ -532,6 +609,131 @@ fn handle_client_msg(
             ctx, &id, action::SLTP, ticket, 0.0, sl, tp,
         )],
     })
+}
+
+/// Depodaki mumları, kaynağını ve geçmiş çekme durumunu bildirerek paketle.
+///
+/// **Tek kaynak döner**: MT5 barı varsa o, yoksa tick'ten üretilen. İkisi
+/// birleştirilmez — birleşim noktası spread'in yarısı kadar sahte bir fiyat
+/// boşluğu üretirdi (bkz. [`crate::candles`]).
+fn candles_from_store(
+    ctx: &Ctx,
+    symbol: String,
+    tf: String,
+    count: usize,
+    hist: &'static str,
+    hist_note: Option<String>,
+) -> Vec<ServerMsg> {
+    let Some(canon) = crate::candles::canon_tf(&tf) else {
+        let mut names: Vec<&str> = crate::candles::TIMEFRAMES.iter().map(|(n, _)| *n).collect();
+        // D1 tick'ten üretilmiyor ama MT5'ten servis ediliyor; listede olmalı.
+        names.push("D1");
+        return vec![ServerMsg::Error {
+            msg: format!("gecersiz tf '{tf}' — gecerli: {}", names.join(", ")),
+        }];
+    };
+    // Üst sınır: bir istemci 10 milyon bar isteyip belleği şişirmesin.
+    let n = count.min(crate::candles::MAX_REQUEST);
+    let view = ctx
+        .candles
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&symbol, canon, n);
+
+    // Boş cevabın sebebi dilimin kendisi olabilir: D1 tick'ten ÜRETİLMİYOR
+    // (gün sınırı broker sunucusunun günüdür, bizimkiyle tutmaz). Bunu
+    // söylemezsek istemci "veri yok" ile "bu dilim buradan gelmez"i ayırt
+    // edemezdi.
+    let hist_note = if view.is_empty() && crate::candles::tf_millis(canon).is_none() {
+        let why = format!("{canon} yalniz MT5 kaynagindan gelir, tick'ten uretilmez");
+        Some(match hist_note {
+            Some(n) => format!("{n}; {why}"),
+            None => why,
+        })
+    } else {
+        hist_note
+    };
+
+    vec![ServerMsg::Candles {
+        s: symbol,
+        tf: canon.to_string(),
+        src_kind: view.src.name(),
+        items: view.bars,
+        age_ms: view.age_ms,
+        hist,
+        hist_note,
+    }]
+}
+
+/// `candles` isteğinin tam yolu: gerekiyorsa MT5'ten çekmeyi tetikler.
+///
+/// **PUBLIC kalır** — token istemez. Grafik çizen bir istemcinin gizli bir
+/// şeye ihtiyacı yok.
+///
+/// Sıra: (1) depodaki MT5 görüntüsü yeterince taze mi, (2) değilse Service'ten
+/// çek ve bekle, (3) elde ne varsa onu — kaynağını söyleyerek — döndür.
+/// Çekme başarısız olsa bile cevapsız kalmıyoruz; tick'ten üretilene düşüp
+/// `hist` alanında neden düşüldüğünü söylüyoruz.
+async fn candles_op(ctx: &Ctx, symbol: String, tf: String, count: usize) -> Vec<ServerMsg> {
+    let Some(canon) = crate::candles::canon_tf(&tf) else {
+        // Geçersiz dilim: aynı hatayı tek yerden üretelim.
+        return candles_from_store(ctx, symbol, tf, count, "off", None);
+    };
+    let n = count.min(crate::candles::MAX_REQUEST);
+
+    // 1) Depodaki görüntü yeterince taze ve yeterince uzunsa dokunma.
+    let fresh = {
+        let cs = ctx.candles.lock().unwrap_or_else(|e| e.into_inner());
+        cs.mt5_status(&symbol, canon)
+    };
+    if let Some((have, age)) = fresh {
+        if have >= n && age < HIST_REFRESH_MS {
+            return candles_from_store(ctx, symbol, tf, count, "cached", None);
+        }
+    }
+
+    // 2) Çekmeyi dene.
+    let Some((instance, symbol_id)) = ctx.registry.resolve_any(&symbol) else {
+        // Sembol hiçbir örnekte yok; depoda da olamaz ama boş cevabı yine de
+        // kaynağıyla veriyoruz.
+        return candles_from_store(ctx, symbol, tf, count, "off", Some("sembol bulunamadi".into()));
+    };
+    let Some(tx) = ctx.hist_tx.get(&instance) else {
+        return candles_from_store(ctx, symbol, tf, count, "off", None);
+    };
+
+    let (rtx, rrx) = tokio::sync::oneshot::channel();
+    if tx
+        .send(HistCmd {
+            symbol: symbol.clone(),
+            symbol_id,
+            tf: canon.to_string(),
+            count: n as u32,
+            // Sayfalama yok: daima en son barlardan geriye. `to_msc` ile
+            // geriye sayfalamak deponun "son N bar" yüzeyiyle tutarsız
+            // olurdu; ihtiyaç doğduğunda ayrı bir işlem olarak eklenmeli.
+            to_msc: 0,
+            reply: rtx,
+        })
+        .is_err()
+    {
+        return candles_from_store(ctx, symbol, tf, count, "off", Some("okuyucu kapali".into()));
+    }
+
+    let (hist, note) = match tokio::time::timeout(HIST_WAIT, rrx).await {
+        Ok(Ok(HistReply::Done { status, .. })) => (status.name(), status.detail()),
+        Ok(Ok(HistReply::Unavailable)) => ("off", Some("MQL5 Service calismiyor".into())),
+        Ok(Ok(HistReply::Refused(why))) => ("refused", Some(why)),
+        // Okuyucu thread'i cevap kanalını düşürdü.
+        Ok(Err(_)) => ("refused", Some("okuyucu cevap vermedi".into())),
+        Err(_) => (
+            HistStatus::TimedOut { got: 0 }.name(),
+            Some("cekirdek beklemesi doldu".into()),
+        ),
+    };
+
+    // 3) Elde ne varsa onu, kaynağını söyleyerek ver.
+    candles_from_store(ctx, symbol, tf, count, hist, note)
 }
 
 /// Emir öncesi ortak denetimler; hata varsa `Err(ServerMsg)`.
@@ -899,15 +1101,7 @@ mod tests {
         let ev = |sym: &str, tf: &'static str| FeedEvent::Candle {
             symbol: Arc::from(sym),
             tf,
-            bar: crate::candles::Bar {
-                t: 0,
-                o: 1.0,
-                h: 1.0,
-                l: 1.0,
-                c: 1.0,
-                ticks: 1,
-                partial: false,
-            },
+            bar: crate::candles::Bar { t: 0, o: 1.0, h: 1.0, l: 1.0, c: 1.0, ticks: 1, ..Default::default() },
         };
 
         assert!(!s.wants(&ev("EURUSD", "M1")), "abone olmadan gitmemeli");
@@ -1040,12 +1234,14 @@ mod tests {
             registry: Arc::new(Registry::default()),
             events,
             cmd_tx: HashMap::new(),
+            hist_tx: HashMap::new(),
             token: token.map(str::to_owned),
             trading: true,
             allow_live: false,
             deviation: 20,
             orders: Arc::new(OrderTracker::new()),
             candles: Arc::new(Mutex::new(crate::candles::CandleStore::new())),
+            hist_slots: Arc::new(tokio::sync::Semaphore::new(HIST_SLOTS)),
         }
     }
 
@@ -1143,5 +1339,268 @@ mod tests {
         assert!(subs.tick_all, "tick aboneligi kurulmali");
         assert!(!subs.orders, "emir kanali token olmadan acilmamali");
         assert!(matches!(out.first(), Some(ServerMsg::Error { .. })));
+    }
+
+    // --- geçmiş / mum kaynağı ---
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+    }
+
+    fn mt5_bar(t: i64, c: f64) -> crate::candles::Bar {
+        crate::candles::Bar {
+            t,
+            o: c,
+            h: c,
+            l: c,
+            c,
+            ticks: 10,
+            spread: Some(9),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn candles_is_public_even_with_a_token_configured() {
+        // Grafik çizen istemci token istemez; bu kural yalnız `handle_client_msg`
+        // içinde değil, işlemin kendisinde de geçerli.
+        let ctx = ctx_with(Some("gizli"));
+        let mut level = start_level(&ctx);
+        let mut subs = Subs::default();
+        let out = handle_client_msg(
+            ClientMsg::Candles { symbol: "EURUSD".into(), tf: "M1".into(), count: 10 },
+            &ctx,
+            &mut subs,
+            &mut level,
+        )
+        .unwrap();
+        assert!(matches!(out.first(), Some(ServerMsg::Candles { .. })), "token istememeli: {out:?}");
+
+        let out = rt().block_on(candles_op(&ctx, "EURUSD".into(), "M1".into(), 10));
+        assert!(matches!(out.first(), Some(ServerMsg::Candles { .. })));
+    }
+
+    #[test]
+    fn answer_reports_the_source_and_never_mixes_the_two() {
+        // MT5 serisi (BID) ile tick serisi (MID) aynı fiyat serisi değil.
+        let ctx = ctx_with(None);
+        {
+            let mut cs = ctx.candles.lock().unwrap();
+            let base: i64 = 1_700_000_000_000 - 1_700_000_000_000i64.rem_euclid(60_000);
+            for i in 0..3 {
+                cs.on_tick("EURUSD", 1.1000, 1.1002, base + i * 60_000 + 500);
+            }
+        }
+
+        // Önce MT5 yok: tick kaynağı bildirilmeli.
+        let out = rt().block_on(candles_op(&ctx, "EURUSD".into(), "M1".into(), 100));
+        match &out[0] {
+            ServerMsg::Candles { src_kind, items, age_ms, hist, .. } => {
+                assert_eq!(*src_kind, "tick");
+                assert_eq!(items.len(), 3);
+                assert!(age_ms.is_none(), "tick serisi canli");
+                // Kayıtlı örnek yok → geçmiş kanalı da yok.
+                assert_eq!(*hist, "off");
+            }
+            other => panic!("beklenmeyen: {other:?}"),
+        }
+
+        // MT5 barı gelince O dönmeli ve tick barları KARIŞMAMALI.
+        ctx.candles.lock().unwrap().ingest_mt5("EURUSD", "M1", &[mt5_bar(1_699_000_000_000, 1.0900)]);
+        let out = rt().block_on(candles_op(&ctx, "EURUSD".into(), "M1".into(), 100));
+        match &out[0] {
+            ServerMsg::Candles { src_kind, items, age_ms, .. } => {
+                assert_eq!(*src_kind, "mt5");
+                assert_eq!(items.len(), 1, "tick barlari eklenmemeli");
+                assert!(age_ms.is_some(), "goruntunun yasi bildirilmeli");
+            }
+            other => panic!("beklenmeyen: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_client_request_triggers_the_mt5_fetch_and_the_answer_says_so() {
+        // Sahte okuyucu thread'i: isteği alır, barları depoya işler, cevaplar.
+        let mut ctx = ctx_with(None);
+        let (h_tx, h_rx) = std::sync::mpsc::channel::<HistCmd>();
+        ctx.hist_tx.insert("mt5-1".into(), h_tx);
+        ctx.registry.set_symbols("mt5-1", vec![{
+            let mut e = sinyal_proto::SymbolEntry { symbol_id: 3, ..Default::default() };
+            sinyal_proto::write_fixed_str(&mut e.name, "EURUSD");
+            e
+        }]);
+
+        let store = ctx.candles.clone();
+        let reader = std::thread::spawn(move || {
+            let cmd = h_rx.recv().expect("istek gelmeli");
+            assert_eq!(cmd.symbol, "EURUSD");
+            assert_eq!(cmd.symbol_id, 3, "sembol kaydindan cozulmeli");
+            assert_eq!(cmd.tf, "H4", "kanonik dilim adi gitmeli");
+            assert_eq!(cmd.count, 50);
+            store.lock().unwrap().ingest_mt5(
+                "EURUSD",
+                "H4",
+                &[mt5_bar(1_700_000_000_000, 1.2345)],
+            );
+            let _ = cmd.reply.send(HistReply::Done { status: HistStatus::Complete, bars: 1 });
+        });
+
+        let out = rt().block_on(candles_op(&ctx, "EURUSD".into(), "h4".into(), 50));
+        reader.join().unwrap();
+        match &out[0] {
+            ServerMsg::Candles { tf, src_kind, items, hist, hist_note, .. } => {
+                assert_eq!(tf, "H4");
+                assert_eq!(*src_kind, "mt5");
+                assert_eq!(*hist, "ok");
+                assert!(hist_note.is_none());
+                assert!((items[0].c - 1.2345).abs() < 1e-12);
+            }
+            other => panic!("beklenmeyen: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn incomplete_delivery_is_surfaced_to_the_client() {
+        // Bar halkası dolarsa barlar KALICI kaybolur; istemci delikli seriyi
+        // tam sanmamalı.
+        let mut ctx = ctx_with(None);
+        let (h_tx, h_rx) = std::sync::mpsc::channel::<HistCmd>();
+        ctx.hist_tx.insert("mt5-1".into(), h_tx);
+        ctx.registry.set_symbols("mt5-1", vec![{
+            let mut e = sinyal_proto::SymbolEntry::default();
+            sinyal_proto::write_fixed_str(&mut e.name, "EURUSD");
+            e
+        }]);
+
+        let store = ctx.candles.clone();
+        let reader = std::thread::spawn(move || {
+            let cmd = h_rx.recv().unwrap();
+            store.lock().unwrap().ingest_mt5("EURUSD", "M1", &[mt5_bar(1_700_000_000_000, 1.0)]);
+            let _ = cmd.reply.send(HistReply::Done {
+                status: HistStatus::Incomplete { expected: 500, got: 1 },
+                bars: 1,
+            });
+        });
+
+        let out = rt().block_on(candles_op(&ctx, "EURUSD".into(), "M1".into(), 500));
+        reader.join().unwrap();
+        match &out[0] {
+            ServerMsg::Candles { hist, hist_note, .. } => {
+                assert_eq!(*hist, "incomplete");
+                assert!(hist_note.as_ref().unwrap().contains("1/500"), "eksiklik yazilmali");
+            }
+            other => panic!("beklenmeyen: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_dead_history_channel_still_produces_an_answer() {
+        // Okuyucu cevap vermezse istemciyi asmıyoruz: elimizdeki tick
+        // barlarını, neden MT5 gelmediğini söyleyerek veriyoruz.
+        let mut ctx = ctx_with(None);
+        let (h_tx, h_rx) = std::sync::mpsc::channel::<HistCmd>();
+        ctx.hist_tx.insert("mt5-1".into(), h_tx);
+        ctx.registry.set_symbols("mt5-1", vec![{
+            let mut e = sinyal_proto::SymbolEntry::default();
+            sinyal_proto::write_fixed_str(&mut e.name, "EURUSD");
+            e
+        }]);
+        ctx.candles.lock().unwrap().on_tick("EURUSD", 1.1, 1.1, 1_700_000_000_000);
+
+        // İsteği al ve cevap kanalını DÜŞÜR (okuyucu öldü).
+        let reader = std::thread::spawn(move || {
+            let cmd = h_rx.recv().unwrap();
+            drop(cmd.reply);
+        });
+
+        let out = rt().block_on(candles_op(&ctx, "EURUSD".into(), "M1".into(), 10));
+        reader.join().unwrap();
+        match &out[0] {
+            ServerMsg::Candles { src_kind, items, hist, .. } => {
+                assert_eq!(*src_kind, "tick", "MT5 gelmezse tick'e dusulmeli");
+                assert_eq!(items.len(), 1);
+                assert_eq!(*hist, "refused");
+            }
+            other => panic!("beklenmeyen: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_fresh_snapshot_is_not_refetched() {
+        // Her istekte çekmek `CopyRates`'i sürekli meşgul ederdi. Kanal
+        // BAĞLI ama okuyucu yok: istek gitseydi test zaman aşımına düşerdi.
+        let mut ctx = ctx_with(None);
+        let (h_tx, h_rx) = std::sync::mpsc::channel::<HistCmd>();
+        ctx.hist_tx.insert("mt5-1".into(), h_tx);
+        ctx.candles.lock().unwrap().ingest_mt5("EURUSD", "M1", &[mt5_bar(1_700_000_000_000, 1.0)]);
+
+        let out = rt().block_on(candles_op(&ctx, "EURUSD".into(), "M1".into(), 1));
+        match &out[0] {
+            ServerMsg::Candles { hist, src_kind, .. } => {
+                assert_eq!(*hist, "cached");
+                assert_eq!(*src_kind, "mt5");
+            }
+            other => panic!("beklenmeyen: {other:?}"),
+        }
+        assert!(h_rx.try_recv().is_err(), "taze goruntu icin yeniden cekilmemeli");
+    }
+
+    #[test]
+    fn an_empty_d1_answer_explains_that_it_cannot_come_from_ticks() {
+        // "veri yok" ile "bu dilim tick'ten uretilmiyor" ayni sey degil.
+        let ctx = ctx_with(None);
+        ctx.candles.lock().unwrap().on_tick("EURUSD", 1.1, 1.1, 1_700_000_000_000);
+
+        let out = rt().block_on(candles_op(&ctx, "EURUSD".into(), "D1".into(), 10));
+        match &out[0] {
+            ServerMsg::Candles { tf, items, hist_note, .. } => {
+                assert_eq!(tf, "D1");
+                assert!(items.is_empty());
+                assert!(
+                    hist_note.as_ref().unwrap().contains("tick'ten uretilmez"),
+                    "sebep soylenmeli: {hist_note:?}"
+                );
+            }
+            other => panic!("beklenmeyen: {other:?}"),
+        }
+
+        // M1 boş dönse bile böyle bir not OLMAMALI — o dilim tick'ten üretilir.
+        let out = rt().block_on(candles_op(&ctx, "YOKSUN".into(), "M1".into(), 10));
+        match &out[0] {
+            ServerMsg::Candles { hist_note, .. } => {
+                assert!(
+                    hist_note.as_deref() != Some("M1 yalniz MT5 kaynagindan gelir, tick'ten uretilmez"),
+                    "M1 tick'ten uretilebilir"
+                );
+            }
+            other => panic!("beklenmeyen: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn concurrent_history_fetches_are_capped_so_the_terminal_is_not_hammered() {
+        // `candles` PUBLIC. Sinirsiz birakmak, token'siz bir istemcinin
+        // `CopyRates` uzerinden ticaret terminalini yavaslatmasi demekti.
+        let sem = Arc::new(tokio::sync::Semaphore::new(HIST_SLOTS));
+        let mut held = Vec::new();
+        for _ in 0..HIST_SLOTS {
+            held.push(sem.clone().try_acquire_owned().expect("tavan kadar izin verilmeli"));
+        }
+        assert!(sem.clone().try_acquire_owned().is_err(), "tavan asilmamali");
+        drop(held.pop());
+        assert!(sem.clone().try_acquire_owned().is_ok(), "biten istek yerini birakmali");
+    }
+
+    #[test]
+    fn invalid_timeframe_is_refused_and_lists_the_mt5_only_one() {
+        let ctx = ctx_with(None);
+        let out = rt().block_on(candles_op(&ctx, "EURUSD".into(), "M2".into(), 10));
+        match &out[0] {
+            ServerMsg::Error { msg } => {
+                assert!(msg.contains("M2"));
+                assert!(msg.contains("D1"), "D1 mt5'ten servis ediliyor, listede olmali: {msg}");
+            }
+            other => panic!("beklenmeyen: {other:?}"),
+        }
     }
 }

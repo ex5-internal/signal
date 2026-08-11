@@ -1,0 +1,500 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sinyal — Canlı Grafik</title>
+<!--
+  Sinyal WS grafik istemcisi — tek dosya, bağımlılık yok.
+
+  NEDEN file:// veya http:// ile açılmalı
+  ---------------------------------------
+  Bu sayfa `ws://` ile bağlanır. Tarayıcılar `https://` bir sayfadan `ws://`
+  bağlantısını "karışık içerik" diye ENGELLER. Sunucuda TLS olmadığı için
+  sayfa da güvensiz bir kaynaktan açılmalı: dosyaya çift tıklamak (file://)
+  veya düz http ile sunmak. TLS eklenirse `wss://` yazıp https'ten açılabilir.
+
+  Protokol notları (koddan doğrulandı)
+  ------------------------------------
+  - `candle` mesajı YALNIZCA bar KAPANDIĞINDA gelir. Oluşmakta olan barın
+    hareketi için `tick` akışı şart; son barı biz mid=(b+a)/2 ile güncelliyoruz
+    (çekirdek de mumları mid'den üretiyor, aynı hesap).
+  - Bar alanları kısaltmalı: t(açılış, epoch ms, BROKER saati), o, h, l, c,
+    ticks(bar içi tick sayısı — gerçek hacim DEĞİL), partial(false ise alan yok).
+  - Kanal adında sembol büyük/küçük harf DUYARLI, dilim büyük harfe çevrilir.
+    `candle.SEMBOL.TF` geçerli, `candle.SEMBOL.*` GEÇERSİZ (sessizce yok sayılır).
+  - `lagged` gelirse akışta boşluk oluşmuştur → geçmişi yeniden çekiyoruz.
+  - Grafik yüzeyi token istemez. Bu sayfa hiçbir emir göndermez.
+-->
+<style>
+  :root {
+    --bg: #0e1116; --panel: #161b22; --line: #272e38; --text: #e6edf3;
+    --dim: #8b949e; --up: #26a69a; --down: #ef5350; --accent: #58a6ff;
+    --warn: #d29922; --bad: #f85149; --grid: #1c2430;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #ffffff; --panel: #f6f8fa; --line: #d0d7de; --text: #1f2328;
+      --dim: #656d76; --up: #16a34a; --down: #dc2626; --accent: #0969da;
+      --warn: #9a6700; --bad: #cf222e; --grid: #eaeef2;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text); display: flex; flex-direction: column;
+    font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  header {
+    display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+    padding: 8px 10px; background: var(--panel); border-bottom: 1px solid var(--line);
+  }
+  input, select, button {
+    background: var(--bg); color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 5px 8px; font: inherit;
+  }
+  input:focus, select:focus { outline: 1px solid var(--accent); }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  #url { width: 260px; }
+  .sp { flex: 1; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); display: inline-block; }
+  .dot.ok { background: var(--up); }
+  .dot.bad { background: var(--bad); }
+  .dot.wait { background: var(--warn); }
+  #status { color: var(--dim); white-space: nowrap; }
+  #wrap { flex: 1; position: relative; min-height: 0; }
+  canvas { display: block; width: 100%; height: 100%; cursor: crosshair; }
+  #hud {
+    position: absolute; top: 8px; left: 10px; pointer-events: none;
+    background: color-mix(in srgb, var(--panel) 88%, transparent);
+    border: 1px solid var(--line); border-radius: 6px; padding: 6px 9px;
+    font-size: 12px; white-space: pre; color: var(--text);
+  }
+  #note {
+    position: absolute; bottom: 8px; left: 10px; right: 10px; pointer-events: none;
+    color: var(--warn); font-size: 12px;
+  }
+  footer {
+    padding: 5px 10px; background: var(--panel); border-top: 1px solid var(--line);
+    color: var(--dim); font-size: 12px; display: flex; gap: 14px; flex-wrap: wrap;
+  }
+  b { color: var(--text); font-weight: 600; }
+</style>
+</head>
+<body>
+
+<header>
+  <span class="dot" id="dot"></span>
+  <input id="url" value="ws://144.76.111.177:8787" spellcheck="false" title="WebSocket adresi">
+  <select id="sym"><option>EURUSD</option></select>
+  <select id="tf">
+    <option>M1</option><option>M5</option><option>M15</option>
+    <option>M30</option><option>H1</option><option>H4</option>
+  </select>
+  <button id="go">Bağlan</button>
+  <button id="fit">Sığdır</button>
+  <span class="sp"></span>
+  <span id="status">bağlı değil</span>
+</header>
+
+<div id="wrap">
+  <canvas id="cv"></canvas>
+  <div id="hud"></div>
+  <div id="note"></div>
+</div>
+
+<footer>
+  <span>bar: <b id="nbars">0</b></span>
+  <span>son: <b id="last">—</b></span>
+  <span>spread: <b id="spread">—</b></span>
+  <span>gecikme: <b id="lat">—</b></span>
+  <span>tick: <b id="ntick">0</b></span>
+  <span id="srvinfo"></span>
+</footer>
+
+<script>
+"use strict";
+
+// ---------- durum ----------
+const S = {
+  ws: null, bars: [], sym: "EURUSD", tf: "M1", digits: 5, point: 0.00001,
+  tfMs: 60000, ntick: 0, lastBid: 0, lastAsk: 0, lastLat: 0,
+  view: { off: 0, span: 160 },   // off = sağdan kaç bar geride, span = görünen bar
+  mouse: null, retry: 0, timer: null, symbolsSeen: false,
+};
+
+const TF_MS = { M1: 60000, M5: 300000, M15: 900000, M30: 1800000, H1: 3600000, H4: 14400000 };
+
+const $ = (id) => document.getElementById(id);
+const cv = $("cv"), ctx = cv.getContext("2d");
+
+// ---------- yardımcılar ----------
+function fmt(p) { return p.toFixed(S.digits); }
+function css(v) { return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+
+function setStatus(text, cls) {
+  $("status").textContent = text;
+  $("dot").className = "dot" + (cls ? " " + cls : "");
+}
+function note(msg) { $("note").textContent = msg || ""; }
+
+// Broker saati epoch ms → okunur etiket. Broker saati UTC değildir; olduğu gibi
+// gösteriyoruz ki grafikteki bar sınırları sunucudakiyle birebir örtüşsün.
+function tlabel(ms, withDate) {
+  const d = new Date(ms);
+  const p = (n) => String(n).padStart(2, "0");
+  const hm = p(d.getUTCHours()) + ":" + p(d.getUTCMinutes());
+  return withDate ? p(d.getUTCDate()) + "." + p(d.getUTCMonth() + 1) + " " + hm : hm;
+}
+
+// ---------- bağlantı ----------
+function connect() {
+  if (S.ws) { try { S.ws.close(); } catch (e) {} S.ws = null; }
+  clearTimeout(S.timer);
+
+  S.sym = $("sym").value;
+  S.tf = $("tf").value;
+  S.tfMs = TF_MS[S.tf] || 60000;
+  S.bars = []; S.ntick = 0; S.symbolsSeen = false;
+  note("");
+  setStatus("bağlanılıyor…", "wait");
+
+  let ws;
+  try { ws = new WebSocket($("url").value.trim()); }
+  catch (e) { setStatus("geçersiz adres", "bad"); note(String(e && e.message || e)); return; }
+  S.ws = ws;
+
+  ws.onopen = () => {
+    S.retry = 0;
+    setStatus("bağlı", "ok");
+    // Sembol tablosu: digits/point fiyat biçimlemesi için gerekli.
+    send({ op: "symbols" });
+    requestHistory();
+    // Kanal adında sembol büyük/küçük harf duyarlı, dilim büyük harf.
+    send({ op: "subscribe", channels: ["tick." + S.sym, "candle." + S.sym + "." + S.tf] });
+  };
+
+  ws.onmessage = (ev) => {
+    // Sunucu bir çerçevede birden fazla satır gönderebilir.
+    for (const line of String(ev.data).split("\n")) {
+      const s = line.trim();
+      if (!s) continue;
+      let m; try { m = JSON.parse(s); } catch (e) { continue; }
+      handle(m);
+    }
+    draw();
+  };
+
+  ws.onerror = () => setStatus("bağlantı hatası", "bad");
+
+  ws.onclose = (e) => {
+    if (S.ws !== ws) return;
+    S.ws = null;
+    const wait = Math.min(15000, 800 * Math.pow(2, S.retry++));
+    setStatus("kapandı (" + e.code + ") — " + Math.round(wait / 1000) + " sn sonra tekrar", "bad");
+    S.timer = setTimeout(connect, wait);
+  };
+}
+
+function send(o) {
+  if (S.ws && S.ws.readyState === 1) S.ws.send(JSON.stringify(o));
+}
+
+function requestHistory() {
+  send({ op: "candles", symbol: S.sym, tf: S.tf, count: 1000 });
+}
+
+// ---------- mesaj işleme ----------
+function handle(m) {
+  switch (m.t) {
+    case "hello": {
+      const bits = [];
+      bits.push("proto " + m.proto);
+      bits.push(m.level);
+      if (m.trading) bits.push("ticaret açık");
+      $("srvinfo").textContent = "sunucu: " + bits.join(" · ") + " · " + (m.instances || []).join(",");
+      break;
+    }
+
+    case "symbols": {
+      S.symbolsSeen = true;
+      const sel = $("sym");
+      const names = [...new Set((m.items || []).map((x) => x.s))].sort();
+      if (names.length) {
+        const cur = S.sym;
+        sel.innerHTML = "";
+        for (const n of names) {
+          const o = document.createElement("option");
+          o.value = o.textContent = n;
+          if (n === cur) o.selected = true;
+          sel.appendChild(o);
+        }
+        if (!names.includes(cur)) note("dikkat: '" + cur + "' sunucuda yok — listeden seçin");
+      }
+      const me = (m.items || []).find((x) => x.s === S.sym);
+      if (me) {
+        S.digits = me.digits;
+        S.point = me.point;
+        if (me.ready === false) note("dikkat: " + S.sym + " sunucuda 'hazır' değil, fiyata güvenmeyin");
+      }
+      break;
+    }
+
+    case "candles": {
+      // Sunucu istekteki symbol'ü aynen yankılar, tf'yi büyük harfe çevirir.
+      if (m.s !== S.sym || m.tf !== S.tf) break;
+      S.bars = (m.items || []).slice();
+      $("nbars").textContent = S.bars.length;
+      fitView();
+      if (!S.bars.length) {
+        note("Bu sembol/dilim için sunucuda hiç bar yok. Mumlar daemon çalıştığı " +
+             "sürece birikir — geriye dönük geçmiş henüz yok.");
+      } else if (S.bars[0].partial) {
+        note("İlk bar kısmi (daemon barın ortasında başlamış) — açılış fiyatı gerçek açılış değil.");
+      } else {
+        note("");
+      }
+      break;
+    }
+
+    case "candle": {
+      // YALNIZCA bar kapandığında gelir.
+      if (m.s !== S.sym || m.tf !== S.tf) break;
+      const b = m.bar;
+      const last = S.bars[S.bars.length - 1];
+      if (last && last.t === b.t) S.bars[S.bars.length - 1] = b;
+      else {
+        S.bars.push(b);
+        // Sağ kenarı takip ediyorsak orada kal.
+        if (S.view.off === 0) { /* otomatik kayar */ }
+        else S.view.off += 1;
+      }
+      $("nbars").textContent = S.bars.length;
+      break;
+    }
+
+    case "tick": {
+      if (m.s !== S.sym) break;
+      S.ntick++; S.lastBid = m.b; S.lastAsk = m.a; S.lastLat = m.lat_us;
+      $("ntick").textContent = S.ntick;
+      $("last").textContent = fmt(m.b);
+      $("spread").textContent = S.point
+        ? Math.round((m.a - m.b) / S.point) + " puan"
+        : (m.a - m.b).toFixed(S.digits);
+      $("lat").textContent = (m.lat_us / 1000).toFixed(1) + " ms";
+      applyTick(m);
+      break;
+    }
+
+    case "lagged":
+      // Akışta boşluk oluştu; geçmişi yeniden çekmek tek doğru davranış.
+      note("akışın gerisine düşüldü (" + m.dropped + " mesaj atlandı) — geçmiş yenileniyor");
+      requestHistory();
+      break;
+
+    case "error":
+      note("sunucu hatası: " + m.msg);
+      break;
+  }
+}
+
+// Oluşmakta olan barı tick'ten güncelle. Çekirdek mumları mid'den ürettiği için
+// biz de mid kullanıyoruz; aksi halde canlı bar kapanınca fiyat zıplardı.
+function applyTick(m) {
+  const mid = (m.b && m.a) ? (m.b + m.a) / 2 : (m.b || m.a);
+  if (!mid) return;
+  const bucket = m.ms - ((m.ms % S.tfMs) + S.tfMs) % S.tfMs;
+  const last = S.bars[S.bars.length - 1];
+
+  if (last && last.t === bucket) {
+    if (mid > last.h) last.h = mid;
+    if (mid < last.l) last.l = mid;
+    last.c = mid;
+    last.ticks = (last.ticks || 0) + 1;
+  } else if (!last || bucket > last.t) {
+    S.bars.push({ t: bucket, o: mid, h: mid, l: mid, c: mid, ticks: 1, partial: false });
+    if (S.view.off > 0) S.view.off += 1;
+    $("nbars").textContent = S.bars.length;
+  }
+}
+
+// ---------- görünüm ----------
+function fitView() {
+  S.view.off = 0;
+  S.view.span = Math.max(20, Math.min(S.bars.length || 160, 160));
+}
+
+function visible() {
+  const n = S.bars.length;
+  if (!n) return { from: 0, to: 0, arr: [] };
+  const to = Math.max(1, n - S.view.off);
+  const from = Math.max(0, to - S.view.span);
+  return { from, to, arr: S.bars.slice(from, to) };
+}
+
+function draw() {
+  const dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth, h = cv.clientHeight;
+  if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) {
+    cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr);
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+
+  const C = {
+    text: css("--text"), dim: css("--dim"), up: css("--up"), down: css("--down"),
+    grid: css("--grid"), line: css("--line"), accent: css("--accent"),
+  };
+
+  const padR = 74, padB = 24, padT = 8, padL = 6;
+  const volH = Math.min(70, h * 0.16);
+  const plotW = w - padR - padL;
+  const plotH = h - padB - padT - volH - 6;
+
+  const { arr, from } = visible();
+  if (!arr.length) {
+    ctx.fillStyle = C.dim;
+    ctx.font = "13px ui-monospace, monospace";
+    ctx.fillText("veri yok", padL + 8, padT + 20);
+    return;
+  }
+
+  let lo = Infinity, hi = -Infinity, vmax = 0;
+  for (const b of arr) { if (b.l < lo) lo = b.l; if (b.h > hi) hi = b.h; if ((b.ticks || 0) > vmax) vmax = b.ticks || 0; }
+  if (!(hi > lo)) { hi = lo + (S.point || 0.0001) * 10; }
+  const pad = (hi - lo) * 0.08;
+  lo -= pad; hi += pad;
+
+  const X = (i) => padL + ((i + 0.5) / arr.length) * plotW;
+  const Y = (p) => padT + (1 - (p - lo) / (hi - lo)) * plotH;
+  const bw = Math.max(1, Math.min(14, (plotW / arr.length) * 0.68));
+
+  // yatay ızgara + fiyat ekseni
+  ctx.font = "11px ui-monospace, monospace";
+  ctx.textBaseline = "middle";
+  const steps = 6;
+  for (let i = 0; i <= steps; i++) {
+    const p = lo + ((hi - lo) * i) / steps;
+    const y = Y(p);
+    ctx.strokeStyle = C.grid; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(padL, Math.round(y) + 0.5); ctx.lineTo(padL + plotW, Math.round(y) + 0.5); ctx.stroke();
+    ctx.fillStyle = C.dim;
+    ctx.fillText(fmt(p), padL + plotW + 6, y);
+  }
+
+  // dikey ızgara + zaman ekseni
+  ctx.textBaseline = "top";
+  const every = Math.max(1, Math.round(arr.length / 8));
+  for (let i = 0; i < arr.length; i += every) {
+    const x = Math.round(X(i)) + 0.5;
+    ctx.strokeStyle = C.grid;
+    ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, padT + plotH); ctx.stroke();
+    ctx.fillStyle = C.dim;
+    ctx.fillText(tlabel(arr[i].t, S.tfMs >= 3600000), x - 16, h - padB + 5);
+  }
+
+  // hacim (tick sayısı) alt panel
+  const volTop = padT + plotH + 6;
+  for (let i = 0; i < arr.length; i++) {
+    const b = arr[i];
+    const v = b.ticks || 0;
+    if (!vmax || !v) continue;
+    const bh = (v / vmax) * volH;
+    ctx.fillStyle = b.c >= b.o ? C.up : C.down;
+    ctx.globalAlpha = 0.35;
+    ctx.fillRect(X(i) - bw / 2, volTop + volH - bh, bw, bh);
+    ctx.globalAlpha = 1;
+  }
+
+  // mumlar
+  for (let i = 0; i < arr.length; i++) {
+    const b = arr[i];
+    const up = b.c >= b.o;
+    const col = up ? C.up : C.down;
+    const x = X(i);
+    ctx.strokeStyle = col; ctx.fillStyle = col; ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(Math.round(x) + 0.5, Y(b.h));
+    ctx.lineTo(Math.round(x) + 0.5, Y(b.l));
+    ctx.stroke();
+    const y1 = Y(b.o), y2 = Y(b.c);
+    const top = Math.min(y1, y2), hgt = Math.max(1, Math.abs(y2 - y1));
+    ctx.fillRect(x - bw / 2, top, bw, hgt);
+    // Kısmi bar: gerçek açılışı bilinmiyor, kesikli çerçeveyle işaretle.
+    if (b.partial) {
+      ctx.save(); ctx.setLineDash([2, 2]); ctx.strokeStyle = css("--warn");
+      ctx.strokeRect(x - bw / 2 - 1, top - 1, bw + 2, hgt + 2); ctx.restore();
+    }
+  }
+
+  // son fiyat çizgisi
+  const lastBar = arr[arr.length - 1];
+  const ly = Y(lastBar.c);
+  ctx.save();
+  ctx.setLineDash([4, 3]);
+  ctx.strokeStyle = C.accent; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(padL, Math.round(ly) + 0.5); ctx.lineTo(padL + plotW, Math.round(ly) + 0.5); ctx.stroke();
+  ctx.restore();
+  ctx.fillStyle = C.accent; ctx.textBaseline = "middle";
+  ctx.fillRect(padL + plotW + 2, ly - 8, padR - 6, 16);
+  ctx.fillStyle = css("--bg");
+  ctx.fillText(fmt(lastBar.c), padL + plotW + 6, ly);
+
+  // imleç
+  let hud = S.sym + "  " + S.tf + "\n";
+  let bi = arr.length - 1;
+  if (S.mouse && S.mouse.x > padL && S.mouse.x < padL + plotW) {
+    bi = Math.max(0, Math.min(arr.length - 1, Math.floor(((S.mouse.x - padL) / plotW) * arr.length)));
+    const x = Math.round(X(bi)) + 0.5;
+    ctx.save();
+    ctx.setLineDash([3, 3]); ctx.strokeStyle = C.dim;
+    ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, padT + plotH + 6 + volH); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(padL, S.mouse.y + 0.5); ctx.lineTo(padL + plotW, S.mouse.y + 0.5); ctx.stroke();
+    ctx.restore();
+  }
+  const b = arr[bi];
+  const chg = b.o ? ((b.c - b.o) / b.o) * 100 : 0;
+  hud += tlabel(b.t, true) + "\n";
+  hud += "A " + fmt(b.o) + "   Y " + fmt(b.h) + "\n";
+  hud += "D " + fmt(b.l) + "   K " + fmt(b.c) + "\n";
+  hud += "değişim " + (chg >= 0 ? "+" : "") + chg.toFixed(3) + "%   tick " + (b.ticks || 0);
+  if (b.partial) hud += "\n⚠ kısmi bar";
+  $("hud").textContent = hud;
+}
+
+// ---------- etkileşim ----------
+cv.addEventListener("mousemove", (e) => {
+  const r = cv.getBoundingClientRect();
+  S.mouse = { x: e.clientX - r.left, y: e.clientY - r.top };
+  if (S.drag) {
+    const dx = e.clientX - S.drag.x;
+    const perBar = Math.max(1, (cv.clientWidth - 80) / S.view.span);
+    const shift = Math.round(dx / perBar);
+    if (shift) {
+      S.view.off = Math.max(0, Math.min(Math.max(0, S.bars.length - 10), S.drag.off + shift));
+      draw();
+    }
+  } else draw();
+});
+cv.addEventListener("mouseleave", () => { S.mouse = null; draw(); });
+cv.addEventListener("mousedown", (e) => { S.drag = { x: e.clientX, off: S.view.off }; });
+window.addEventListener("mouseup", () => { S.drag = null; });
+cv.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  const f = e.deltaY > 0 ? 1.15 : 1 / 1.15;
+  S.view.span = Math.max(20, Math.min(2000, Math.round(S.view.span * f)));
+  draw();
+}, { passive: false });
+
+window.addEventListener("resize", draw);
+$("go").onclick = connect;
+$("fit").onclick = () => { fitView(); draw(); };
+$("sym").onchange = $("tf").onchange = () => { if (S.ws) connect(); };
+$("url").addEventListener("keydown", (e) => { if (e.key === "Enter") connect(); });
+
+connect();
+draw();
+</script>
+</body>
+</html>

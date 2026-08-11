@@ -18,8 +18,9 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 use std::sync::Mutex;
 
-use sinyal_proto::{Book, BookLevel, Cmd, Res, SymbolEntry, Tick, MAX_BOOK_DEPTH};
+use sinyal_proto::{BarRec, Book, BookLevel, Cmd, HistReq, Res, SymbolEntry, Tick, MAX_BOOK_DEPTH};
 
+use crate::hist::HistSession;
 use crate::session::{Capacities, Session};
 
 /// İşlem başarılı.
@@ -48,6 +49,10 @@ pub mod sizeof_what {
     pub const ACCOUNT: i32 = 7;
     pub const POSITION: i32 = 8;
     pub const ORDER: i32 = 9;
+    /// Geçmiş kanalı — service `HistReq`'i bu kodla doğrular.
+    pub const HIST_REQ: i32 = 10;
+    /// Geçmiş kanalı — service `BarRec`'i bu kodla doğrular.
+    pub const BAR_REC: i32 = 11;
     /// Protokol sürümü (boyut değil).
     pub const PROTO_VERSION: i32 = 100;
 }
@@ -71,15 +76,19 @@ const MAX_SESSIONS: usize = 64;
 /// Şimdi tanıtıcı bir **indeks + kuşak** çiftidir. Doğrulama yalnızca kendi
 /// tablomuzdaki atomik değerleri okur; çağırandan gelen sayı asla adres olarak
 /// kullanılmaz. Yalnızca kendi sakladığımız işaretçiyi dereference ederiz.
-struct Slot {
+///
+/// Tip parametresi sayesinde her oturum türü KENDİ tablosunu kullanır: bir
+/// `Session` tanıtıcısının `HistSession` olarak çözülmesi tip düzeyinde
+/// imkânsız, ayrıca [`TAG_HIST`] biti sayısal olarak da ayırıyor.
+struct Slot<T> {
     /// Slot kullanımda mı (tahsis yarışını çözer).
     claimed: AtomicBool,
     /// Her tahsiste artar; eski tanıtıcıları anında geçersizleştirir.
     generation: AtomicU32,
-    ptr: AtomicPtr<Handle>,
+    ptr: AtomicPtr<T>,
 }
 
-impl Slot {
+impl<T> Slot<T> {
     const fn new() -> Self {
         Self {
             claimed: AtomicBool::new(false),
@@ -89,23 +98,49 @@ impl Slot {
     }
 }
 
-static SLOTS: [Slot; MAX_SESSIONS] = [const { Slot::new() }; MAX_SESSIONS];
+static SLOTS: [Slot<Handle>; MAX_SESSIONS] = [const { Slot::new() }; MAX_SESSIONS];
+static HIST_SLOTS: [Slot<HistHandle>; MAX_SESSIONS] = [const { Slot::new() }; MAX_SESSIONS];
 
 struct Handle {
     session: Session,
 }
 
-/// Tanıtıcı = (kuşak << 32) | indeks. Kuşak 1'den başladığı için geçerli bir
-/// tanıtıcı asla 0 olmaz — 0 güvenle "geçersiz" anlamına gelir.
-#[inline]
-fn encode(index: usize, generation: u32) -> i64 {
-    (((generation as u64) << 32) | index as u64) as i64
+struct HistHandle {
+    session: HistSession,
 }
 
+/// EA oturumu tanıtıcılarının tür etiketi.
+const TAG_SESSION: u64 = 0;
+/// Geçmiş oturumu tanıtıcılarının tür etiketi.
+///
+/// # Neden gerekli
+///
+/// İki tablo da aynı indeks/kuşak alanını kullanıyor, dolayısıyla `SinyalOpen`
+/// ile alınan bir tanıtıcı sayısal olarak geçerli bir geçmiş tanıtıcısına eşit
+/// olabilirdi. Tip güvenliği bellek hatasını engeller ama YANLIŞ OTURUMA
+/// yazmayı engellemez — barlar başka bir örneğin halkasına giderdi. Bu bit
+/// karışıklığı en baştan imkânsız kılıyor: etiketi tutmayan tanıtıcı çözülmez.
+const TAG_HIST: u64 = 0x4000_0000;
+/// Etiket bitini indeks bitlerinden ayıran maske.
+const TAG_MASK: u64 = 0x4000_0000;
+
+/// Tanıtıcı = (kuşak << 32) | tür etiketi | indeks. Kuşak 1'den başladığı için
+/// geçerli bir tanıtıcı asla 0 olmaz — 0 güvenle "geçersiz" anlamına gelir.
 #[inline]
-fn decode(h: i64) -> (usize, u32) {
+fn encode(index: usize, generation: u32, tag: u64) -> i64 {
+    (((generation as u64) << 32) | tag | index as u64) as i64
+}
+
+/// Tanıtıcıyı çöz. Tür etiketi beklenenden farklıysa `None` — başka türün
+/// tanıtıcısı buraya sızmaz.
+#[inline]
+fn decode(h: i64, tag: u64) -> Option<(usize, u32)> {
     let v = h as u64;
-    ((v & 0xFFFF_FFFF) as usize, (v >> 32) as u32)
+    let low = v & 0xFFFF_FFFF;
+    if low & TAG_MASK != tag {
+        return None;
+    }
+    Some(((low & !TAG_MASK) as usize, (v >> 32) as u32))
 }
 
 static LAST_ERROR: Mutex<String> = Mutex::new(String::new());
@@ -117,9 +152,9 @@ fn set_error(msg: impl Into<String>) {
 }
 
 /// Yeni bir oturumu tabloya yerleştir; tanıtıcı döner. Yer yoksa 0.
-fn alloc_slot(session: Session) -> i64 {
-    let raw = Box::into_raw(Box::new(Handle { session }));
-    for (i, slot) in SLOTS.iter().enumerate() {
+fn alloc_in<T>(table: &'static [Slot<T>], value: T, tag: u64) -> i64 {
+    let raw = Box::into_raw(Box::new(value));
+    for (i, slot) in table.iter().enumerate() {
         if slot
             .claimed
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
@@ -129,7 +164,7 @@ fn alloc_slot(session: Session) -> i64 {
             // tanıtıcı, yeni işaretçi görünür olmadan geçersizleşir.
             let generation = slot.generation.fetch_add(1, Ordering::AcqRel) + 1;
             slot.ptr.store(raw, Ordering::Release);
-            return encode(i, generation);
+            return encode(i, generation, tag);
         }
     }
     // Yer yok — sızdırmamak için kutuyu geri al.
@@ -140,12 +175,12 @@ fn alloc_slot(session: Session) -> i64 {
 
 /// Tanıtıcıyı çöz. Geçersizse `None` — hiçbir durumda çağırandan gelen sayı
 /// adres olarak kullanılmaz.
-fn resolve<'a>(h: i64) -> Option<&'a Handle> {
+fn resolve_in<T>(table: &'static [Slot<T>], h: i64, tag: u64) -> Option<&'static T> {
     if h == 0 {
         return None;
     }
-    let (index, generation) = decode(h);
-    let slot = SLOTS.get(index)?;
+    let (index, generation) = decode(h, tag)?;
+    let slot = table.get(index)?;
     // Önce kuşak: eşleşmiyorsa tanıtıcı bayat, işaretçiye hiç bakmayız.
     if slot.generation.load(Ordering::Acquire) != generation {
         return None;
@@ -154,7 +189,7 @@ fn resolve<'a>(h: i64) -> Option<&'a Handle> {
     if p.is_null() {
         return None;
     }
-    // Güvenlik: `p` bizim sakladığımız, `alloc_slot`'ta kutulanmış geçerli bir
+    // Güvenlik: `p` bizim sakladığımız, `alloc_in`'de kutulanmış geçerli bir
     // işaretçi. Kuşak denetimi onun hâlâ bu tanıtıcıya ait olduğunu gösteriyor.
     Some(unsafe { &*p })
 }
@@ -162,15 +197,17 @@ fn resolve<'a>(h: i64) -> Option<&'a Handle> {
 /// Slotu boşalt ve oturumu serbest bırak. Tanıtıcı geçersizse `false`.
 ///
 /// # Eşzamanlılık
-/// Aynı tanıtıcı için `SinyalClose` ile diğer çağrılar EŞZAMANLI OLMAMALIDIR.
+/// Aynı tanıtıcı için kapatma ile diğer çağrılar EŞZAMANLI OLMAMALIDIR.
 /// MQL5 modelinde bu doğal olarak sağlanır: `OnDeinit` ile `OnTick`/`OnTimer`
-/// aynı EA thread'inde sıralı çalışır.
-fn free_slot(h: i64) -> bool {
+/// aynı EA thread'inde sıralı çalışır; service tarafında da tek bir döngü var.
+fn free_in<T>(table: &'static [Slot<T>], h: i64, tag: u64) -> bool {
     if h == 0 {
         return false;
     }
-    let (index, generation) = decode(h);
-    let Some(slot) = SLOTS.get(index) else {
+    let Some((index, generation)) = decode(h, tag) else {
+        return false;
+    };
+    let Some(slot) = table.get(index) else {
         return false;
     };
     if slot.generation.load(Ordering::Acquire) != generation {
@@ -181,12 +218,42 @@ fn free_slot(h: i64) -> bool {
     slot.generation.fetch_add(1, Ordering::AcqRel);
     let p = slot.ptr.swap(core::ptr::null_mut(), Ordering::AcqRel);
     if !p.is_null() {
-        // Güvenlik: `alloc_slot`'ta kutulanan işaretçi, yalnızca burada ve bir
+        // Güvenlik: `alloc_in`'de kutulanan işaretçi, yalnızca burada ve bir
         // kez geri alınıyor (swap onu tablodan çıkardı).
         drop(unsafe { Box::from_raw(p) });
     }
     slot.claimed.store(false, Ordering::Release);
     true
+}
+
+#[inline]
+fn alloc_slot(session: Session) -> i64 {
+    alloc_in(&SLOTS, Handle { session }, TAG_SESSION)
+}
+
+#[inline]
+fn resolve(h: i64) -> Option<&'static Handle> {
+    resolve_in(&SLOTS, h, TAG_SESSION)
+}
+
+#[inline]
+fn free_slot(h: i64) -> bool {
+    free_in(&SLOTS, h, TAG_SESSION)
+}
+
+#[inline]
+fn alloc_hist_slot(session: HistSession) -> i64 {
+    alloc_in(&HIST_SLOTS, HistHandle { session }, TAG_HIST)
+}
+
+#[inline]
+fn resolve_hist(h: i64) -> Option<&'static HistHandle> {
+    resolve_in(&HIST_SLOTS, h, TAG_HIST)
+}
+
+#[inline]
+fn free_hist_slot(h: i64) -> bool {
+    free_in(&HIST_SLOTS, h, TAG_HIST)
 }
 
 /// MQL5 `string` (UTF-16, NUL sonlandırılmış) → Rust `String`.
@@ -320,6 +387,8 @@ pub extern "C" fn SinyalSizeof(what: i32) -> i32 {
         sizeof_what::ACCOUNT => size_of::<sinyal_proto::AccountSnapshot>() as i32,
         sizeof_what::POSITION => size_of::<sinyal_proto::PositionRec>() as i32,
         sizeof_what::ORDER => size_of::<sinyal_proto::OrderRec>() as i32,
+        sizeof_what::HIST_REQ => size_of::<HistReq>() as i32,
+        sizeof_what::BAR_REC => size_of::<BarRec>() as i32,
         sizeof_what::PROTO_VERSION => sinyal_proto::ring::RING_VERSION as i32,
         _ => SINYAL_ERR_ARGS,
     }
@@ -636,6 +705,256 @@ pub unsafe extern "C" fn SinyalPushRes(h: i64, res: *const Res) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
+// Geçmiş kanalı (service ↔ çekirdek)
+// ---------------------------------------------------------------------------
+//
+// Bu blok AYRI bir oturum tipidir ve mevcut `SinyalOpen` imzasına DOKUNMAZ:
+// MQL5 `#import` bildirimlerinde imza doğrulaması yapılmadığı için var olan bir
+// fonksiyonun aritesini değiştirmek, eski EA ile yeni DLL buluştuğunda sessiz
+// yığın bozulmasına yol açardı.
+//
+// Dönüş sözleşmesi buradaki altı fonksiyon için `long`'dur (MQL5 `long` = 64
+// bit): `> 0` başarı, `0` "şu an yapılamadı", `< 0` hata. Tek istisna
+// [`SinyalHistClose`]: sözleşme gereği başarıda **0** döner.
+
+/// Service tarafı: geçmiş segmentlerini oluştur ve oturumu aç.
+///
+/// Başarıda `> 0` tanıtıcı, hatada `< 0` döner (ayrıntı `SinyalLastError`'da).
+/// Kapasiteler varsayılandır — geçmiş akışının boyutu EA'nın yapılandırmasına
+/// bağlı değil.
+///
+/// Bu oturum EA'nın tek-yazar kilidine DOKUNMAZ; kendi kilidi
+/// `{instance}.hist` adını kullanır, böylece EA ile service aynı örnek adıyla
+/// yan yana çalışabilir.
+///
+/// # Güvenlik
+/// `instance` NUL sonlandırılmış geçerli bir UTF-16 dizisi olmalıdır.
+#[no_mangle]
+pub unsafe extern "C" fn SinyalHistOpen(instance: *const u16) -> i64 {
+    // Güvenlik: `instance` üzerindeki sözleşme çağırandan bu fonksiyona,
+    // oradan da değişmeden `hist_open`'a aktarılıyor.
+    unsafe { hist_open(instance, false) }
+}
+
+/// Çekirdek tarafı: var olan geçmiş segmentlerine bağlan.
+///
+/// Service henüz başlamadıysa hata döner — çağıran yeniden denemelidir, bu
+/// beklenen bir durumdur.
+///
+/// # Güvenlik
+/// `instance` NUL sonlandırılmış geçerli bir UTF-16 dizisi olmalıdır.
+#[no_mangle]
+pub unsafe extern "C" fn SinyalHistAttach(instance: *const u16) -> i64 {
+    // Güvenlik: yukarıdaki `SinyalHistOpen` ile aynı sözleşme.
+    unsafe { hist_open(instance, true) }
+}
+
+/// `SinyalHistOpen`/`SinyalHistAttach` ortak gövdesi.
+///
+/// # Güvenlik
+/// `instance` NUL sonlandırılmış geçerli bir UTF-16 dizisi olmalıdır.
+unsafe fn hist_open(instance: *const u16, attach: bool) -> i64 {
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        let Some(name) = (unsafe { wide_to_string(instance) }) else {
+            set_error("instance adı geçersiz veya NULL");
+            return SINYAL_ERR_ARGS as i64;
+        };
+        if name.trim().is_empty() {
+            set_error("instance adı boş olamaz");
+            return SINYAL_ERR_ARGS as i64;
+        }
+        let opened =
+            if attach { HistSession::attach(&name) } else { HistSession::create(&name) };
+        match opened {
+            Ok(session) => {
+                let h = alloc_hist_slot(session);
+                // `alloc_hist_slot` yer yoksa 0 döner; sözleşme hata için
+                // NEGATİF değer istiyor.
+                if h == 0 {
+                    SINYAL_ERR_OTHER as i64
+                } else {
+                    h
+                }
+            }
+            Err(e) => {
+                let what = if attach { "bağlanılamadı" } else { "açılamadı" };
+                set_error(format!("geçmiş oturumu {what} ({name}): {e}"));
+                SINYAL_ERR_OTHER as i64
+            }
+        }
+    }));
+    match r {
+        Ok(v) => v,
+        Err(_) => {
+            set_error("SinyalHistOpen sırasında panik yakalandı");
+            SINYAL_ERR_PANIC as i64
+        }
+    }
+}
+
+/// Geçmiş oturumunu kapat. Başarıda **0**, geçersiz tanıtıcıda negatif döner.
+///
+/// Dönüş değeri diğer export'lardan farklı ([`SINYAL_OK`] değil 0): FFI
+/// sözleşmesi böyle sabitlendi, MQL5 tarafı `!= 0` ile hata arıyor.
+///
+/// Çift kapatma güvenlidir: kuşak sayacı ilk kapatmada arttığı için ikinci
+/// çağrı hata alır ve serbest bırakılmış belleğe dokunmaz.
+#[no_mangle]
+pub extern "C" fn SinyalHistClose(h: i64) -> i64 {
+    let r = catch_unwind(AssertUnwindSafe(|| {
+        if h == 0 {
+            return 0i64;
+        }
+        if free_hist_slot(h) {
+            0
+        } else {
+            set_error("SinyalHistClose: tanıtıcı geçersiz veya zaten kapatılmış");
+            SINYAL_ERR_HANDLE as i64
+        }
+    }));
+    match r {
+        Ok(v) => v,
+        Err(_) => {
+            set_error("SinyalHistClose sırasında panik yakalandı");
+            SINYAL_ERR_PANIC as i64
+        }
+    }
+}
+
+/// Service tarafı: bekleyen geçmiş isteğini al.
+///
+/// Dönüş: `1` istek var (`out` dolduruldu), `0` istek yok, `< 0` hata.
+/// İstek yokluğu HATA DEĞİLDİR — service bunu görünce kısa bir `Sleep` ile
+/// döngüsüne devam eder.
+///
+/// # Güvenlik
+/// `out` geçerli yazılabilir bir [`HistReq`] olmalıdır; yalnızca tek bir
+/// service thread'i çağırmalıdır.
+#[no_mangle]
+pub unsafe extern "C" fn SinyalHistPopReq(h: i64, out: *mut HistReq) -> i64 {
+    hist_guard(|| {
+        let Some(handle) = resolve_hist(h) else {
+            set_error("SinyalHistPopReq: tanıtıcı geçersiz");
+            return SINYAL_ERR_HANDLE as i64;
+        };
+        if out.is_null() {
+            set_error("SinyalHistPopReq: çıkış işaretçisi NULL");
+            return SINYAL_ERR_ARGS as i64;
+        }
+        // Güvenlik: SPSC sözleşmesi çağıranın sorumluluğunda (tek service
+        // thread'i).
+        match unsafe { handle.session.pop_req() } {
+            Some(r) => {
+                unsafe { core::ptr::write(out, r) };
+                SINYAL_OK as i64
+            }
+            None => SINYAL_WOULD_BLOCK as i64,
+        }
+    })
+}
+
+/// Service tarafı: bar yayınla.
+///
+/// Dönüş: `1` yazıldı, `0` halka DOLU, `< 0` hata.
+///
+/// **`0` dönüşü hata değildir ve YOK SAYILAMAZ.** Bar yazılmamıştır ve
+/// kaybolan bir geçmiş barı bir daha asla gelmez — seride kalıcı delik açar.
+/// Service `Sleep(1)` gibi kısa bir uykudan sonra AYNI barla yeniden
+/// denemelidir (`OnTimer` yasak, ama `Sleep` service içinde serbesttir).
+///
+/// # Güvenlik
+/// `bar` geçerli bir [`BarRec`] olmalıdır; yalnızca tek bir service thread'i
+/// çağırmalıdır.
+#[no_mangle]
+pub unsafe extern "C" fn SinyalHistPushBar(h: i64, bar: *const BarRec) -> i64 {
+    hist_guard(|| {
+        let Some(handle) = resolve_hist(h) else {
+            set_error("SinyalHistPushBar: tanıtıcı geçersiz");
+            return SINYAL_ERR_HANDLE as i64;
+        };
+        if bar.is_null() {
+            set_error("SinyalHistPushBar: işaretçi NULL");
+            return SINYAL_ERR_ARGS as i64;
+        }
+        let b = unsafe { core::ptr::read(bar) };
+        // Güvenlik: SPSC sözleşmesi çağıranın sorumluluğunda.
+        if unsafe { handle.session.push_bar(&b) } {
+            SINYAL_OK as i64
+        } else {
+            SINYAL_WOULD_BLOCK as i64
+        }
+    })
+}
+
+/// Çekirdek tarafı: geçmiş isteği gönder.
+///
+/// Dönüş: `1` yazıldı, `0` halka dolu (yeniden dene), `< 0` hata.
+///
+/// # Güvenlik
+/// `req` geçerli bir [`HistReq`] olmalıdır; yalnızca tek bir çekirdek thread'i
+/// çağırmalıdır.
+#[no_mangle]
+pub unsafe extern "C" fn SinyalHistPushReq(h: i64, req: *const HistReq) -> i64 {
+    hist_guard(|| {
+        let Some(handle) = resolve_hist(h) else {
+            set_error("SinyalHistPushReq: tanıtıcı geçersiz");
+            return SINYAL_ERR_HANDLE as i64;
+        };
+        if req.is_null() {
+            set_error("SinyalHistPushReq: işaretçi NULL");
+            return SINYAL_ERR_ARGS as i64;
+        }
+        let r = unsafe { core::ptr::read(req) };
+        // Güvenlik: SPSC sözleşmesi çağıranın sorumluluğunda.
+        if unsafe { handle.session.push_req(&r) } {
+            SINYAL_OK as i64
+        } else {
+            SINYAL_WOULD_BLOCK as i64
+        }
+    })
+}
+
+/// Çekirdek tarafı: bar oku.
+///
+/// Dönüş: `1` bar var (`out` dolduruldu), `0` bar yok, `< 0` hata.
+///
+/// # Güvenlik
+/// `out` geçerli yazılabilir bir [`BarRec`] olmalıdır; yalnızca tek bir
+/// çekirdek thread'i çağırmalıdır.
+#[no_mangle]
+pub unsafe extern "C" fn SinyalHistPopBar(h: i64, out: *mut BarRec) -> i64 {
+    hist_guard(|| {
+        let Some(handle) = resolve_hist(h) else {
+            set_error("SinyalHistPopBar: tanıtıcı geçersiz");
+            return SINYAL_ERR_HANDLE as i64;
+        };
+        if out.is_null() {
+            set_error("SinyalHistPopBar: çıkış işaretçisi NULL");
+            return SINYAL_ERR_ARGS as i64;
+        }
+        // Güvenlik: SPSC sözleşmesi çağıranın sorumluluğunda.
+        match unsafe { handle.session.pop_bar() } {
+            Some(b) => {
+                unsafe { core::ptr::write(out, b) };
+                SINYAL_OK as i64
+            }
+            None => SINYAL_WOULD_BLOCK as i64,
+        }
+    })
+}
+
+/// [`guard`]'ın 64 bit dönen sürümü — geçmiş export'ları `long` döndürüyor.
+fn hist_guard<F: FnOnce() -> i64>(f: F) -> i64 {
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(v) => v,
+        Err(_) => {
+            set_error("köprüde panik yakalandı (terminal korundu)");
+            SINYAL_ERR_PANIC as i64
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Teşhis
 // ---------------------------------------------------------------------------
 
@@ -925,5 +1244,224 @@ mod tests {
         let b = SinyalQpc();
         assert!(b >= a);
         assert!(SinyalQpcFrequency() > 0);
+    }
+
+    // --- Geçmiş kanalı ---
+
+    fn sample_bar(req_id: u32, index: u32, total: u32) -> BarRec {
+        BarRec {
+            time_msc: 1_700_000_000_000 + index as i64 * 60_000,
+            open: 100.0,
+            high: 101.0,
+            low: 99.0,
+            close: 100.5,
+            tick_volume: 7,
+            req_id,
+            symbol_id: 3,
+            timeframe: sinyal_proto::timeframe::M1,
+            index,
+            total,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn hist_request_and_bar_cross_the_ffi_boundary() {
+        let name = unique("hist");
+        let w = wide(&name);
+        // Service segmentleri kurar; çekirdek sonradan bağlanır.
+        let svc = unsafe { SinyalHistOpen(w.as_ptr()) };
+        assert!(svc > 0, "service oturumu açılmalı, dönen: {svc}");
+        let core = unsafe { SinyalHistAttach(w.as_ptr()) };
+        assert!(core > 0, "çekirdek bağlanmalı, dönen: {core}");
+
+        // Çekirdek → service: istek.
+        let req = HistReq {
+            req_id: 55,
+            symbol_id: 3,
+            timeframe: sinyal_proto::timeframe::H1,
+            count: 500,
+            ..Default::default()
+        };
+        assert_eq!(unsafe { SinyalHistPushReq(core, &req) }, SINYAL_OK as i64);
+
+        let mut got = HistReq::default();
+        assert_eq!(unsafe { SinyalHistPopReq(svc, &mut got) }, SINYAL_OK as i64);
+        assert_eq!(got.req_id, 55);
+        assert_eq!(got.timeframe, sinyal_proto::timeframe::H1);
+        assert_eq!(got.count, 500);
+        // İkinci okumada istek yok — bu HATA DEĞİL.
+        assert_eq!(
+            unsafe { SinyalHistPopReq(svc, &mut got) },
+            SINYAL_WOULD_BLOCK as i64,
+            "boş istek halkası hata değil"
+        );
+
+        // Service → çekirdek: barlar.
+        for i in 0..3u32 {
+            assert_eq!(
+                unsafe { SinyalHistPushBar(svc, &sample_bar(55, i, 3)) },
+                SINYAL_OK as i64
+            );
+        }
+        let mut bar = BarRec::default();
+        for i in 0..3u32 {
+            assert_eq!(unsafe { SinyalHistPopBar(core, &mut bar) }, SINYAL_OK as i64);
+            assert_eq!(bar.index, i, "fiziksel sıra eskiden yeniye olmalı");
+            assert_eq!(bar.req_id, 55);
+            assert_eq!(bar.total, 3);
+        }
+        assert_eq!(unsafe { SinyalHistPopBar(core, &mut bar) }, SINYAL_WOULD_BLOCK as i64);
+
+        // Kapatma sözleşmesi: başarıda 0.
+        assert_eq!(SinyalHistClose(core), 0);
+        assert_eq!(SinyalHistClose(svc), 0);
+        // Çift kapatma serbest bırakılmış belleğe dokunmamalı.
+        assert_eq!(SinyalHistClose(svc), SINYAL_ERR_HANDLE as i64);
+    }
+
+    #[test]
+    fn hist_push_bar_reports_would_block_when_ring_is_full_not_an_error() {
+        // Halka dolduğunda `0` dönmeli — service kısa bir `Sleep` ile yeniden
+        // dener. HATA dönseydi service isteği iptal eder ve barlar KALICI
+        // kaybolurdu.
+        let name = unique("histfull");
+        let w = wide(&name);
+        let svc = unsafe { SinyalHistOpen(w.as_ptr()) };
+        assert!(svc > 0);
+
+        let cap = sinyal_proto::capacity::BARS;
+        for i in 0..cap {
+            assert_eq!(
+                unsafe { SinyalHistPushBar(svc, &sample_bar(1, i as u32, cap as u32)) },
+                SINYAL_OK as i64,
+                "kapasite dolana kadar kabul edilmeli"
+            );
+        }
+        assert_eq!(
+            unsafe { SinyalHistPushBar(svc, &sample_bar(1, 0, 1)) },
+            SINYAL_WOULD_BLOCK as i64,
+            "dolu halka 0 dönmeli, hata değil"
+        );
+
+        // Çekirdek okuyup yer açınca yeniden deneme BAŞARILI olmalı.
+        let core = unsafe { SinyalHistAttach(w.as_ptr()) };
+        let mut bar = BarRec::default();
+        assert_eq!(unsafe { SinyalHistPopBar(core, &mut bar) }, SINYAL_OK as i64);
+        assert_eq!(
+            unsafe { SinyalHistPushBar(svc, &sample_bar(1, 0, 1)) },
+            SINYAL_OK as i64,
+            "yer açılınca yeniden deneme yazmalı"
+        );
+
+        SinyalHistClose(core);
+        SinyalHistClose(svc);
+    }
+
+    #[test]
+    fn hist_bogus_handle_is_rejected_not_dereferenced() {
+        // Daha önce GERÇEK bir çökme sebebiydi: MQL5 tarafından gelen rastgele
+        // bir sayı adres olarak kullanılırsa terminal düşer.
+        let mut req = HistReq::default();
+        let mut bar = BarRec::default();
+        for h in [0i64, 1, -1, 0x1234_5678, i64::MIN, i64::MAX, 0x4000_0000] {
+            assert_eq!(
+                unsafe { SinyalHistPopReq(h, &mut req) },
+                SINYAL_ERR_HANDLE as i64,
+                "tanıtıcı {h} reddedilmeli"
+            );
+            assert_eq!(
+                unsafe { SinyalHistPushBar(h, &sample_bar(1, 0, 1)) },
+                SINYAL_ERR_HANDLE as i64,
+                "tanıtıcı {h} reddedilmeli"
+            );
+            assert_eq!(
+                unsafe { SinyalHistPushReq(h, &req) },
+                SINYAL_ERR_HANDLE as i64,
+                "tanıtıcı {h} reddedilmeli"
+            );
+            assert_eq!(
+                unsafe { SinyalHistPopBar(h, &mut bar) },
+                SINYAL_ERR_HANDLE as i64,
+                "tanıtıcı {h} reddedilmeli"
+            );
+        }
+        // 0 dışındaki her tanıtıcı için kapatma da reddedilmeli (0 "zaten
+        // kapalı" sayılır ve sessizce başarı döner).
+        assert_eq!(SinyalHistClose(0x1234_5678), SINYAL_ERR_HANDLE as i64);
+    }
+
+    #[test]
+    fn hist_and_tick_handles_are_not_interchangeable() {
+        // İki tablo aynı indeks alanını kullanıyor; tür etiketi olmasaydı bir
+        // tick tanıtıcısı geçerli bir geçmiş tanıtıcısına eşit olabilir ve
+        // barlar YANLIŞ oturuma yazılabilirdi.
+        let tick_name = unique("mix-tick");
+        let hist_name = unique("mix-hist");
+        let th = open_small(&tick_name);
+        let hw = wide(&hist_name);
+        let hh = unsafe { SinyalHistOpen(hw.as_ptr()) };
+        assert!(th != 0 && hh > 0);
+        assert_ne!(th, hh);
+
+        // Tick tanıtıcısı geçmiş export'unda reddedilmeli.
+        assert_eq!(
+            unsafe { SinyalHistPushBar(th, &sample_bar(1, 0, 1)) },
+            SINYAL_ERR_HANDLE as i64
+        );
+        assert_eq!(SinyalHistClose(th), SINYAL_ERR_HANDLE as i64);
+        // Geçmiş tanıtıcısı tick export'unda reddedilmeli.
+        assert_eq!(
+            unsafe { SinyalPushTick(hh, 0, 0, 1.0, 1.0, 0.0, 0.0, 0, 1) },
+            SINYAL_ERR_HANDLE
+        );
+        assert_eq!(SinyalClose(hh), SINYAL_ERR_HANDLE);
+
+        // Her ikisi de kendi export'unda hâlâ çalışıyor olmalı.
+        assert_eq!(
+            unsafe { SinyalHistPushBar(hh, &sample_bar(1, 0, 1)) },
+            SINYAL_OK as i64
+        );
+        assert_eq!(
+            unsafe { SinyalPushTick(th, 0, 0, 1.0, 1.0, 0.0, 0.0, 0, 1) },
+            SINYAL_OK
+        );
+        assert_eq!(SinyalHistClose(hh), 0);
+        assert_eq!(SinyalClose(th), SINYAL_OK);
+    }
+
+    #[test]
+    fn hist_rejects_null_pointers_and_bad_instance() {
+        let name = unique("histnull");
+        let w = wide(&name);
+        let h = unsafe { SinyalHistOpen(w.as_ptr()) };
+        assert!(h > 0);
+        assert_eq!(
+            unsafe { SinyalHistPopReq(h, core::ptr::null_mut()) },
+            SINYAL_ERR_ARGS as i64
+        );
+        assert_eq!(
+            unsafe { SinyalHistPopBar(h, core::ptr::null_mut()) },
+            SINYAL_ERR_ARGS as i64
+        );
+        assert_eq!(unsafe { SinyalHistPushBar(h, core::ptr::null()) }, SINYAL_ERR_ARGS as i64);
+        assert_eq!(unsafe { SinyalHistPushReq(h, core::ptr::null()) }, SINYAL_ERR_ARGS as i64);
+        SinyalHistClose(h);
+
+        // Açılış hataları NEGATİF dönmeli (tick tarafındaki 0 sözleşmesi
+        // değil) — MQL5 tarafı `<= 0` ile kontrol ediyor.
+        assert!(unsafe { SinyalHistOpen(core::ptr::null()) } < 0);
+        let empty = wide("   ");
+        assert!(unsafe { SinyalHistOpen(empty.as_ptr()) } < 0);
+        // Service başlamadan bağlanmak hata, ama yeniden denenebilir bir hata.
+        let missing = wide(&unique("histmissing"));
+        assert!(unsafe { SinyalHistAttach(missing.as_ptr()) } < 0);
+    }
+
+    #[test]
+    fn hist_sizeof_matches_rust_layout() {
+        // Service açılışta bunları MQL5 `sizeof()` ile karşılaştırır.
+        assert_eq!(SinyalSizeof(sizeof_what::HIST_REQ), 64);
+        assert_eq!(SinyalSizeof(sizeof_what::BAR_REC), 120);
     }
 }

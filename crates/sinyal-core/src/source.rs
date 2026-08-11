@@ -20,6 +20,7 @@ use sinyal_shm::{qpc, qpc_delta_nanos};
 use tokio::sync::broadcast;
 
 use crate::candles::CandleStore;
+use crate::history::{HistClient, HistCmd, HistReply, HistStatus, DEFAULT_TIMEOUT};
 use crate::join::OrderJoin;
 use crate::state::{LastTick, Registry};
 
@@ -67,6 +68,12 @@ pub enum FeedEvent {
     },
 }
 
+/// Geçmiş kanalını yeniden bağlamayı deneme aralığı.
+///
+/// Service çekirdekten sonra başlayabilir; bir kez deneyip vazgeçmek,
+/// "servisi açtım ama hâlâ bar gelmiyor" demek olurdu.
+const HIST_RETRY: Duration = Duration::from_secs(5);
+
 /// Okuyucu thread'inin durumu (teşhis).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ReaderStats {
@@ -84,6 +91,20 @@ pub struct ReaderStats {
     pub join_late: u64,
     /// Hicbir emrimize baglanamayan (elle yapilmis) olay sayisi.
     pub join_unattributed: u64,
+    /// Gecmis kanali (MQL5 Service) bagli mi.
+    pub hist_ready: bool,
+    /// Gonderilen gecmis istegi sayisi.
+    pub hist_reqs: u64,
+    /// Depoya islenen MT5 bari sayisi.
+    pub hist_bars: u64,
+    /// EKSIK teslim edilen istek sayisi — bar halkasi dolmus olabilir.
+    pub hist_incomplete: u64,
+    /// Service'in hata dondurdugu istek sayisi.
+    pub hist_failed: u64,
+    /// Zaman asimina ugrayan istek sayisi.
+    pub hist_timeout: u64,
+    /// Su an cevabi beklenen gecmis istegi sayisi.
+    pub hist_pending: u64,
 }
 
 /// Bir örnek için okuyucu thread'i başlat.
@@ -96,20 +117,23 @@ pub fn spawn_reader(
     registry: Arc<Registry>,
     tx: broadcast::Sender<FeedEvent>,
     cmd_rx: Receiver<Cmd>,
+    hist_rx: Receiver<HistCmd>,
     stats: Arc<std::sync::Mutex<ReaderStats>>,
     candles: Arc<std::sync::Mutex<CandleStore>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name(format!("sinyal-rd-{instance}"))
-        .spawn(move || reader_loop(instance, registry, tx, cmd_rx, stats, candles))
+        .spawn(move || reader_loop(instance, registry, tx, cmd_rx, hist_rx, stats, candles))
         .expect("okuyucu thread'i başlatılamadı")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn reader_loop(
     instance: String,
     registry: Arc<Registry>,
     tx: broadcast::Sender<FeedEvent>,
     cmd_rx: Receiver<Cmd>,
+    hist_rx: Receiver<HistCmd>,
     stats: Arc<std::sync::Mutex<ReaderStats>>,
     candles: Arc<std::sync::Mutex<CandleStore>>,
 ) {
@@ -128,6 +152,11 @@ fn reader_loop(
                 // Komut kuyruğu bu sırada dolabilir; boşaltıp reddedilmelerini
                 // sağlıyoruz ki istemci sonsuza kadar beklemesin.
                 while cmd_rx.try_recv().is_ok() {}
+                // Geçmiş istekleri de CEVAPLANMALI: sessizce yutmak, WebSocket
+                // görevini zaman aşımına kadar bekletirdi.
+                while let Ok(h) = hist_rx.try_recv() {
+                    let _ = h.reply.send(HistReply::Unavailable);
+                }
             }
         }
     };
@@ -147,6 +176,29 @@ fn reader_loop(
     let mut join = OrderJoin::new();
     let mut batch = vec![Tick::default(); 512];
     let mut idle_rounds: u32 = 0;
+
+    // Geçmiş kanalı BU thread'den bağlanmalı: taşıyıcı, kendisine erişen ilk
+    // thread'i sahip yapar ve başkasının işlemini sessizce reddeder. main'de
+    // bağlanıp buraya taşımak, hata vermeyen ama hiç bar gelmeyen bir kurulum
+    // üretirdi.
+    let mut hist = crate::hist_bridge::attach(&instance)
+        .map(|link| HistClient::new(link, DEFAULT_TIMEOUT));
+    if hist.is_some() {
+        eprintln!("[{instance}] gecmis kanali bagli — MT5 barlari acik");
+    } else if !crate::hist_bridge::COMPILED_IN {
+        eprintln!(
+            "[{instance}] gecmis kanali bu ikiliye derlenmedi (mt5-hist kapali) \
+             — mumlar yalniz tick'ten uretilecek"
+        );
+    }
+    let mut last_hist_try = Instant::now();
+    // İstek → cevap kanalı. `HistClient` tokio'yu tanımıyor; eşleşmeyi burada
+    // tutuyoruz ki geçmiş mantığı paylaşımlı bellek ve çalışma zamanı olmadan
+    // test edilebilsin.
+    let mut hist_waiters: std::collections::HashMap<
+        u32,
+        tokio::sync::oneshot::Sender<HistReply>,
+    > = std::collections::HashMap::new();
 
     loop {
         let mut did_work = false;
@@ -268,6 +320,81 @@ fn reader_loop(
             }
         }
 
+        // --- 4b) Geçmiş bar kanalı ---
+        //
+        // Üç iş: gelen istekleri service'e ilet, gelen barları depoya işle,
+        // süresi dolanları kapat. Hiçbiri tick akışını bloklamaz — geçmiş
+        // gecikmesi fiyat gecikmesinden önemsizdir.
+        loop {
+            match hist_rx.try_recv() {
+                Ok(h) => {
+                    did_work = true;
+                    let Some(client) = hist.as_mut() else {
+                        // Service yok: özellik kapalı, hata değil. Ama
+                        // CEVAPSIZ bırakmıyoruz.
+                        let _ = h.reply.send(HistReply::Unavailable);
+                        continue;
+                    };
+                    match client.request(&h.symbol, h.symbol_id, &h.tf, h.count, h.to_msc) {
+                        Ok(id) => {
+                            hist_waiters.insert(id, h.reply);
+                            let mut s = stats.lock().unwrap_or_else(|e| e.into_inner());
+                            s.hist_reqs += 1;
+                        }
+                        Err(e) => {
+                            let _ = h.reply.send(HistReply::Refused(e.to_string()));
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+
+        if let Some(client) = hist.as_mut() {
+            let mut done = client.drain();
+            done.extend(client.expire());
+            for out in done {
+                did_work = true;
+                let n = out.bars.len();
+                // Hata ve zaman aşımı bir ÇEKİM DEĞİLDİR: boş sonuçlarını
+                // depoya yazmak, hiç alınamamış bir seriyi "broker bar
+                // vermedi" diye alınmış göstermek olurdu. Başarılı ama boş
+                // cevap ise kaydedilir — o gerçekten bir cevaptır.
+                if n > 0 || matches!(out.status, HistStatus::Complete) {
+                    // Barlar AYRI bir seriye giriyor: MT5'in serisi (genelde
+                    // BID) ile tick'ten ürettiğimiz (MID) aynı şey değil,
+                    // karıştırmak istemciyi yanıltırdı.
+                    let mut cs = candles.lock().unwrap_or_else(|e| e.into_inner());
+                    cs.ingest_mt5(&out.symbol, out.tf, &out.bars);
+                }
+                {
+                    let mut s = stats.lock().unwrap_or_else(|e| e.into_inner());
+                    s.hist_bars += n as u64;
+                    match out.status {
+                        HistStatus::Complete => {}
+                        HistStatus::Incomplete { .. } => s.hist_incomplete += 1,
+                        HistStatus::Failed(_) => s.hist_failed += 1,
+                        HistStatus::TimedOut { .. } => s.hist_timeout += 1,
+                    }
+                }
+                if !matches!(out.status, HistStatus::Complete) {
+                    eprintln!(
+                        "[{instance}] gecmis {} {}: {} — {}",
+                        out.symbol,
+                        out.tf,
+                        out.status.name(),
+                        out.status.detail().unwrap_or_default()
+                    );
+                }
+                // Zaman aşımı da bir CEVAPTIR: bekleyen taraf sonsuza kadar
+                // asılı kalmaz.
+                if let Some(reply) = hist_waiters.remove(&out.req_id) {
+                    let _ = reply.send(HistReply::Done { status: out.status, bars: n });
+                }
+            }
+        }
+
         // --- 5) Durum görüntüsü (uyarlanır sıklık) ---
         //
         // Durum yalnızca hesap/pozisyon sorguları için değil, **korelasyon için
@@ -324,6 +451,18 @@ fn reader_loop(
             s.join_pending = join.pending_len() as u64;
             s.join_late = join.resolved_late;
             s.join_unattributed = join.unattributed;
+            s.hist_ready = hist.is_some();
+            s.hist_pending = hist.as_ref().map_or(0, |h| h.pending_len() as u64);
+        }
+
+        // Service çekirdekten sonra başlayabilir; bir kez deneyip vazgeçmek
+        // "servisi açtım ama hâlâ bar gelmiyor" demek olurdu.
+        if hist.is_none() && last_hist_try.elapsed() >= HIST_RETRY {
+            last_hist_try = Instant::now();
+            if let Some(link) = crate::hist_bridge::attach(&instance) {
+                eprintln!("[{instance}] gecmis kanali bagli — MT5 barlari acik");
+                hist = Some(HistClient::new(link, DEFAULT_TIMEOUT));
+            }
         }
 
         // --- 7) Bekleme stratejisi ---
@@ -445,7 +584,8 @@ mod tests {
         let (tx, mut rx) = broadcast::channel(256);
         let (_cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         let stats = Arc::new(std::sync::Mutex::new(ReaderStats::default()));
-        let _rd = spawn_reader(inst.clone(), registry.clone(), tx, cmd_rx, stats, Arc::new(std::sync::Mutex::new(CandleStore::new())));
+        let (_hist_tx, hist_rx) = std::sync::mpsc::channel();
+        let _rd = spawn_reader(inst.clone(), registry.clone(), tx, cmd_rx, hist_rx, stats, Arc::new(std::sync::Mutex::new(CandleStore::new())));
 
         // Okuyucunun bağlanıp sembol tablosunu almasını bekle.
         std::thread::sleep(Duration::from_millis(300));
@@ -494,7 +634,8 @@ mod tests {
         let (tx, mut rx) = broadcast::channel(256);
         let (_cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         let stats = Arc::new(std::sync::Mutex::new(ReaderStats::default()));
-        let _rd = spawn_reader(inst.clone(), registry.clone(), tx, cmd_rx, stats, Arc::new(std::sync::Mutex::new(CandleStore::new())));
+        let (_hist_tx, hist_rx) = std::sync::mpsc::channel();
+        let _rd = spawn_reader(inst.clone(), registry.clone(), tx, cmd_rx, hist_rx, stats, Arc::new(std::sync::Mutex::new(CandleStore::new())));
         std::thread::sleep(Duration::from_millis(300));
 
         ea.run(|s| {
@@ -529,6 +670,192 @@ mod tests {
     }
 
     #[test]
+    fn history_requests_are_always_answered_even_without_a_service() {
+        // ASIL NOKTA: geçmiş kanalı yokken isteği sessizce yutmak, WebSocket
+        // görevini zaman aşımına kadar askıda bırakırdı. "Özellik kapalı"
+        // cevabı, cevapsızlıktan iyidir.
+        let inst = unique("hist");
+        let ea = FakeEa::start(inst.clone(), small());
+        ea.run(|s| {
+            unsafe { s.set_symbols(&[sym(0, "EURUSD")]) }.unwrap();
+        });
+
+        let registry = Arc::new(Registry::new());
+        let (tx, _rx) = broadcast::channel(256);
+        let (_cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (hist_tx, hist_rx) = std::sync::mpsc::channel();
+        let stats = Arc::new(std::sync::Mutex::new(ReaderStats::default()));
+        let _rd = spawn_reader(
+            inst.clone(),
+            registry.clone(),
+            tx,
+            cmd_rx,
+            hist_rx,
+            stats,
+            Arc::new(std::sync::Mutex::new(CandleStore::new())),
+        );
+        std::thread::sleep(Duration::from_millis(300));
+
+        let (rtx, rrx) = tokio::sync::oneshot::channel();
+        hist_tx
+            .send(HistCmd {
+                symbol: "EURUSD".into(),
+                symbol_id: 0,
+                tf: "M1".into(),
+                count: 100,
+                to_msc: 0,
+                reply: rtx,
+            })
+            .unwrap();
+
+        let reply = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async { tokio::time::timeout(Duration::from_secs(5), rrx).await })
+            .expect("cevapsiz kalmamali")
+            .expect("kanal dusmemeli");
+
+        // Bu örnek için hiçbir Service çalışmıyor (ve `mt5-hist` kapalıysa
+        // kanal hiç derlenmemiştir) — iki durumda da cevap gelmeli.
+        assert_eq!(reply, HistReply::Unavailable);
+    }
+
+    /// Service rolünü taklit eden yardımcı — EA'nınki gibi tek thread'e
+    /// kilitli, çünkü `HistSession` de oturuma erişen ilk thread'i sahip yapar.
+    #[cfg(feature = "mt5-hist")]
+    struct FakeService {
+        tx: std::sync::mpsc::Sender<Box<dyn FnOnce(&sinyal_bridge::HistSession) + Send>>,
+        _handle: std::thread::JoinHandle<()>,
+    }
+
+    #[cfg(feature = "mt5-hist")]
+    impl FakeService {
+        fn start(instance: String) -> Self {
+            let (tx, rx) = std::sync::mpsc::channel::<
+                Box<dyn FnOnce(&sinyal_bridge::HistSession) + Send>,
+            >();
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                let s = sinyal_bridge::HistSession::create(&instance).expect("service oturumu");
+                ready_tx.send(()).ok();
+                while let Ok(f) = rx.recv() {
+                    f(&s);
+                }
+            });
+            ready_rx.recv().expect("service hazir olmali");
+            Self { tx, _handle: handle }
+        }
+
+        fn run(&self, f: impl FnOnce(&sinyal_bridge::HistSession) + Send + 'static) {
+            self.tx.send(Box::new(f)).expect("service thread'i yasamali");
+        }
+    }
+
+    /// UÇTAN UCA: istek paylaşımlı bellekten service'e gider, barlar geri
+    /// gelir ve **MT5 kaynaklı ayrı seriye** işlenir.
+    ///
+    /// Sahte taşıyıcıyla yapılan testler eşleştirme mantığını kanıtlar; bu
+    /// test halka yerleşimini, `Cell<BarRec>` slot boyutunu ve thread
+    /// sahipliğini de kanıtlıyor — üçü de yalnızca çalışma zamanında bozulur.
+    #[cfg(feature = "mt5-hist")]
+    #[test]
+    fn history_flows_through_real_shared_memory_into_the_mt5_series() {
+        use sinyal_proto::{bar_flag, timeframe, BarRec};
+
+        let inst = unique("histe2e");
+        // Service segmentleri OLUŞTURUR; çekirdek yalnızca bağlanır.
+        let svc = FakeService::start(inst.clone());
+        let ea = FakeEa::start(inst.clone(), small());
+        ea.run(|s| {
+            unsafe { s.set_symbols(&[sym(4, "EURUSD")]) }.unwrap();
+        });
+
+        let registry = Arc::new(Registry::new());
+        let (tx, _rx) = broadcast::channel(256);
+        let (_cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let (hist_tx, hist_rx) = std::sync::mpsc::channel();
+        let stats = Arc::new(std::sync::Mutex::new(ReaderStats::default()));
+        let store = Arc::new(std::sync::Mutex::new(CandleStore::new()));
+        let _rd = spawn_reader(
+            inst.clone(),
+            registry.clone(),
+            tx,
+            cmd_rx,
+            hist_rx,
+            stats,
+            store.clone(),
+        );
+        std::thread::sleep(Duration::from_millis(300));
+
+        let (rtx, rrx) = tokio::sync::oneshot::channel();
+        hist_tx
+            .send(HistCmd {
+                symbol: "EURUSD".into(),
+                symbol_id: 4,
+                tf: "M5".into(),
+                count: 3,
+                to_msc: 0,
+                reply: rtx,
+            })
+            .unwrap();
+
+        // Service isteği alıp barları yayınlıyor.
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        for _ in 0..50 {
+            let seen_tx = seen_tx.clone();
+            svc.run(move |s| {
+                if let Some(req) = unsafe { s.pop_req() } {
+                    for i in 0..3u32 {
+                        let b = BarRec {
+                            time_msc: 1_700_000_000_000 + i as i64 * 300_000,
+                            open: 1.10,
+                            high: 1.11,
+                            low: 1.09,
+                            close: 1.10 + i as f64 * 0.001,
+                            tick_volume: 7,
+                            req_id: req.req_id,
+                            symbol_id: req.symbol_id,
+                            timeframe: req.timeframe,
+                            index: i,
+                            total: 3,
+                            flags: if i == 2 { bar_flag::LAST } else { 0 },
+                            ..Default::default()
+                        };
+                        assert!(unsafe { s.push_bar(&b) }, "bar halkasi dolmamali");
+                    }
+                    seen_tx.send(req).ok();
+                }
+            });
+            if let Ok(req) = seen_rx.recv_timeout(Duration::from_millis(100)) {
+                assert_eq!(req.symbol_id, 4);
+                assert_eq!(req.timeframe, timeframe::M5, "MT5 ham degeri gitmeli");
+                assert_eq!(req.count, 3);
+                assert_ne!(req.req_id, 0);
+                break;
+            }
+        }
+
+        let reply = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async { tokio::time::timeout(Duration::from_secs(10), rrx).await })
+            .expect("zaman asimi")
+            .expect("cevap gelmeli");
+        assert_eq!(reply, HistReply::Done { status: HistStatus::Complete, bars: 3 });
+
+        // Barlar MT5 serisine girdi ve kaynağı öyle bildiriliyor.
+        let cs = store.lock().unwrap();
+        let view = cs.get("EURUSD", "M5", 10);
+        assert_eq!(view.src, crate::candles::BarSource::Mt5);
+        assert_eq!(view.bars.len(), 3);
+        assert!((view.bars[2].c - 1.102).abs() < 1e-9);
+        // Tick tarafına HİÇ dokunulmamalı.
+        assert!(cs.tick_bars("EURUSD", "M5", 10).is_empty());
+    }
+
+    #[test]
     fn commands_reach_the_ea_through_the_reader_thread() {
         // ASIL NOKTA: WebSocket görevleri push_cmd'yi DOĞRUDAN çağıramaz —
         // Session'ın thread koruması reddeder. Kanal üzerinden geçmeli.
@@ -542,7 +869,8 @@ mod tests {
         let (tx, _rx) = broadcast::channel(256);
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         let stats = Arc::new(std::sync::Mutex::new(ReaderStats::default()));
-        let _rd = spawn_reader(inst.clone(), registry.clone(), tx, cmd_rx, stats, Arc::new(std::sync::Mutex::new(CandleStore::new())));
+        let (_hist_tx, hist_rx) = std::sync::mpsc::channel();
+        let _rd = spawn_reader(inst.clone(), registry.clone(), tx, cmd_rx, hist_rx, stats, Arc::new(std::sync::Mutex::new(CandleStore::new())));
         std::thread::sleep(Duration::from_millis(300));
 
         cmd_tx

@@ -13,6 +13,16 @@ workspace = true
 name = "sinyald"
 path = "src/main.rs"
 
+[features]
+default = ["mt5-hist"]
+# Gecmis bar kanalini (MQL5 Service <-> cekirdek) derlemeye dahil eder.
+#
+# Kapatildiginda cekirdek TAM ISLEVSEL kalir: mumlar tick'ten uretilir ve
+# `candles` cevabi `src_kind: "tick"`, `hist: "off"` der. Kacis kapisi olarak
+# duruyor — `sinyal-bridge::HistSession` imzasi degisirse cekirdek yine de
+# derlenir ve yalnizca src/hist_bridge.rs guncellenir.
+mt5-hist = []
+
 [dependencies]
 sinyal-proto = { path = "../sinyal-proto" }
 sinyal-shm = { path = "../sinyal-shm" }

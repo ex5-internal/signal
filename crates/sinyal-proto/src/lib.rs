@@ -32,13 +32,33 @@
 //!
 //! Tick ve derinlik ayrı halkalarda tutulur: derinlik mesajı tick'ten ~13 kat
 //! büyük, tek halkada birleştirmek tick slotlarını da o boyuta şişirirdi.
+//!
+//! ### Geçmiş kanalı — AYRI bir yazar
+//!
+//! Geçmiş barlar ([`bars`]) yukarıdaki segmentlerden bağımsız bir çiftte akar:
+//!
+//! | Segment | Yön | İçerik |
+//! |---|---|---|
+//! | `hist` | çekirdek → **service** | geçmiş istekleri ([`bars::HistReq`]) |
+//! | `bars` | **service** → çekirdek | MT5'in kendi barları ([`bars::BarRec`]) |
+//!
+//! Yazan taraf EA değil, ayrı bir **MQL5 Service**'tir: `CopyRates` EA'da
+//! çağıran thread'i bloklar ve zaman aşımı belgelenmemiştir (canlıda 30-60 sn
+//! donma raporları var), bu yüzden tick toplama yoluna konamaz.
+//!
+//! Ayrı segment çifti aynı zamanda **tek-yazar kilidini korur**: EA `md/book/
+//! res/sym/state` üzerinde tek yazar olarak kalır, service yalnızca `bars`a
+//! yazar. İkisi birbirinin kilidine dokunmaz ve service olmadan da EA tam
+//! işlevsel çalışır.
 
+pub mod bars;
 pub mod msg;
 pub mod ring;
 pub mod state;
 pub mod symtab;
 pub mod validate;
 
+pub use bars::{bar_flag, timeframe, BarRec, HistReq, HIST_SYMBOL_LEN};
 pub use msg::{
     action, book_type, exec_mode, filling, filling_mask, kind, order_type, read_fixed_str, res_kind,
     res_source, sym_flag, tick_flag, type_time, write_fixed_str, Book, BookLevel, Cmd, Res,
@@ -78,6 +98,17 @@ pub mod capacity {
     pub const POSITIONS: u32 = 512;
     /// Durum segmentindeki azami bekleyen emir sayısı.
     pub const ORDERS: u32 = 512;
+    /// Geçmiş istek halkası slot sayısı. İstekler seyrek ve küçük.
+    pub const HIST_REQS: u64 = 1 << 10;
+    /// Geçmiş bar halkası slot sayısı (≈4 MB).
+    ///
+    /// Geçmiş akışı tanım gereği **patlamalıdır**: tek istek binlerce bar
+    /// üretir. Halka dolarsa yazar yeniden DENEMEZ ve barlar kalıcı olarak
+    /// kaybolur; bu yüzden tek istekte dönebilecek azami bar sayısının
+    /// (5000) birkaç katı seçildi ki çekirdek kısa bir gecikmeyle bile
+    /// yetişebilsin. Eksik teslimat ayrıca [`bars::BarRec::total`] ile
+    /// yakalanır.
+    pub const BARS: u64 = 1 << 15;
 }
 
 /// Bir EA örneğinin paylaşılan bellek segment adları.
@@ -97,6 +128,10 @@ pub struct SegmentNames {
     pub symbols: String,
     /// Hesap + açık pozisyonlar + bekleyen emirler (durum, akış değil).
     pub state: String,
+    /// Çekirdek → service geçmiş istekleri.
+    pub hist_reqs: String,
+    /// Service → çekirdek geçmiş barları.
+    pub bars: String,
 }
 
 impl SegmentNames {
@@ -109,6 +144,8 @@ impl SegmentNames {
             results: format!("Local\\Sinyal.{instance}.res"),
             symbols: format!("Local\\Sinyal.{instance}.sym"),
             state: format!("Local\\Sinyal.{instance}.state"),
+            hist_reqs: format!("Local\\Sinyal.{instance}.hreq"),
+            bars: format!("Local\\Sinyal.{instance}.bars"),
         }
     }
 }
@@ -281,6 +318,47 @@ mod layout {
     const _: () = assert!(size_of::<SymbolTableHeader>() == 64);
     const _: () = assert!(align_of::<SymbolTableHeader>() == 64);
     const _: () = assert!(offset_of!(SymbolTableHeader, generation) == 24);
+
+    // --- Geçmiş kanalı ---
+    const _: () = assert!(size_of::<HistReq>() == 64, "HistReq 64 bayt olmalı");
+    const _: () = assert!(align_of::<HistReq>() == 8);
+    const _: () = assert!(offset_of!(HistReq, to_msc) == 0);
+    const _: () = assert!(offset_of!(HistReq, req_id) == 8);
+    const _: () = assert!(offset_of!(HistReq, symbol_id) == 12);
+    const _: () = assert!(offset_of!(HistReq, timeframe) == 16);
+    const _: () = assert!(offset_of!(HistReq, count) == 20);
+    // Sembol adı isteğin İÇİNDE taşınır: service grafiğe bağlı değildir
+    // (`_Symbol` yok) ve `symbol_id`'yi ada çeviremez. Ofset MQL5 başlığına da
+    // buradan gider — kayarsa service isteğin ortasından ad okumaya başlar.
+    const _: () = assert!(offset_of!(HistReq, symbol) == 24);
+    const _: () = assert!(HIST_SYMBOL_LEN == 32);
+    const _: () = assert!(offset_of!(HistReq, _reserved) == 56);
+
+    // `Cell<BarRec>` = 128 bayt. Bu, DİĞER HALKALARIN HİÇBİRİYLE AYNI DEĞİL
+    // (Tick 64, Cmd/Res 192, Book 832) — kasıtlı. `RING_MAGIC` tüm halkalarda
+    // aynı olduğundan, yanlış segment adına bağlanmayı yakalayan tek
+    // çalışma-zamanı denetimi slot boyutu karşılaştırmasıdır.
+    const _: () = assert!(size_of::<BarRec>() == 120, "BarRec 120 bayt olmalı");
+    const _: () = assert!(align_of::<BarRec>() == 8);
+    const _: () = assert!(size_of::<Cell<BarRec>>() == 128, "Cell<BarRec> 2 önbellek satırı olmalı");
+    const _: () = assert!(size_of::<Cell<BarRec>>() != size_of::<Cell<Tick>>());
+    const _: () = assert!(size_of::<Cell<BarRec>>() != size_of::<Cell<Cmd>>());
+    const _: () = assert!(size_of::<Cell<BarRec>>() != size_of::<Cell<Book>>());
+    const _: () = assert!(offset_of!(BarRec, time_msc) == 0);
+    const _: () = assert!(offset_of!(BarRec, open) == 8);
+    const _: () = assert!(offset_of!(BarRec, high) == 16);
+    const _: () = assert!(offset_of!(BarRec, low) == 24);
+    const _: () = assert!(offset_of!(BarRec, close) == 32);
+    const _: () = assert!(offset_of!(BarRec, tick_volume) == 40);
+    const _: () = assert!(offset_of!(BarRec, real_volume) == 48);
+    const _: () = assert!(offset_of!(BarRec, req_id) == 56);
+    const _: () = assert!(offset_of!(BarRec, symbol_id) == 60);
+    const _: () = assert!(offset_of!(BarRec, timeframe) == 64);
+    const _: () = assert!(offset_of!(BarRec, spread) == 68);
+    const _: () = assert!(offset_of!(BarRec, flags) == 72);
+    const _: () = assert!(offset_of!(BarRec, index) == 76);
+    const _: () = assert!(offset_of!(BarRec, total) == 80);
+    const _: () = assert!(offset_of!(BarRec, _reserved) == 88);
 }
 
 #[cfg(test)]

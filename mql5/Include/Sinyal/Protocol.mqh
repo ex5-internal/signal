@@ -23,6 +23,11 @@
 #define SINYAL_MAX_POSITIONS        512
 #define SINYAL_MAX_ORDERS           512
 
+//--- HistReq içindeki sembol adı alanının uzunluğu.
+//    Service grafiğe BAĞLI DEĞİLDİR (_Symbol yok) ve symbol_id'yi ada
+//    çevirebilmesi için adın istekle birlikte gelmesi gerekir.
+#define SINYAL_HIST_SYMBOL_LEN      32
+
 //--- beklenen yapı boyutları (EA açılışta DLL ile karşılaştırır)
 #define SINYAL_SIZEOF_TICK          56
 #define SINYAL_SIZEOF_BOOKLEVEL     24
@@ -33,6 +38,8 @@
 #define SINYAL_SIZEOF_ACCOUNT       512
 #define SINYAL_SIZEOF_POSITION      192
 #define SINYAL_SIZEOF_ORDER         192
+#define SINYAL_SIZEOF_HISTREQ       64
+#define SINYAL_SIZEOF_BARREC        120
 
 //--- mesaj türü (Tick.kind / Book.kind)
 #define SINYAL_KIND_TICK                1
@@ -97,6 +104,7 @@
 #define SINYAL_SYMFLAG_BOOK_SUBSCRIBED  1
 #define SINYAL_SYMFLAG_READY            2
 #define SINYAL_SYMFLAG_POLLED_ONLY      4
+#define SINYAL_SYMFLAG_CHART            8
 
 //--- Res.source: canli olay mi, mutabakat telafisi mi
 #define SINYAL_RESSRC_LIVE              0
@@ -137,6 +145,31 @@
 #define SINYAL_RES_TRADE_TXN            2
 #define SINYAL_RES_REJECTED             3
 #define SINYAL_RES_DUPLICATE            4
+
+//--- SinyalBarRec.flags bitleri.
+//    PARTIAL: bar OLUSMAKTA, close degismeye devam eder. CopyRates'in
+//             son bari (start_pos=0) HER ZAMAN budur.
+//    HAS_REAL_VOLUME: real_volume ANLAMLI. Bayrak yoksa 0 "hacim sifir"
+//             DEGIL "veri yok" demektir — cogu forex brokeri yayinlamaz.
+//    ERROR:   kayit veri degil HATA tasiyor; MQL5 hata kodu spread
+//             alanindadir, total 0'dir.
+#define SINYAL_BARFLAG_PARTIAL          1
+#define SINYAL_BARFLAG_LAST             2
+#define SINYAL_BARFLAG_HAS_REAL_VOLUME  4
+#define SINYAL_BARFLAG_ERROR            8
+
+//--- zaman dilimi = MT5 ENUM_TIMEFRAMES HAM degeri.
+//    Kendi sirali enum'umuz DEGIL: service bu degeri dogrudan
+//    CopyRates'e verecek ve aradaki her ceviri bir hata firsatidir.
+//    DIKKAT: H1 = 16385, 60 DEGIL — dakika sanmak sessizce yanlis
+//    dilim cekilmesine yol acar.
+#define SINYAL_TF_M1                    1
+#define SINYAL_TF_M5                    5
+#define SINYAL_TF_M15                   15
+#define SINYAL_TF_M30                   30
+#define SINYAL_TF_H1                    16385
+#define SINYAL_TF_H4                    16388
+#define SINYAL_TF_D1                    16408
 
 //+------------------------------------------------------------------+
 //| Tek piyasa tick'i. 56 bayt.                                      |
@@ -408,4 +441,64 @@ struct SinyalOrder
    uchar             digits;         // +165
    uchar             flags;          // +166
    uchar             reserved0[25];  // +167
+  };
+
+//+------------------------------------------------------------------+
+//| Geçmiş bar isteği (çekirdek -> SERVICE). 64 bayt.                |
+//|                                                                  |
+//| Bu kanal EA'dan GEÇMEZ. CopyRates çağıran thread'i bloklar ve     |
+//| zaman aşımı belgelenmemiştir (canlıda 30-60 sn donma raporları);  |
+//| EA'nın tek thread'inde çağrılırsa tick toplama tamamen durur.     |
+//| Bu yüzden isteği ayrı bir MQL5 Service karşılar.                  |
+//|                                                                  |
+//| to_msc  : bar açılış zamanı ÜST SINIRI (epoch ms). 0 = en son     |
+//|           barlardan geriye doğru.                                 |
+//| count   : service bunu TERMINAL_MAXBARS ile ayrıca KIRPAR.        |
+//| symbol  : sembolün broker'daki GERÇEK adı, NUL dolgulu.           |
+//|           Service grafiğe bağlı değildir; symbol_id'yi ada        |
+//|           çevirebilmesinin ek FFI gerektirmeyen tek yolu budur.   |
+//|           _reserved'in ilk 32 baytını kaplar, yapı boyutu       |
+//|           DEĞİŞMEZ.                                               |
+//+------------------------------------------------------------------+
+struct SinyalHistReq
+  {
+   long              to_msc;         // +0   epoch MS, 0 = en yeniden geriye
+   uint              req_id;         // +8   0 GEÇERSİZ
+   uint              symbol_id;      // +12
+   uint              timeframe;      // +16  SINYAL_TF_* (MT5 ham enum)
+   uint              count;          // +20  istenen bar sayısı
+   uchar             symbol[SINYAL_HIST_SYMBOL_LEN]; // +24 broker sembol adı
+   uchar             reserved0[8];   // +56
+  };
+
+//+------------------------------------------------------------------+
+//| Tek geçmiş bar (SERVICE -> çekirdek). 120 bayt.                   |
+//|                                                                  |
+//| time_msc MİLİSANİYEDİR; MqlRates.time ise SANİYE. Service 1000 ile|
+//| ÇARPAR — çarpmazsa iki kaynağın bar sınırları 1000 kat kayar.     |
+//|                                                                  |
+//| spread MqlRates ile aynı şekilde int'tir (64 bit DEĞİL). ERROR    |
+//| bayrağı kuruluysa bu alan bar verisi değil MQL5 HATA KODU taşır.  |
+//|                                                                  |
+//| index/total eksik teslimatı görünür kılar: halka dolarsa barlar   |
+//| sessizce kaybolurdu, sayı tutmayınca fark edilir.                 |
+//+------------------------------------------------------------------+
+struct SinyalBarRec
+  {
+   long              time_msc;       // +0   bar AÇILIŞI, epoch MS (saniye*1000)
+   double            open;           // +8
+   double            high;           // +16
+   double            low;            // +24
+   double            close;          // +32
+   long              tick_volume;    // +40  tick sayısı — gerçek hacim DEĞİL
+   long              real_volume;    // +48  yalnız HAS_REAL_VOLUME ile anlamlı
+   uint              req_id;         // +56
+   uint              symbol_id;      // +60
+   uint              timeframe;      // +64  SINYAL_TF_*
+   int               spread;         // +68  point; ERROR'da MQL5 hata kodu
+   uint              flags;          // +72  SINYAL_BARFLAG_*
+   uint              index;          // +76  0'dan başlar, ESKİDEN YENİYE
+   uint              total;          // +80  bu isteğin toplam bar sayısı
+   uint              reserved0;      // +84  dolgu
+   uchar             reserved1[32];  // +88
   };

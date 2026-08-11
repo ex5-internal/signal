@@ -41,11 +41,24 @@ pub enum ClientMsg {
 
     /// Mum (OHLC) geçmişi iste.
     ///
-    /// DİKKAT: geçmiş, daemon başladığı andan itibarendir — geriye dönük
-    /// broker geçmişi YOKTUR. İlk bar `partial: true` ile işaretlenir.
+    /// İki kaynak vardır ve cevap **hangisinden geldiğini söyler**
+    /// (`src_kind`):
+    ///
+    /// - `mt5` — broker'ın kendi serisi (forex/CFD'de genellikle BID).
+    ///   Geriye dönük geçmiş vardır. MQL5 Service çalışıyorsa bu istek onu
+    ///   tetikler.
+    /// - `tick` — tick akışından burada üretilen seri (MID). Geriye dönük
+    ///   geçmiş YOKTUR; depo daemon başladığı andan itibaren dolar ve ilk bar
+    ///   `partial: true` ile işaretlenir.
+    ///
+    /// İki seri **birleştirilmez** — birleşim noktası sahte bir fiyat boşluğu
+    /// üretirdi.
     Candles {
         symbol: String,
-        /// `M1` | `M5` | `M15` | `M30` | `H1` | `H4`
+        /// `M1` | `M5` | `M15` | `M30` | `H1` | `H4` | `D1`
+        ///
+        /// `D1` yalnızca `mt5` kaynağından gelir: günlük barın sınırı broker
+        /// sunucusunun gün başlangıcıdır, bizim UTC sınırımızla tutmaz.
         #[serde(default = "default_tf")]
         tf: String,
         #[serde(default = "default_candle_count")]
@@ -233,13 +246,41 @@ pub enum ServerMsg {
     Candles {
         s: String,
         tf: String,
+        /// Bu barlar **nereden** geldi: `mt5` (broker'ın kendi serisi, genelde
+        /// BID) veya `tick` (bizim ürettiğimiz, MID).
+        ///
+        /// Söylemek zorunlu: iki seri aynı fiyat serisi değildir ve istemci
+        /// hangisine baktığını bilmeden gösterge hesaplayamaz. Bir cevap
+        /// **asla** iki kaynağı karıştırmaz.
+        src_kind: &'static str,
         items: Vec<crate::candles::Bar>,
+        /// `mt5` görüntüsünün yaşı (ms). Bu seri bir **anlık görüntüdür**,
+        /// kendiliğinden güncellenmez. `tick` kaynağında yoktur (canlıdır).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        age_ms: Option<i64>,
+        /// MT5'ten geçmiş çekme denemesinin sonucu:
+        ///
+        /// - `off` — geçmiş kanalı yok (Service çalışmıyor veya kapalı derlendi)
+        /// - `cached` — depodaki görüntü yeterince taze, çekilmedi
+        /// - `ok` — çekildi, tam geldi
+        /// - `incomplete` — çekildi ama **eksik**; seri delikli olabilir
+        /// - `failed` — Service hata bildirdi (kod `hist_note` içinde)
+        /// - `timeout` — süre doldu; Service yanıt vermedi
+        /// - `refused` — istek hiç gönderilemedi
+        hist: &'static str,
+        /// `hist` için insan okunur ayrıntı (hata kodu, kaç bar eksik).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hist_note: Option<String>,
     },
 
     /// Bir mum kapandı (canlı).
+    ///
+    /// **Daima `tick` kaynaklıdır** — tick akışından üretilir. `mt5` kaynaklı
+    /// bir dizinin sonuna eklenmemelidir; iki seri farklı fiyat tabanındadır.
     Candle {
         s: String,
         tf: &'static str,
+        src_kind: &'static str,
         bar: crate::candles::Bar,
     },
 
@@ -291,9 +332,17 @@ pub struct SymbolInfo {
     pub stops_level: u32,
     /// Broker bu sembolde derinlik veriyor mu (0 = hayır).
     pub book_depth: u32,
-    /// `true` ise bu sembol yalnızca timer taramasıyla toplanıyor ve
-    /// ~10-16 ms'lik ek gecikme taşıyor.
+    /// `true` ise bu sembol yalnızca timer taramasıyla toplanıyor: ~10-16 ms
+    /// ek gecikme, ve iki tarama arasındaki ara tickler GÖRÜLMEZ.
     pub polled_only: bool,
+    /// `true` ise bu sembol EA'nın bağlı olduğu grafiğin sembolüdür ve
+    /// `OnTick` ile **olay güdümlü** akar — terminalin verdiği her tick olayı
+    /// alınır.
+    ///
+    /// **En yüksek sadakat bu semboldedir.** Sinyal üretimi hangi sembolde
+    /// yapılacaksa EA o sembolün grafiğine bağlanmalıdır; aksi halde strateji
+    /// gördüğü fiyat serisinde ara tickleri kaçırır.
+    pub chart: bool,
     /// Sembol canlı veri üretti mi. `false` ise fiyatına güvenme.
     pub ready: bool,
     pub src: String,
@@ -541,6 +590,81 @@ mod tests {
         assert!(!j.contains(r#""order":"#), "boş alanlar gönderilmemeli: {j}");
         assert!(!j.contains(r#""deal":"#));
         assert!(!j.contains(r#""comment":"#));
+    }
+
+    #[test]
+    fn candles_answer_always_says_which_source_it_came_from() {
+        // İstemci hangi seriye baktığını bilmeden gösterge hesaplayamaz:
+        // mt5 = BID tabanlı broker serisi, tick = bizim MID serimiz.
+        let m = ServerMsg::Candles {
+            s: "EURUSD".into(),
+            tf: "M5".into(),
+            src_kind: "mt5",
+            items: vec![crate::candles::Bar {
+                t: 1_700_000_000_000,
+                o: 1.10,
+                h: 1.11,
+                l: 1.09,
+                c: 1.105,
+                ticks: 250,
+                spread: Some(12),
+                ..Default::default()
+            }],
+            age_ms: Some(1200),
+            hist: "ok",
+            hist_note: None,
+        };
+        let j = serde_json::to_string(&m).unwrap();
+        assert!(j.contains(r#""src_kind":"mt5""#), "kaynak bildirilmeli: {j}");
+        assert!(j.contains(r#""age_ms":1200"#), "goruntunun yasi bildirilmeli");
+        assert!(j.contains(r#""hist":"ok""#));
+        assert!(j.contains(r#""spread":12"#));
+        // Broker gerçek hacim vermiyor: 0 GÖNDERİLMEZ, alan hiç olmaz.
+        assert!(!j.contains(r#""real_volume""#), "veri yoksa hacim alani olmamali: {j}");
+        assert!(!j.contains(r#""hist_note""#));
+    }
+
+    #[test]
+    fn tick_sourced_answer_reports_no_age_because_it_is_live() {
+        let m = ServerMsg::Candles {
+            s: "EURUSD".into(),
+            tf: "M1".into(),
+            src_kind: "tick",
+            items: vec![],
+            age_ms: None,
+            hist: "off",
+            hist_note: Some("service yok".into()),
+        };
+        let j = serde_json::to_string(&m).unwrap();
+        assert!(j.contains(r#""src_kind":"tick""#));
+        assert!(!j.contains(r#""age_ms""#), "tick serisi canli, yas alani olmamali");
+        assert!(j.contains(r#""hist":"off""#));
+        assert!(j.contains(r#""hist_note":"service yok""#));
+    }
+
+    #[test]
+    fn live_candle_event_is_marked_tick_sourced() {
+        // Bu barı bir mt5 dizisinin sonuna eklemek, birleşim noktasında sahte
+        // bir fiyat boşluğu üretirdi.
+        let m = ServerMsg::Candle {
+            s: "EURUSD".into(),
+            tf: "M1",
+            src_kind: "tick",
+            bar: crate::candles::Bar { t: 1, o: 1.0, h: 1.0, l: 1.0, c: 1.0, ticks: 3, ..Default::default() },
+        };
+        let j = serde_json::to_string(&m).unwrap();
+        assert!(j.contains(r#""t":"candle""#));
+        assert!(j.contains(r#""src_kind":"tick""#), "canli bar kaynagi bildirilmeli: {j}");
+    }
+
+    #[test]
+    fn real_volume_zero_is_sent_only_when_the_broker_actually_publishes_it() {
+        // 0 "hacim sifir" degil "veri yok" demek — ayrimi tel uzerinde de
+        // korumak zorundayiz.
+        let with = crate::candles::Bar { real_volume: Some(0), ..Default::default() };
+        let without = crate::candles::Bar { real_volume: None, ..Default::default() };
+        assert!(serde_json::to_string(&with).unwrap().contains(r#""real_volume":0"#));
+        assert!(!serde_json::to_string(&without).unwrap().contains("real_volume"));
     }
 
     #[test]

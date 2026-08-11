@@ -298,6 +298,19 @@ void PrepareSymbols(SinyalSymbolEntry &out[], int &out_count)
 
       uint flags = 0;
 
+      // GRAFİK SEMBOLÜ ayrı bir gecikme sınıfıdır ve bunu tüketiciye DOĞRU
+      // bildirmek zorundayız: `OnTick` YALNIZCA grafik sembolü için tetiklenir,
+      // yani o sembol terminalin verdiği her tick olayını olay güdümlü alır.
+      // Taramaya bağlı değildir.
+      //
+      // Önceki sürüm bayrağı yalnızca DOM'a bakarak kuruyordu, bu yüzden grafik
+      // sembolü de POLLED_ONLY görünüyordu. Bu YANLIŞ bilgiydi: sinyal üreten
+      // bir tüketici o sembolü "16 ms örneklemeli, aradaki tickler kayıp"
+      // sanırdı — oysa tam tersine en yüksek sadakat orada.
+      bool is_chart = (sym == _Symbol);
+      if(is_chart)
+         flags |= SINYAL_SYMFLAG_CHART;
+
       // DOM: bookdepth 0 ise MarketBookAdd'i HİÇ çağırma. Retail forex'te
       // 0 beklenen durumdur ve gereksiz çağrı 4901 üretir.
       if(EnableBook && bookdepth > 0)
@@ -311,13 +324,15 @@ void PrepareSymbols(SinyalSymbolEntry &out[], int &out_count)
          else
            {
             Print("Sinyal: MarketBookAdd başarısız (", sym, ") hata=", GetLastError());
-            flags |= SINYAL_SYMFLAG_POLLED_ONLY;
+            if(!is_chart)
+               flags |= SINYAL_SYMFLAG_POLLED_ONLY;
             n_nobook++;
            }
         }
       else
         {
-         flags |= SINYAL_SYMFLAG_POLLED_ONLY;
+         if(!is_chart)
+            flags |= SINYAL_SYMFLAG_POLLED_ONLY;
          n_nobook++;
         }
 
@@ -358,8 +373,15 @@ void PrepareSymbols(SinyalSymbolEntry &out[], int &out_count)
      }
 
    if(VerboseLog)
+     {
+      // Grafik sembolünü AYRICA yaz: sinyal üretiminin hangi sembolde en
+      // yüksek sadakatle çalıştığını görmenin tek yolu bu satır.
       PrintFormat("Sinyal: sembol hazırlığı — seçilen=%d, DOM=%d, yalnız-polling=%d, başarısız=%d",
                   n_selected, n_book, n_nobook, n_failed);
+      PrintFormat("Sinyal: grafik sembolü=%s (OnTick ile olay güdümlü, en yüksek sadakat) — "
+                  "diğer %d sembol %d ms taramayla örnekleniyor",
+                  _Symbol, n_selected - 1, TimerMs);
+     }
   }
 
 //+------------------------------------------------------------------+

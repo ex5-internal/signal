@@ -20,6 +20,7 @@
 
 use std::mem::size_of;
 
+use sinyal_proto::bars::{bar_flag, timeframe, BarRec, HistReq, HIST_SYMBOL_LEN};
 use sinyal_proto::msg::{Book, BookLevel, Cmd, Res, SymbolEntry, Tick};
 use sinyal_proto::state::{
     margin_mode, rec_flag, so_mode, trade_mode, AccountSnapshot, OrderRec, PositionRec,
@@ -28,6 +29,14 @@ use sinyal_proto::{
     action, book_type, exec_mode, filling, filling_mask, kind, order_type, res_kind, res_source,
     sym_flag, tick_flag, type_time, COMMENT_LEN, MAX_BOOK_DEPTH, SYMBOL_NAME_LEN,
 };
+
+/// `HistReq.symbol` alanının ofseti — MQL5 gövdesindeki yorumlara girer.
+///
+/// Elle yazılmazsa Rust tarafında bir alan eklendiğinde başlıktaki ofset
+/// yorumu sessizce yalan söylerdi. `HIST_SYMBOL_LEN` de `sinyal_proto`'dan
+/// geliyor: adın uzunluğu iki yerde tutulsaydı biri kayar ve service isteğin
+/// ortasından okumaya başlardı.
+const HIST_SYMBOL_OFF: usize = std::mem::offset_of!(HistReq, symbol);
 
 fn main() -> std::io::Result<()> {
     let out = render();
@@ -73,6 +82,11 @@ fn render() -> String {
 #define SINYAL_MAX_POSITIONS        {max_positions}
 #define SINYAL_MAX_ORDERS           {max_orders}
 
+//--- HistReq içindeki sembol adı alanının uzunluğu.
+//    Service grafiğe BAĞLI DEĞİLDİR (_Symbol yok) ve symbol_id'yi ada
+//    çevirebilmesi için adın istekle birlikte gelmesi gerekir.
+#define SINYAL_HIST_SYMBOL_LEN      {hist_symbol_len}
+
 //--- beklenen yapı boyutları (EA açılışta DLL ile karşılaştırır)
 #define SINYAL_SIZEOF_TICK          {sz_tick}
 #define SINYAL_SIZEOF_BOOKLEVEL     {sz_booklevel}
@@ -83,10 +97,13 @@ fn render() -> String {
 #define SINYAL_SIZEOF_ACCOUNT       {sz_account}
 #define SINYAL_SIZEOF_POSITION      {sz_position}
 #define SINYAL_SIZEOF_ORDER         {sz_order}
+#define SINYAL_SIZEOF_HISTREQ       {sz_histreq}
+#define SINYAL_SIZEOF_BARREC        {sz_barrec}
 
 "#,
         proto_version = sinyal_proto::ring::RING_VERSION,
         max_book_depth = MAX_BOOK_DEPTH,
+        hist_symbol_len = HIST_SYMBOL_LEN,
         comment_len = COMMENT_LEN,
         symbol_name_len = SYMBOL_NAME_LEN,
         rec_comment_len = sinyal_proto::state::REC_COMMENT_LEN,
@@ -101,6 +118,8 @@ fn render() -> String {
         sz_account = size_of::<AccountSnapshot>(),
         sz_position = size_of::<PositionRec>(),
         sz_order = size_of::<OrderRec>(),
+        sz_histreq = size_of::<HistReq>(),
+        sz_barrec = size_of::<BarRec>(),
     ));
 
     // ---- sabitler ----
@@ -169,6 +188,7 @@ fn render() -> String {
     s.push_str(&def32("SINYAL_SYMFLAG_BOOK_SUBSCRIBED", sym_flag::BOOK_SUBSCRIBED));
     s.push_str(&def32("SINYAL_SYMFLAG_READY", sym_flag::READY));
     s.push_str(&def32("SINYAL_SYMFLAG_POLLED_ONLY", sym_flag::POLLED_ONLY));
+    s.push_str(&def32("SINYAL_SYMFLAG_CHART", sym_flag::CHART));
 
     s.push_str("\n//--- Res.source: canli olay mi, mutabakat telafisi mi\n");
     s.push_str(&def("SINYAL_RESSRC_LIVE", res_source::LIVE));
@@ -211,6 +231,35 @@ fn render() -> String {
     s.push_str(&def("SINYAL_RES_TRADE_TXN", res_kind::TRADE_TXN));
     s.push_str(&def("SINYAL_RES_REJECTED", res_kind::REJECTED));
     s.push_str(&def("SINYAL_RES_DUPLICATE", res_kind::DUPLICATE));
+
+    s.push_str(
+        "\n//--- SinyalBarRec.flags bitleri.\n\
+         //    PARTIAL: bar OLUSMAKTA, close degismeye devam eder. CopyRates'in\n\
+         //             son bari (start_pos=0) HER ZAMAN budur.\n\
+         //    HAS_REAL_VOLUME: real_volume ANLAMLI. Bayrak yoksa 0 \"hacim sifir\"\n\
+         //             DEGIL \"veri yok\" demektir — cogu forex brokeri yayinlamaz.\n\
+         //    ERROR:   kayit veri degil HATA tasiyor; MQL5 hata kodu spread\n\
+         //             alanindadir, total 0'dir.\n",
+    );
+    s.push_str(&def32("SINYAL_BARFLAG_PARTIAL", bar_flag::PARTIAL));
+    s.push_str(&def32("SINYAL_BARFLAG_LAST", bar_flag::LAST));
+    s.push_str(&def32("SINYAL_BARFLAG_HAS_REAL_VOLUME", bar_flag::HAS_REAL_VOLUME));
+    s.push_str(&def32("SINYAL_BARFLAG_ERROR", bar_flag::ERROR));
+
+    s.push_str(
+        "\n//--- zaman dilimi = MT5 ENUM_TIMEFRAMES HAM degeri.\n\
+         //    Kendi sirali enum'umuz DEGIL: service bu degeri dogrudan\n\
+         //    CopyRates'e verecek ve aradaki her ceviri bir hata firsatidir.\n\
+         //    DIKKAT: H1 = 16385, 60 DEGIL — dakika sanmak sessizce yanlis\n\
+         //    dilim cekilmesine yol acar.\n",
+    );
+    s.push_str(&def32("SINYAL_TF_M1", timeframe::M1));
+    s.push_str(&def32("SINYAL_TF_M5", timeframe::M5));
+    s.push_str(&def32("SINYAL_TF_M15", timeframe::M15));
+    s.push_str(&def32("SINYAL_TF_M30", timeframe::M30));
+    s.push_str(&def32("SINYAL_TF_H1", timeframe::H1));
+    s.push_str(&def32("SINYAL_TF_H4", timeframe::H4));
+    s.push_str(&def32("SINYAL_TF_D1", timeframe::D1));
 
     // ---- yapılar ----
     s.push_str(&format!(
@@ -486,7 +535,73 @@ struct SinyalOrder
    uchar             flags;          // +166
    uchar             reserved0[25];  // +167
   }};
+
+//+------------------------------------------------------------------+
+//| Geçmiş bar isteği (çekirdek -> SERVICE). {sz_histreq} bayt.                |
+//|                                                                  |
+//| Bu kanal EA'dan GEÇMEZ. CopyRates çağıran thread'i bloklar ve     |
+//| zaman aşımı belgelenmemiştir (canlıda 30-60 sn donma raporları);  |
+//| EA'nın tek thread'inde çağrılırsa tick toplama tamamen durur.     |
+//| Bu yüzden isteği ayrı bir MQL5 Service karşılar.                  |
+//|                                                                  |
+//| to_msc  : bar açılış zamanı ÜST SINIRI (epoch ms). 0 = en son     |
+//|           barlardan geriye doğru.                                 |
+//| count   : service bunu TERMINAL_MAXBARS ile ayrıca KIRPAR.        |
+//| symbol  : sembolün broker'daki GERÇEK adı, NUL dolgulu.           |
+//|           Service grafiğe bağlı değildir; symbol_id'yi ada        |
+//|           çevirebilmesinin ek FFI gerektirmeyen tek yolu budur.   |
+//|           _reserved'in ilk {hist_symbol_len} baytını kaplar, yapı boyutu       |
+//|           DEĞİŞMEZ.                                               |
+//+------------------------------------------------------------------+
+struct SinyalHistReq
+  {{
+   long              to_msc;         // +0   epoch MS, 0 = en yeniden geriye
+   uint              req_id;         // +8   0 GEÇERSİZ
+   uint              symbol_id;      // +12
+   uint              timeframe;      // +16  SINYAL_TF_* (MT5 ham enum)
+   uint              count;          // +20  istenen bar sayısı
+   uchar             symbol[SINYAL_HIST_SYMBOL_LEN]; // +{hist_symbol_off} broker sembol adı
+   uchar             reserved0[{hist_tail}];   // +{hist_tail_off}
+  }};
+
+//+------------------------------------------------------------------+
+//| Tek geçmiş bar (SERVICE -> çekirdek). {sz_barrec} bayt.                   |
+//|                                                                  |
+//| time_msc MİLİSANİYEDİR; MqlRates.time ise SANİYE. Service 1000 ile|
+//| ÇARPAR — çarpmazsa iki kaynağın bar sınırları 1000 kat kayar.     |
+//|                                                                  |
+//| spread MqlRates ile aynı şekilde int'tir (64 bit DEĞİL). ERROR    |
+//| bayrağı kuruluysa bu alan bar verisi değil MQL5 HATA KODU taşır.  |
+//|                                                                  |
+//| index/total eksik teslimatı görünür kılar: halka dolarsa barlar   |
+//| sessizce kaybolurdu, sayı tutmayınca fark edilir.                 |
+//+------------------------------------------------------------------+
+struct SinyalBarRec
+  {{
+   long              time_msc;       // +0   bar AÇILIŞI, epoch MS (saniye*1000)
+   double            open;           // +8
+   double            high;           // +16
+   double            low;            // +24
+   double            close;          // +32
+   long              tick_volume;    // +40  tick sayısı — gerçek hacim DEĞİL
+   long              real_volume;    // +48  yalnız HAS_REAL_VOLUME ile anlamlı
+   uint              req_id;         // +56
+   uint              symbol_id;      // +60
+   uint              timeframe;      // +64  SINYAL_TF_*
+   int               spread;         // +68  point; ERROR'da MQL5 hata kodu
+   uint              flags;          // +72  SINYAL_BARFLAG_*
+   uint              index;          // +76  0'dan başlar, ESKİDEN YENİYE
+   uint              total;          // +80  bu isteğin toplam bar sayısı
+   uint              reserved0;      // +84  dolgu
+   uchar             reserved1[32];  // +88
+  }};
 "#,
+        hist_symbol_len = HIST_SYMBOL_LEN,
+        hist_symbol_off = HIST_SYMBOL_OFF,
+        hist_tail = size_of::<HistReq>() - HIST_SYMBOL_OFF - HIST_SYMBOL_LEN,
+        hist_tail_off = HIST_SYMBOL_OFF + HIST_SYMBOL_LEN,
+        sz_histreq = size_of::<HistReq>(),
+        sz_barrec = size_of::<BarRec>(),
         sz_tick = size_of::<Tick>(),
         sz_booklevel = size_of::<BookLevel>(),
         sz_book = size_of::<Book>(),
@@ -552,6 +667,7 @@ fn mql5_struct_size(src: &str, name: &str) -> Option<usize> {
                         "SINYAL_SYMBOL_NAME_LEN" => SYMBOL_NAME_LEN,
                         "SINYAL_MAX_BOOK_DEPTH" => MAX_BOOK_DEPTH,
                         "SINYAL_REC_COMMENT_LEN" => sinyal_proto::state::REC_COMMENT_LEN,
+                        "SINYAL_HIST_SYMBOL_LEN" => HIST_SYMBOL_LEN,
                         other => panic!("bilinmeyen dizi sabiti: {other}"),
                     },
                 };
@@ -595,6 +711,10 @@ mod tests {
             "#define SINYAL_SIZEOF_SYMBOLENTRY   {}",
             size_of::<SymbolEntry>()
         )));
+        assert!(out
+            .contains(&format!("#define SINYAL_SIZEOF_HISTREQ       {}", size_of::<HistReq>())));
+        assert!(out
+            .contains(&format!("#define SINYAL_SIZEOF_BARREC        {}", size_of::<BarRec>())));
     }
 
     #[test]
@@ -610,6 +730,8 @@ mod tests {
             "SinyalAccount",
             "SinyalPosition",
             "SinyalOrder",
+            "SinyalHistReq",
+            "SinyalBarRec",
         ] {
             assert!(out.contains(&format!("struct {name}")), "{name} eksik");
         }
@@ -656,7 +778,7 @@ mod tests {
     #[test]
     fn generated_mql5_structs_have_the_same_size_as_rust() {
         let out = render();
-        let cases: [(&str, usize); 9] = [
+        let cases: [(&str, usize); 11] = [
             ("SinyalTick", size_of::<Tick>()),
             ("SinyalBookLevel", size_of::<BookLevel>()),
             ("SinyalBook", size_of::<Book>()),
@@ -666,6 +788,11 @@ mod tests {
             ("SinyalAccount", size_of::<AccountSnapshot>()),
             ("SinyalPosition", size_of::<PositionRec>()),
             ("SinyalOrder", size_of::<OrderRec>()),
+            // Geçmiş kanalı: sembol adı `_reserved`'in ilk 32 baytına
+            // BÖLÜNEREK taşındığı için MQL5 gövdesi Rust'takinden farklı
+            // GÖRÜNÜR; boyut aynı kalmazsa service yanlış ofsetten okur.
+            ("SinyalHistReq", size_of::<HistReq>()),
+            ("SinyalBarRec", size_of::<BarRec>()),
         ];
         for (name, rust_size) in cases {
             let mql = mql5_struct_size(&out, name)
@@ -692,10 +819,78 @@ mod tests {
             "SINYAL_FILLMASK_BOC",
             "SINYAL_SYMFLAG_READY",
             "SINYAL_SYMFLAG_POLLED_ONLY",
+            "SINYAL_SYMFLAG_CHART",
         ] {
             assert!(out.contains(c), "{c} eksik");
         }
         // RETURN'ün maskede OLMADIĞI başlıkta açıkça yazmalı.
         assert!(out.contains("RETURN bu maskede YOKTUR"));
+    }
+
+    #[test]
+    fn hist_channel_constants_are_emitted() {
+        // Service bu sabitler olmadan bar yazamaz: bayrak yoksa "oluşmakta
+        // olan bar" ile "kapanmış bar" ayırt edilemez, dilim sabiti yoksa
+        // CopyRates'e verilecek değer elle uydurulur.
+        let out = render();
+        for c in [
+            "SINYAL_BARFLAG_PARTIAL",
+            "SINYAL_BARFLAG_LAST",
+            "SINYAL_BARFLAG_HAS_REAL_VOLUME",
+            "SINYAL_BARFLAG_ERROR",
+            "SINYAL_TF_M1",
+            "SINYAL_TF_M5",
+            "SINYAL_TF_M15",
+            "SINYAL_TF_M30",
+            "SINYAL_TF_H1",
+            "SINYAL_TF_H4",
+            "SINYAL_TF_D1",
+            "SINYAL_HIST_SYMBOL_LEN",
+        ] {
+            assert!(out.contains(c), "{c} eksik");
+        }
+    }
+
+    #[test]
+    fn timeframe_defines_carry_raw_mt5_enum_values() {
+        // H1'i 60 sanmak (dakika) sessizce YANLIŞ dilim çekilmesine yol açar
+        // ve grafikte hiçbir hata görünmez — bu yüzden değerin kendisi test
+        // edilir, yalnızca varlığı değil.
+        let out = render();
+        assert!(out.contains(&format!("#define SINYAL_TF_H1                    {}", timeframe::H1)));
+        assert!(out.contains(&format!("#define SINYAL_TF_D1                    {}", timeframe::D1)));
+        assert!(out.contains("H1 = 16385, 60 DEGIL"));
+    }
+
+    #[test]
+    fn hist_req_symbol_field_matches_the_rust_offset() {
+        // MQL5 gövdesindeki ofset yorumu ile Rust'taki GERÇEK ofset aynı
+        // olmalı. Boyut testi yalnızca TOPLAMI karşılaştırdığı için, aynı
+        // boyutta iki alanın yeri değişse o test GEÇER ve sembol adı isteğin
+        // ortasından okunmaya başlardı.
+        assert!(
+            HIST_SYMBOL_OFF + HIST_SYMBOL_LEN <= size_of::<HistReq>(),
+            "sembol alanı HistReq'in dışına taşıyor"
+        );
+        let out = render();
+        assert!(out.contains(&format!(
+            "uchar             symbol[SINYAL_HIST_SYMBOL_LEN]; // +{HIST_SYMBOL_OFF}"
+        )));
+
+        // Ofsetin kendisi de doğru olmalı: to_msc(8) + dört uint(16) = 24.
+        assert_eq!(HIST_SYMBOL_OFF, 24);
+        // Ve adı yazıp okumak gerçekten çalışmalı — alan var ama kullanılamaz
+        // olsaydı çekirdek adı hiç doldurmazdı (bu daha önce oldu).
+        let mut r = HistReq::default();
+        assert!(r.set_symbol("EURUSD.pro"));
+        assert_eq!(r.symbol_str(), "EURUSD.pro");
+    }
+
+    #[test]
+    fn bar_time_unit_conversion_is_documented_in_header() {
+        // MqlRates.time SANİYE, BarRec.time_msc MİLİSANİYE. Bu dönüşüm
+        // unutulursa bar sınırları 1000 kat kayar ve hata sessizdir.
+        let out = render();
+        assert!(out.contains("MqlRates.time ise SANİYE"));
     }
 }
