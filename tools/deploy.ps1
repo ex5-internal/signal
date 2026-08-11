@@ -191,6 +191,8 @@ if ($Compile) {
         # EA ve Service AYRI programlardır ve ikisi de derlenmelidir. Service
         # derlenmezse Navigator'da hiç görünmez ve tek belirtisi "geçmiş
         # gelmiyor" olur — sessiz bir başarısızlık.
+        # Aynı oturumda ikinci kez çağrılırsa önceki koşudan sızmasın.
+        $script:CompileFailed = $false
         $toCompile = @(
             @{ Path = Join-Path $DataDir 'MQL5\Experts\SinyalCollector.mq5'; Label = 'EA' }
             @{ Path = Join-Path $DataDir 'MQL5\Services\SinyalHistory.mq5';  Label = 'Service' }
@@ -202,20 +204,61 @@ if ($Compile) {
             }
             Write-Step "$($item.Label) derleniyor ($editor)"
             $log = Join-Path $env:TEMP "sinyal-compile-$($item.Label).log"
-            # metaeditor derleme başarısında da sıfır olmayan kod dönebilir;
-            # gerçek sonuç log dosyasındadır.
-            & $editor "/compile:$($item.Path)" "/log:$log" | Out-Null
-            Start-Sleep -Milliseconds 500
-            if (Test-Path $log) {
-                $content = Get-Content $log -Encoding Unicode -ErrorAction SilentlyContinue
-                if (-not $content) { $content = Get-Content $log -ErrorAction SilentlyContinue }
-                $content | Where-Object { $_ -match 'error|warning|result' } | ForEach-Object {
-                    if ($_ -match '\berror\b') { Write-Host "    $_" -ForegroundColor Red }
-                    else { Write-Host "    $_" }
-                }
-                if ($content -match '0 error') { Write-Step "$($item.Label) derlemesi başarılı" }
-                else { Write-Warn "$($item.Label) derlemesinde hata olabilir — yukarıdaki loga bak." }
+
+            # BAYAT LOG TUZAĞI: metaeditor kaynağı hiç açamazsa log dosyasını
+            # YAZMAZ. Önceki koşudan kalan log okunur ve "başarılı" sanılır.
+            # Bu yüzden önce siliyoruz ve sonra "yeniden oluştu mu" diye
+            # bakıyoruz.
+            Remove-Item $log -Force -ErrorAction SilentlyContinue
+
+            # `| Out-Null` metaeditor'ü BEKLEMEZ (GUI uygulaması hemen döner);
+            # sabit `Start-Sleep` de bir tahmindi. -Wait gerçekten bekler.
+            $proc = Start-Process -FilePath $editor `
+                -ArgumentList "/compile:$($item.Path)", "/log:$log" `
+                -Wait -PassThru -WindowStyle Hidden
+
+            if (-not (Test-Path $log)) {
+                Write-Warn "$($item.Label) DERLENMEDİ: metaeditor log yazmadı (çıkış=$($proc.ExitCode))."
+                Write-Warn '  Kaynak dosya bulunamamış veya metaeditor başlatılamamış olabilir.'
+                $script:CompileFailed = $true
+                continue
             }
+
+            $content = Get-Content $log -Encoding Unicode -ErrorAction SilentlyContinue
+            if (-not $content) { $content = Get-Content $log -ErrorAction SilentlyContinue }
+            $text = ($content -join "`n")
+
+            $content | Where-Object { $_ -match 'error|warning|result' } | ForEach-Object {
+                if ($_ -match '\b[1-9]\d*\s+errors?\b') { Write-Host "    $_" -ForegroundColor Red }
+                else { Write-Host "    $_" }
+            }
+
+            # HATA SAYISINI OKU, metin ARAMA YAPMA.
+            #
+            # Önceki sürüm `-match '0 error'` kullanıyordu ve bu SESSİZ BİR
+            # YALANDI: "10 errors" metni "0 error" desenini İÇERİR, yani 10
+            # hatalı bir derleme "başarılı" diye raporlanırdı. Sayıyı
+            # yakalayıp SIFIR MI diye bakmak tek doğru yol.
+            if ($text -match '(?<n>\d+)\s+errors?\b') {
+                if ([int]$Matches['n'] -eq 0) {
+                    Write-Step "$($item.Label) derlemesi başarılı"
+                }
+                else {
+                    Write-Warn "$($item.Label) DERLENEMEDİ: $($Matches['n']) hata — yukarıdaki loga bak."
+                    $script:CompileFailed = $true
+                }
+            }
+            else {
+                Write-Warn "$($item.Label): derleme sonucu log'dan OKUNAMADI — başarılı SAYILMIYOR."
+                $script:CompileFailed = $true
+            }
+        }
+        # Service derlenmezse Navigator'da hiç görünmez ve tek belirtisi
+        # "geçmiş gelmiyor" olur. Sessizce geçmek yerine çıkış kodu veriyoruz.
+        if ($script:CompileFailed) {
+            Write-Warn ''
+            Write-Warn 'EN AZ BİR DERLEME BAŞARISIZ — kurulum EKSİK.'
+            $global:LASTEXITCODE = 1
         }
     }
 }
