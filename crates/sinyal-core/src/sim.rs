@@ -22,12 +22,22 @@
 //!   ASK'ten kapanır.
 //! - Kayma: piyasa ve STOP dolumlarında **daima aleyhte**, sabit ve
 //!   belirlenimci ([`SimConfig::slippage_points`], varsayılan 1 point).
+//!   Dolum fiyatı kotasyon ızgarasına da ALEYHTE oturur — en yakına
+//!   yuvarlamak kaymanın kendisini silebilirdi (bkz. [`round_px_adverse`]).
 //! - `stops_level`: SL/TP ve bekleyen emir fiyatının güncel fiyata asgari
 //!   uzaklığı; ihlal 10016 ile reddedilir.
 //! - Marjin: `hacim × contract_size × fiyat / kaldıraç`; serbest marjin
 //!   yetmezse 10019.
 //! - Hacim ızgarası (`volume_step`/`min`/`max`); ihlal 10014.
 //! - SL/TP tetiklenmesi; **aynı tick ikisini de vurursa SL kazanır**.
+//!
+//! # Eksik veriyle SİMÜLE EDİLMEZ
+//!
+//! `contract_size` veya `point` yoksa emir 10013 ile reddedilir
+//! ([`check_contract`]). İlki olmadan marjin ve kâr, ikincisi olmadan kayma
+//! ve `stops_level` hesaplanamaz; ikisinde de motor "modelliyorum" dediği
+//! şeyi modellemeden İYİMSER dolum üretirdi. Eksik veriyle devam etmek,
+//! bu modülün var oluş sebebini ortadan kaldırırdı.
 //!
 //! # Modellenmeyen — bunlar tahmin EDİLMEZ
 //!
@@ -1249,15 +1259,21 @@ impl SimEngine {
             return price;
         }
         let slip = sym.slip(self.cfg.slippage_points);
-        let raw = if kind.is_buy() { ask + slip } else { bid - slip };
-        round_px(raw, sym)
+        let buy = kind.is_buy();
+        let raw = if buy { ask + slip } else { bid - slip };
+        // Izgaraya ALEYHTE oturt: alışta yukarı, satışta aşağı. En yakına
+        // yuvarlamak kaymanın kendisini silebilirdi (bkz. `round_px_adverse`).
+        round_px_adverse(raw, sym, buy)
     }
 
     /// Kapanış dolum fiyatı: LONG BID'den, SHORT ASK'ten — aleyhte kaymayla.
+    ///
+    /// Kapanışta aleyhte yön TERSTİR: LONG satarak çıkar, yani düşük fiyat
+    /// kötüdür; SHORT alarak çıkar, yani yüksek fiyat kötüdür.
     fn market_exit(&self, buy: bool, sym: &SimSymbol, bid: f64, ask: f64) -> f64 {
         let slip = sym.slip(self.cfg.slippage_points);
         let raw = if buy { bid - slip } else { ask + slip };
-        round_px(raw, sym)
+        round_px_adverse(raw, sym, !buy)
     }
 
     /// Serbest marjin denetimi. `leverage <= 0` ise marjin modellenmiyordur.
@@ -1338,6 +1354,44 @@ fn round_px(p: f64, sym: &SimSymbol) -> f64 {
         return p;
     }
     sinyal_proto::normalize_price(p, sym.tick_size, sym.digits)
+}
+
+/// Kotasyon ızgarasının adımı: `tick_size`, yoksa `digits`ten türetilen adım.
+fn grid_step(sym: &SimSymbol) -> f64 {
+    if sym.tick_size > 0.0 && sym.tick_size.is_finite() {
+        sym.tick_size
+    } else {
+        10f64.powi(-(sym.digits.min(15) as i32))
+    }
+}
+
+/// Izgara toleransı: tam ızgarada duran bir fiyatı kayan nokta tozu yüzünden
+/// bir tam adım öteye itmemek için.
+const GRID_TOLERANCE: f64 = 1e-6;
+
+/// Dolum fiyatını ızgaraya **ALEYHTE** oturt (`up` ise yukarı, değilse aşağı).
+///
+/// **En yakına yuvarlamak kaymayı YİYEBİLİR.** Somut örnek: `tick_size` 0.05,
+/// `--sim-slippage 2` (= 0.02) ve ask 4000.20 iken ham dolum 4000.22'dir; en
+/// yakın ızgara noktası 4000.20, yani tam olarak kaymasız fiyat. Kayma
+/// sessizce silinir ve motor "aleyhte kayma modelliyorum" derken mükemmel
+/// dolum üretir — düzeltmeye çalıştığımız yanılgının ta kendisi.
+///
+/// Doğrusu yönlü yuvarlamadır ve gerçekliğe de bu uyar: broker yalnızca
+/// ızgara üzerindeki fiyatları kote edebilir, kayma da sizi bir sonraki
+/// ızgara noktasına İTER, geri çekmez. Zaten ızgarada duran bir fiyat
+/// (kayma 0, ya da kayma ızgaranın tam katı) yerinde kalır.
+fn round_px_adverse(p: f64, sym: &SimSymbol, up: bool) -> f64 {
+    if p == 0.0 || !p.is_finite() {
+        return p;
+    }
+    let g = grid_step(sym);
+    if !(g > 0.0) || !g.is_finite() {
+        return p;
+    }
+    let k = p / g;
+    let k = if up { (k - GRID_TOLERANCE).ceil() } else { (k + GRID_TOLERANCE).floor() };
+    round_dec(k * g, sym.digits.min(15) as i32)
 }
 
 fn round_dec(v: f64, decimals: i32) -> f64 {
@@ -1495,6 +1549,96 @@ mod tests {
     /// `stops_level` = 100 point (10 pip) olan sembol.
     fn strict() -> SimSymbol {
         SimSymbol { stops_level: 100, ..eurusd() }
+    }
+
+    // --- eksik sembol verisi: simüle etmektense reddet ----------------------
+
+    #[test]
+    fn a_symbol_without_contract_size_is_rejected_instead_of_silently_simulated() {
+        // BU TESTİN SEBEBİ: alan 0 iken motor çalışmaya DEVAM edebiliyordu ve
+        // ettiği sürece iki şeyi birden bozuyordu — marjin (hacim × 0 ×
+        // fiyat / kaldıraç ≈ 0, yani sonsuz kaldıraç) ve kâr (fiyat farkı ×
+        // hacim, yani forex'te 100 000 kat küçük). İkisi de simülasyonu
+        // OLDUĞUNDAN KÂRLI gösteriyordu; tam olarak kaçınılmak istenen şey.
+        // Kayıttan oynatımda alan gerçekten 0 geliyordu (kaydedici yazmıyordu).
+        let mut e = engine();
+        let sym = SimSymbol { contract_size: 0.0, ..eurusd() };
+        let out = e.place(&req(SimOrderKind::Buy, 0.10), &sym, 1.10000, 1.10020);
+
+        assert_eq!(out.retcode(), retcode::INVALID, "eksik sozlesme verisi reddedilmeli");
+        assert!(
+            out.reason().unwrap_or_default().contains("contract_size"),
+            "sebep hangi alanin eksik oldugunu SOYLEMELI: {:?}",
+            out.reason()
+        );
+        // Sessiz kabul edilseydi burada bir pozisyon dururdu.
+        assert!(e.positions(&PriceBook::new()).is_empty(), "pozisyon acilmamali");
+    }
+
+    #[test]
+    fn a_symbol_without_point_is_rejected_because_slippage_could_not_be_applied() {
+        // `point` yoksa `slip()` 0 döner: motor "aleyhte kayma modelliyorum"
+        // der ama uygulamaz. Sessizce iyimser dolum üretmektense reddediyoruz.
+        let mut e = engine();
+        let sym = SimSymbol { point: 0.0, ..eurusd() };
+        let out = e.place(&req(SimOrderKind::Buy, 0.10), &sym, 1.10000, 1.10020);
+
+        assert_eq!(out.retcode(), retcode::INVALID);
+        assert!(
+            out.reason().unwrap_or_default().contains("point"),
+            "sebep `point`i adiyla anmali: {:?}",
+            out.reason()
+        );
+    }
+
+    #[test]
+    fn fills_land_on_the_tick_grid_exactly_like_the_live_path() {
+        // point ile tick_size AYNI DEĞİL (endeks/CFD'de tick_size point'in
+        // katıdır). Canlı yol fiyatı `normalize_price(p, tick_size, digits)`
+        // ile ızgaraya oturtuyor; simülatör yalnızca `digits`e yuvarlarsa
+        // broker'ın hiç veremeyeceği bir fiyattan dolum raporlar.
+        let sym = SimSymbol {
+            digits: 2,
+            point: 0.01,
+            tick_size: 0.05,
+            volume_step: 0.01,
+            volume_min: 0.01,
+            volume_max: 100.0,
+            stops_level: 0,
+            contract_size: 1.0,
+        };
+        // ASIL TUZAK BURADA: 2 point kayma = 0.02, ham dolum 4000.22. En
+        // YAKIN ızgara noktası 4000.20 — yani tam olarak kaymasız fiyat.
+        // "En yakına yuvarla" deseydik kayma sessizce SİLİNİR ve motor
+        // "aleyhte kayma modelliyorum" derken mükemmel dolum üretirdi.
+        // Doğrusu bir sonraki ızgara noktası: 4000.25.
+        let mut e = SimEngine::new(SimConfig { slippage_points: 2.0, ..SimConfig::default() });
+        let out = e.place(&req(SimOrderKind::Buy, 1.0), &sym, 4000.15, 4000.20);
+        assert!(out.is_accepted(), "{:?}", out.reason());
+
+        let fill = e.positions(&PriceBook::new())[0].price_open;
+        let k = fill / sym.tick_size;
+        assert!(
+            (k - k.round()).abs() < 1e-6,
+            "dolum fiyati tick izgarasinda olmali: {fill} (tick_size {})",
+            sym.tick_size
+        );
+        assert!(near(fill, 4000.25), "kayma izgaraya ALEYHTE oturmali, verilen: {fill}");
+
+        // SATIŞ tarafı simetrik: bid 4000.15 − 0.02 = 4000.13, en yakın
+        // 4000.15 (yine kaymasız), aleyhte olan 4000.10'dur.
+        let out = e.place(&req(SimOrderKind::Sell, 1.0), &sym, 4000.15, 4000.20);
+        assert!(out.is_accepted(), "{:?}", out.reason());
+        let sell_fill = e.positions(&PriceBook::new())[1].price_open;
+        assert!(near(sell_fill, 4000.10), "satista kayma asagi olmali, verilen: {sell_fill}");
+
+        // Kayma ızgaranın tam katıysa fiyat YERİNDE kalmalı: yönlü yuvarlama
+        // bedava bir tik daha eklememeli.
+        let mut e = SimEngine::new(SimConfig { slippage_points: 5.0, ..SimConfig::default() });
+        let out = e.place(&req(SimOrderKind::Buy, 1.0), &sym, 4000.15, 4000.20);
+        assert!(out.is_accepted(), "{:?}", out.reason());
+        let exact = e.positions(&PriceBook::new())[0].price_open;
+        assert!(near(exact, 4000.25), "tam katta fazladan tik eklenmemeli: {exact}");
     }
 
     fn engine() -> SimEngine {

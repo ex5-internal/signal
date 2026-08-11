@@ -875,6 +875,7 @@ fn handle_client_msg(
                     volume_max: e.volume_max,
                     volume_step: e.volume_step,
                     exec_mode: e.trade_exemode,
+                    contract_size: e.contract_size,
                     filling_mask: e.filling_mode,
                     stops_level: e.stops_level,
                     book_depth: e.ticks_bookdepth,
@@ -1362,14 +1363,28 @@ struct SimLook {
     time_msc: i64,
 }
 
-/// O ANKİ fiyat.
+/// O ANKİ fiyat — **isteği çözen ÖRNEĞİN kendi fiyatı**.
 ///
 /// Kaynak canlıdakiyle aynı: sembol kaydına işlenmiş son tick. Replay'de bu
 /// kaydı oynatım motoru, paper'da canlı okuyucu besler — ikisi de aynı
 /// `Registry` üzerinden.
-fn sim_last(ctx: &Ctx, symbol: &str) -> Option<crate::state::LastTick> {
+///
+/// `instance` parametresi ŞART. Önceki sürüm fiyatı adla, örnekten bağımsız
+/// arıyordu; `snapshot` örnek adına göre SIRALI döndüğü için daima
+/// alfabetik olarak ilk örneğin fiyatını alıyordu. Oysa sembol kaydı
+/// (`contract_size`, `stops_level`, `digits`) `resolve_any`den geliyor ve o
+/// bir `HashMap` üzerinde geziniyor, yani RASTGELE bir örneği seçiyor. İki
+/// terminal aynı sembolü kote ettiğinde (iki broker, iki hesap) dolum bir
+/// terminalin fiyatından, doğrulaması BAŞKA terminalin sözleşmesinden
+/// yapılırdı — üstelik hangisinin seçileceği koşudan koşuya değişebilirdi,
+/// yani replay tekrarlanabilirliği de kırılırdı.
+fn sim_last(ctx: &Ctx, instance: &str, symbol: &str) -> Option<crate::state::LastTick> {
     let filter = [symbol.to_owned()];
-    ctx.registry.snapshot(&filter).into_iter().next().map(|(_, _, t)| t)
+    ctx.registry
+        .snapshot(&filter)
+        .into_iter()
+        .find(|(i, _, _)| i == instance)
+        .map(|(_, _, t)| t)
 }
 
 fn sim_lookup(ctx: &Ctx, symbol: &str) -> Result<SimLook, (u32, String)> {
@@ -1379,7 +1394,7 @@ fn sim_lookup(ctx: &Ctx, symbol: &str) -> Result<SimLook, (u32, String)> {
     let Some(entry) = ctx.registry.symbol(&instance, symbol_id) else {
         return Err((simret::INVALID, "sembol kaydi okunamadi".into()));
     };
-    let last = sim_last(ctx, symbol);
+    let last = sim_last(ctx, &instance, symbol);
     Ok(SimLook {
         instance,
         sym: SimSymbol::from_entry(&entry),
@@ -2518,6 +2533,66 @@ mod tests {
             "mt5-1",
             1,
             crate::state::LastTick { bid, ask, last: 0.0, time_msc: 1_700_000_000_500 },
+        );
+    }
+
+    #[test]
+    fn the_fill_price_comes_from_the_same_instance_that_resolved_the_symbol() {
+        // İKİ TERMINAL AYNI SEMBOLU KOTE EDIYOR (iki broker / iki hesap —
+        // paper birden çok --instance destekliyor).
+        //
+        // Eski `sim_last` fiyatı yalnızca ADLA arıyordu ve `snapshot` örnek
+        // adına göre SIRALI döndüğü için daima alfabetik ilk örneğin fiyatını
+        // veriyordu. Sembol KAYDI ise `resolve_any`den geliyor ve o bir
+        // `HashMap` üzerinde geziniyor — yani rastgele bir örnek. Sonuç: bir
+        // terminalin fiyatından, başka terminalin sözleşmesiyle dolum; üstelik
+        // hangisinin seçileceği koşudan koşuya değişebildiği için replay
+        // tekrarlanabilirliği de kırılırdı.
+        //
+        // Testin sınadığı şey: dolum fiyatı, isteği çözen örneğin fiyatıdır.
+        let (ctx, _c_rx) = paper_ctx(10_000.0);
+        seed_symbol(&ctx, 1.10000, 1.10002);
+
+        // İkinci örnek AYNI sembolü ÇOK FARKLI bir fiyatla kote ediyor.
+        let mut e = sinyal_proto::SymbolEntry {
+            symbol_id: 1,
+            digits: 5,
+            point: 0.00001,
+            tick_size: 0.00001,
+            volume_min: 0.01,
+            volume_max: 100.0,
+            volume_step: 0.01,
+            contract_size: 100_000.0,
+            flags: sinyal_proto::sym_flag::READY,
+            ..Default::default()
+        };
+        sinyal_proto::write_fixed_str(&mut e.name, "EURUSD");
+        // Ad alfabetik olarak "mt5-1"den ÖNCE gelsin ki eski davranış
+        // (sıralı listenin ilki) bu fiyatı seçsin ve test kırılabilsin.
+        ctx.registry.set_symbols("aa-other", vec![e]);
+        ctx.registry.update_last(
+            "aa-other",
+            1,
+            crate::state::LastTick { bid: 2.0, ask: 2.00002, last: 0.0, time_msc: 1 },
+        );
+
+        // ASIL İDDİA, `resolve_any`nin hangi örneği seçtiğinden BAĞIMSIZ
+        // olmalı: `HashMap` sırasına bağlı bir test hatayı ancak yarı yarıya
+        // yakalardı. Her iki örnek için de ayrı ayrı soruyoruz.
+        let a = sim_last(&ctx, "aa-other", "EURUSD").expect("aa-other fiyati olmali");
+        assert_eq!((a.bid, a.ask), (2.0, 2.00002), "aa-other kendi fiyatini vermeli");
+        let b = sim_last(&ctx, "mt5-1", "EURUSD").expect("mt5-1 fiyati olmali");
+        assert_eq!((b.bid, b.ask), (1.10000, 1.10002), "mt5-1 kendi fiyatini vermeli");
+
+        // Ve `sim_lookup` ikisini TUTARLI eşleştirmeli: kayıt hangi
+        // örnekten geldiyse fiyat da ondan.
+        let look = sim_lookup(&ctx, "EURUSD").expect("sembol cozulmeli");
+        let expected = sim_last(&ctx, &look.instance, "EURUSD").unwrap();
+        assert_eq!(
+            (look.bid, look.ask),
+            (expected.bid, expected.ask),
+            "fiyat, sembol kaydini veren ornekten gelmeli — ornek: {}",
+            look.instance
         );
     }
 

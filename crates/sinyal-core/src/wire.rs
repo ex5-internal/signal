@@ -398,6 +398,16 @@ pub struct SymbolInfo {
     pub volume_min: f64,
     pub volume_max: f64,
     pub volume_step: f64,
+    /// Sözleşme büyüklüğü (`SYMBOL_TRADE_CONTRACT_SIZE`) — GOLD'da 100,
+    /// forex'te tipik olarak 100000.
+    ///
+    /// **Pozisyon büyüklüğü ve kâr/zarar bunsuz hesaplanamaz:**
+    /// `kar = fiyat_farki × hacim × contract_size` ve
+    /// `marjin = hacim × contract_size × fiyat / kaldirac`.
+    ///
+    /// `0` ise broker'dan okunamamış demektir; hacim hesabı yapan bir istemci
+    /// bunu "1" varsaymamalı — sessizce 100 kat yanlış pozisyon açardı.
+    pub contract_size: f64,
     /// `SYMBOL_TRADE_EXEMODE` — doğru doldurma modunun belirleyicisi.
     pub exec_mode: u32,
     pub filling_mask: u32,

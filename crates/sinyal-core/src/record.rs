@@ -1023,7 +1023,10 @@ mod tests {
             digits: 5,
             point: 1e-5,
             volume_step: 0.01,
-            flags: sym_flag::READY,
+            // Simülatörün parayla ilişkisi bu alandan geçiyor; testlerde 0
+            // bırakmak, kaybını görünmez kılan şeyin ta kendisiydi.
+            contract_size: 100_000.0,
+            flags: sym_flag::READY | sym_flag::CONTRACT_DATA,
             ..Default::default()
         };
         write_fixed_str(&mut e.name, name);
@@ -1398,6 +1401,35 @@ mod tests {
         };
         assert_eq!(name_of(0), "EURUSD", "symbol_id 0 cozulemedi: {items:?}");
         assert_eq!(name_of(1), "XAUUSD", "symbol_id 1 cozulemedi: {items:?}");
+
+        // İKİNCİ TUZAK — `contract_size`. Ad eşlemesi gibi kopunca akışı
+        // durdurmaz; simülasyonu SESSİZCE YALANCI yapar. Alan kayda
+        // yazılmadığı için replay'de 0 geliyordu ve:
+        //   marjin = hacim × 0 × fiyat / kaldıraç → serbest marjin denetimi
+        //   (10019) hiç tetiklenmez, yani sonsuz kaldıraç;
+        //   kâr = fiyat farkı × hacim × 0 → forex'te 100 000 kat küçük, yani
+        //   kâr eğrisi anlamsız.
+        // Hiçbir test kırmıyordu: kaydedici testleri alanı yazmadığını,
+        // simülatör testleri de kendi kurduğu sembolle çalıştığı için
+        // eksikliği göremiyordu.
+        for it in items {
+            assert_eq!(
+                it.contract_size, 100_000.0,
+                "contract_size kayittan geri gelmeli, yoksa replay'in marjini ve kari \
+                 sessizce yanlis olur: {it:?}"
+            );
+        }
+        // Sözleşme büyüklüğü motorun gördüğü hâle kadar taşınmalı: kayıt →
+        // SymbolEntry → SimSymbol zincirinin herhangi bir halkası düşerse
+        // yukarıdaki iddia yeşil kalırdı.
+        let entry = items[0].to_entry();
+        assert_eq!(entry.contract_size, 100_000.0, "SymbolEntry'ye aktarilmali");
+        assert_ne!(entry.flags & sym_flag::CONTRACT_DATA, 0, "sozlesme verisi ilan edilmeli");
+        assert_eq!(
+            crate::sim::SimSymbol::from_entry(&entry).contract_size,
+            100_000.0,
+            "SimSymbol'e aktarilmali — marjin ve kar bu degere dayaniyor"
+        );
     }
 
     #[test]

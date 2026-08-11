@@ -533,6 +533,53 @@ fn print_sim_honesty(slippage: f64) {
     }
 }
 
+/// Kayıttaki SON sembol tablosunda `contract_size` taşımayan semboller.
+///
+/// Alan kayıt biçimine sonradan eklendi; ondan önce alınmış kayıtlarda 0
+/// gelir. Simülatör bu durumda emri açıkça reddediyor
+/// (`sim::check_contract`) — ama bunu ancak ilk emirde söylüyor. Operatör
+/// replay'i başlatırken öğrenmeli, bir saat sonra değil.
+///
+/// SON görüntüye bakılıyor: tablo kayıt boyunca güncellenebilir ve bizi
+/// ilgilendiren, oynatımın büyük kısmında geçerli olan hâlidir.
+/// `Recording` yerine yalnızca sembol görüntülerini alıyor: ihtiyacı olan
+/// tek şey bu ve böylece test, üretim tipine sırf sınanabilsin diye
+/// `Default` eklemek zorunda kalmıyor.
+fn symbols_missing_contract_size(symbols: &[Vec<replay::SymbolSnapshot>]) -> Vec<String> {
+    let mut out = Vec::new();
+    for snaps in symbols {
+        let Some(last) = snaps.last() else { continue };
+        for it in &last.items {
+            if !(it.contract_size > 0.0) && !out.contains(&it.s) {
+                out.push(it.s.clone());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn warn_if_recording_lacks_contract_size(missing: &[String]) {
+    if missing.is_empty() {
+        return;
+    }
+    // `eprintln!`: bu bir bilgi satırı değil, oynatımın işe yaramayacağı
+    // uyarısı. Sessiz kalsaydık simülatör her emri 10013 ile reddederdi ve
+    // sebebi kayıt biçiminde aramak kimsenin aklına gelmezdi.
+    eprintln!();
+    eprintln!("  UYARI: kayit `contract_size` TASIMIYOR ({} sembol): {}", missing.len(), {
+        let shown: Vec<&str> = missing.iter().take(8).map(String::as_str).collect();
+        let mut s = shown.join(", ");
+        if missing.len() > shown.len() {
+            s.push_str(", ...");
+        }
+        s
+    });
+    eprintln!("         Bu alan olmadan marjin ve kar HESAPLANAMAZ; simulator bu");
+    eprintln!("         sembollerdeki emirleri retcode 10013 ile REDDEDER.");
+    eprintln!("         Alan kayit bicimine sonradan eklendi — YENIDEN KAYDET.");
+}
+
 /// Epoch ms → gün içi `HH:MM:SS.mmm` (UTC).
 ///
 /// Kapsam tek gün içinde olduğu için tarihi tekrar yazmıyoruz; tarih zaten
@@ -611,6 +658,10 @@ async fn main() {
             let (from_ms, to_ms) = rec.span();
             let instances = rec.instances.clone();
             let items = rec.len();
+            // Emir gönderilmeden ÖNCE söylenmeli: `contract_size` taşımayan
+            // bir kayıtla açılan replay, ilk emre kadar sorunsuz görünür ve
+            // sorun ancak retcode 10013 ile ortaya çıkardı.
+            let missing_contract = symbols_missing_contract_size(&rec.symbols);
 
             let (done_tx, done_rx) = tokio::sync::watch::channel(None);
             // Motor oynatımdan ÖNCE kurulur: oynatım thread'i her tick'te
@@ -661,6 +712,7 @@ async fn main() {
                 }
             );
             println!("  bakiye   : {} (SENTETIK)", cfg.balance);
+            warn_if_recording_lacks_contract_size(&missing_contract);
         }
 
         // --- CANLI ---
@@ -1042,6 +1094,41 @@ mod tests {
         // Sıra fark etmemeli.
         let e = err(&["--instance", "mt5-1", "--replay", "veri", "--replay-date", "20260811"]);
         assert!(e.contains("--instance") && e.contains("--replay"), "{e}");
+    }
+
+    #[test]
+    fn an_old_recording_without_contract_size_is_named_at_startup() {
+        // Simülatör bu sembollerdeki emirleri reddediyor; operatör bunu ilk
+        // emirde DEĞİL, replay'i başlatırken öğrenmeli. Uyarının sessizce
+        // boşa düşmesi (ör. `symbols` alanının şekli değişirse) hatayı geri
+        // getirirdi, o yüzden fonksiyonun kendisi sınanıyor.
+        let item = |name: &str, cs: f64| replay::SymbolItem {
+            id: 0,
+            s: name.into(),
+            contract_size: cs,
+            ..Default::default()
+        };
+        let snap = |items: Vec<replay::SymbolItem>| replay::SymbolSnapshot { at_ms: 1, items };
+
+        let mixed = vec![snap(vec![item("EURUSD", 100_000.0), item("XAUUSD", 0.0)])];
+        assert_eq!(
+            symbols_missing_contract_size(&[mixed]),
+            vec!["XAUUSD".to_string()],
+            "yalnizca alani eksik olan sembol anilmali"
+        );
+
+        // Tam kayıtta uyarı HİÇ çıkmamalı: her açılışta bağıran bir uyarı,
+        // gerçekten önemli olduğunda okunmaz.
+        let complete = vec![snap(vec![item("EURUSD", 100_000.0)])];
+        assert!(symbols_missing_contract_size(&[complete]).is_empty());
+
+        // SON görüntü belirleyicidir: kayıt ortasında düzelen bir tablo
+        // yüzünden uyarı takılı kalmamalı.
+        let fixed_midway = vec![snap(vec![item("EURUSD", 0.0)]), snap(vec![item("EURUSD", 100_000.0)])];
+        assert!(
+            symbols_missing_contract_size(&[fixed_midway]).is_empty(),
+            "son goruntu gecerli olmali"
+        );
     }
 
     #[test]

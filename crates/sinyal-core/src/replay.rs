@@ -1637,6 +1637,7 @@ mod tests {
         let sym = crate::sim::SimSymbol {
             digits: 5,
             point: 0.00001,
+            tick_size: 0.00001,
             volume_step: 0.01,
             volume_min: 0.01,
             volume_max: 100.0,
