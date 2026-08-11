@@ -323,6 +323,30 @@ saatinle yeniden hesaplama.
 Arada gerçek kayma olur. Ölçülen uçtan uca gecikme p50 ~250 µs **bizim
 tarafımızda**; broker tarafındaki süre buna dahil değildir.
 
+### GOLD'un GÜNLÜK İŞLEM MOLASI VAR — "sistem çöktü" sanma
+
+Forex çiftleri hafta içi 7/24 akar, **metaller akmaz.** XM'de GOLD günde bir
+kez ~1 saat kapanır (gözlenen: **00:00–01:00 civarı**, sunucu saati). O
+aralıkta:
+
+- `tick.GOLD` aboneliğine **hiç mesaj gelmez** — bağlantı sağlıklıdır
+- `snapshot` son bilinen fiyatı verir ama **bayattır**
+- Emir gönderirsen `kind:"txn"` + **`retcode: 10018`** (`MARKET_CLOSED`) döner
+
+Aynı anda `tick.EURUSD` akmaya devam eder. Yani "hiç tick gelmiyor" ile
+"bu sembolde tick gelmiyor" farklı şeylerdir.
+
+Sinyal sistemi bunu şöyle ayırt etmeli:
+
+```javascript
+// Akış sağlıklı mı? BAŞKA bir sembole bak, GOLD'a değil.
+// GOLD sessizse ve EURUSD akıyorsa → mola, arıza değil.
+// İkisi de sessizse → gerçekten sorun var (EA durmuş, terminal kapanmış).
+```
+
+Emir tarafında `10018` **geçici** bir durumdur; yeniden denemek yerine
+piyasa açılana kadar beklenmelidir.
+
 ### `id: ""` gelen olaylar
 
 Bize ait olmayan işlemler — terminalden elle yapılmış. Olay **asla atılmaz**,
