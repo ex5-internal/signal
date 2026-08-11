@@ -23,14 +23,14 @@ Canlı demo hesapta (XM Global, hedging) uçtan uca doğrulandı.
 
 | Bileşen | Durum | Test |
 |---|---|---|
-| `crates/sinyal-proto` — paylaşılan bellek yerleşimi + emir doğrulama | ✅ | 55 |
-| `crates/sinyal-shm` — Windows shm, QPC, tek-örnek kilidi | ✅ | 14 |
-| `crates/sinyal-bridge` — MT5'e yüklenen DLL (C ABI) | ✅ | 29 |
-| `crates/sinyal-core` — `sinyald`: shm okuma + WebSocket feed + emir | ✅ | 23 |
+| `crates/sinyal-proto` — bellek yerleşimi, durum tabloları, emir doğrulama | ✅ | 65 |
+| `crates/sinyal-shm` — Windows shm, QPC, tek-örnek kilidi, token üretimi | ✅ | 17 |
+| `crates/sinyal-bridge` — MT5'e yüklenen DLL (C ABI) | ✅ | 31 |
+| `crates/sinyal-core` — `sinyald`: feed + mum + emir + korelasyon + yetki | ✅ | 51 |
 | `tools/latency-bench` — gecikme/kayıp ölçüm aracı | ✅ | 7 |
 | `mql5/` — toplayıcı EA + ABI başlıkları | ✅ derlendi, canlı çalışıyor | — |
 
-**128 test, hepsi geçiyor.**
+**171 test, hepsi geçiyor.**
 
 ### Ölçülen gecikme
 
@@ -58,10 +58,12 @@ Demo hesapta, 0.01 lot ile:
 |---|---|
 | Bekleyen `BUY_LIMIT` | `queued → ack(10008) → txn(10009)` |
 | İptal | `txn(10009)` |
-| Market `BUY` EURUSD | 1.15402'den doldu |
-| Pozisyon kapatma | 1.15385'ten kapandı |
+| Market `BUY` EURUSD | 1.15421'den doldu |
+| Pozisyon kapatma | 1.15402'den kapandı |
 | Aynı `id` ile tekrar | `duplicate` — çift pozisyon yok |
 | Geçersiz sembol / side / tip | Hepsi açık mesajla reddedildi |
+| Açılışın 8 olayının tamamı `client_id` taşıdı | 8/8 — kimliksiz yok |
+| Pozisyon sorgusu `client_id` taşıyor | `POSITION_MAGIC` üzerinden |
 
 ---
 
@@ -90,15 +92,51 @@ Terminalde (İngilizce menüler):
 ```bash
 sinyald --instance mt5-1 --bind 127.0.0.1:8787
 sinyald --instance mt5-1 --enable-trading --token GIZLI
+sinyald --generate-token
 ```
 
 Varsayılan olarak yalnızca `127.0.0.1` dinler ve **emir yürütme kapalıdır**.
+
+---
+
+## İki katmanlı yüzey: açık grafik, token'lı işlem
+
+Piyasa verisi (grafik) token istemez; hesap ve emir yüzeyi ister.
+
+| İşlem | Public | Trader |
+|---|:---:|:---:|
+| `subscribe` → `tick.*`, `book.*`, `candle.*` | ✅ | ✅ |
+| `symbols`, `snapshot`, `candles`, `ping` | ✅ | ✅ |
+| `subscribe` → `order` kanalı | ❌ | ✅ |
+| `account`, `positions`, `orders` | ❌ | ✅ |
+| `order`, `close`, `cancel`, `modify_sltp` | ❌ | ✅ |
+
+`hello` bağlantı kurulur kurulmaz ne yapabileceğinizi söyler:
+
+```json
+{"t":"hello","proto":3,"mode":"live","instances":["mt5-1"],
+ "trading":true,"public_feed":true,"auth_required_for_trading":true,"level":"public"}
+```
+
+`--token` verilmişse `auth` ile Trader'a yükselirsiniz:
+`{"op":"auth","token":"..."}` → `{"t":"authed","level":"trader"}`.
+
+**`--token` verilmemişse bağlantı doğrudan `level:"trader"` başlar** — token
+yokken yüzeyin kilitli kalması `auth_required_for_trading:false` ilanıyla
+çelişirdi. Yani "token yok" = "herkese açık", "token var" = "yalnızca grafik
+açık".
+
+Token karşılaştırması sabit zamanlıdır (yanıt süresinden bayt tahmini
+engellenir).
+
+> `ws://` düz metindir: token yol üzerindeki herkes tarafından okunabilir.
+> TLS **yok**. İnternete açarken bunu bilerek yapın.
 
 ### WebSocket protokolü
 
 **Abone ol:**
 ```json
-{"op":"subscribe","channels":["tick.*","book.GOLD","order"]}
+{"op":"subscribe","channels":["tick.*","book.GOLD","candle.EURUSD.M5","order"]}
 ```
 ```json
 {"t":"tick","s":"EURUSD","b":1.15412,"a":1.15431,"ms":1786467441043,"lat_us":36,"src":"mt5-1"}
@@ -112,6 +150,18 @@ gerçek süre. Akışın sağlığını doğrudan gösterir.
 `book_depth`, `polled_only`, `ready`.
 
 **Anlık fiyat:** `{"op":"snapshot","symbols":["EURUSD"]}`
+
+**Mumlar:** `{"op":"candles","symbol":"EURUSD","tf":"M5","count":300}`
+
+M1/M5/M15/M30/H1/H4 desteklenir. Barlar **tick akışından** üretilir; bar sınırı
+broker saatinden (`time_msc`) türetilir, yerel saatten değil. İlk bar `partial`
+işaretlidir.
+
+> Mumlar `sinyald` başladığı andan itibaren dolar — **geriye dönük geçmiş yok.**
+> Grafiğe geçmiş bar gerekiyorsa EA `CopyRates` yolu gerekir (henüz yok).
+
+**Hesap / pozisyon / emir:** `{"op":"account"}`, `{"op":"positions"}`,
+`{"op":"orders"}` — üçü de Trader ister.
 
 **Emir:**
 ```json
@@ -128,6 +178,36 @@ Emir sonucu **iki aşamalıdır ve karıştırılmamalıdır**:
 
 - `kind:"ack"` + `retcode:10008` → istek sunucuya iletildi. **DOLMADI.**
 - `kind:"txn"` + `retcode:10009` → gerçekten yürütüldü.
+
+### Olaylar `id`'nize nasıl bağlanıyor
+
+`MqlTradeTransaction` yapısında `magic` ve `comment` **yoktur**, `request_id`
+ise yalnızca `TRADE_TRANSACTION_REQUEST` olayında doludur. Yani dolumu bildiren
+`DEAL_ADD` olayı tek başına hangi emre ait olduğunu söylemez. EA'da tablo
+taraması da seçenek değil: terminalin işlem kuyruğu 1024 elemanlı ve işleyici
+yavaşlarsa **eski olaylar sessizce ezilir**.
+
+Bu yüzden EA ham alanları iletir, eşleştirme çekirdekte yapılır. Üç yönlü tablo:
+`request_id → id`, `emir bileti → id`, `pozisyon bileti → id`. Bağ dört yoldan
+kurulur:
+
+1. `SEND_ACK` — çekirdeğin ürettiği, `request_id`'yi taşıyan olay
+2. `TRADE_TRANSACTION_REQUEST` — `request_id` + `result.order` (asıl bilet)
+3. Durum yayınındaki `POSITION_MAGIC` — çekirdek yeniden başlasa bile bağları
+   geri getirir; mutabakatın temeli
+4. Hedging'de açılış emrinin bileti = pozisyon bileti
+
+Olay sırası **garantili değildir**: `DEAL_ADD`, onu açıklayan `REQUEST`'ten önce
+gelebilir. Çözülemeyen olaylar 5 saniyelik bir tamponda tutulur ve bağ kurulunca
+**geriye dönük** atfedilir. Bağ hiç kurulamazsa olay `id:""` ile yayımlanır —
+"bize ait değil / terminalden elle yapılmış" demektir. **Olay asla atılmaz.**
+
+Ters yönde çıkarım yapılmaz: bir pozisyona dokunan her emir o pozisyonun
+sahibine ait değildir (K1'in açtığını K2 kapatabilir). Bilet bilinmiyorsa
+pozisyon sahibine düşülür — bu bilinçli bir geri çekilmedir.
+
+Telemetri bunu 30 saniyede bir basar:
+`eslesme: bekleyen=0 gec=0 kimliksiz=0`.
 
 ---
 
@@ -206,21 +286,29 @@ Protokol değişirse `RING_VERSION` artırılır, uyumsuz sürümler bağlanamaz
 
 Canlı paraya geçmeden önce kapatılmalı:
 
-1. **Ara `txn` olayları müşteri kimliğine bağlanamıyor.**
-   `MqlTradeTransaction`'da `magic`/`comment` yok ve `request_id` yalnızca
-   `TRADE_TRANSACTION_REQUEST`'te dolu. Dolum bilgisini taşıyan `DEAL_ADD`
-   olayı `id:""` ile geliyor. Bilet→`client_id` tablosu gerekiyor.
+1. **Geriye dönük mum geçmişi yok.** Barlar yalnızca `sinyald` çalışırken
+   birikir; başlamadan önceki geçmiş elde edilemez. MT5'te sembol başına
+   ~100 MB yerel geçmiş duruyor — EA/Service tarafında `CopyRates` ile
+   okunup protokole taşınması gerekiyor.
 
-2. **Hesap bilgisi protokolde yok.** Bakiye/equity/marjin görünmüyor; emir
-   marjini önden doğrulanamıyor.
+2. **Emir mutabakatı periyodik değil.** Durum yayını açık pozisyon ve bekleyen
+   emirleri kapsıyor, ama `HistorySelect` ile kapanmış işlemlerin
+   karşılaştırılması yok. `OnTradeTransaction` kuyruğu 1024'te taşıp eskileri
+   ezdiği için uzun kesintiden sonra tek doğru kaynak geçmiştir.
 
-3. **Pozisyon/emir sorgulama yok.** İstemci yeniden bağlanınca mevcut durumu
-   bilemiyor. `OnTradeTransaction` kuyruğu 1024'te taşıp eskileri ezdiği için
-   periyodik mutabakat şart.
+3. **TLS yok.** `ws://` düz metin; token ağ üzerinde açık gider. İnternete
+   açılırken bilinçli bir kabul.
 
-4. **Sembol listesi yalnızca EA açılışında okunuyor.** Market Watch'a sonradan
+4. **Risk limiti yok.** Azami lot, günlük emir sayısı, kill-switch — hiçbiri
+   yok. `--enable-trading` ve (varsa) token dışında kapı bulunmuyor.
+
+5. **Sembol listesi yalnızca EA açılışında okunuyor.** Market Watch'a sonradan
    eklenen sembol, EA yeniden başlamadan görünmez. Dinamik ekleme için
    sembol kimliklerinin kararlı (append-only) olması gerekiyor.
+
+6. **Terminal kaynaklı tick kaybı ölçülmüyor.** `CopyTicks` ile karşılaştırıp
+   MT5'in kendi atladığı tick sayısını raporlamak gerekiyor (halka kaybı ayrıca
+   ölçülüyor ve 0).
 
 ---
 

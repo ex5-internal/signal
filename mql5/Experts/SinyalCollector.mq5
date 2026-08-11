@@ -602,12 +602,24 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    // client_id ↔ request_id ↔ order ↔ position tablosu üzerinden.
    SinyalRes r;
    r.client_id        = 0;               // çekirdek dolduracak
-   r.order            = trans.order;
-   r.deal             = trans.deal;
+
+   // BİLET SEÇİMİ — korelasyonun kilit noktası.
+   //
+   // `OrderSendAsync` anında `MqlTradeResult.order` SIFIRDIR, bu yüzden
+   // SEND_ACK bilet taşımaz. Bileti öğrenebileceğimiz ilk yer
+   // TRADE_TRANSACTION_REQUEST olayıdır: orada `result` TAM DOLU gelir ve
+   // `result.order` gerçek bileti taşır — oysa aynı olayda `trans.order`
+   // çoğu zaman 0'dır.
+   //
+   // Önceki sürüm bileti yalnızca `trans`'tan okuyordu; bu yüzden
+   // "bilet → client_id" bağı hiç kurulamıyor ve dolum olayları kimliksiz
+   // kalıyordu. Artık REQUEST olayında `result` tercih ediliyor.
+   r.order            = (trans.order != 0) ? trans.order : result.order;
+   r.deal             = (trans.deal  != 0) ? trans.deal  : result.deal;
    r.position         = trans.position;
    r.position_by      = trans.position_by;
-   r.volume           = trans.volume;
-   r.price            = trans.price;
+   r.volume           = (trans.volume != 0.0) ? trans.volume : result.volume;
+   r.price            = (trans.price  != 0.0) ? trans.price  : result.price;
    r.bid              = 0.0;
    r.ask              = 0.0;
    r.recv_qpc         = SinyalQpc();

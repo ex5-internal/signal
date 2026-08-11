@@ -27,7 +27,7 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use sinyal_proto::{res_kind, Res};
+use sinyal_proto::Res;
 
 /// Çözülemeyen olayın bekleyeceği süre.
 ///
@@ -72,37 +72,58 @@ impl OrderJoin {
         }
     }
 
-    /// Emir gönderirken çağrılır: `client_id` biliniyor ama henüz bilet yok.
-    pub fn on_dispatch(&mut self, client_id: u64) {
-        // Şimdilik yalnızca kayıt tutulacak bir şey yok — bağ, `SEND_ACK`
-        // geldiğinde `request_id` ile kurulur. Yine de tabloları budayalım.
-        let _ = client_id;
-        self.prune();
-    }
-
     /// Durum anlık görüntüsündeki pozisyonlardan bağ kur.
     ///
-    /// `POSITION_MAGIC` bizim gönderdiğimiz emirlerde `client_id` taşır. Bu
-    /// yol, çekirdek yeniden başladığında veya olaylar kaybolduğunda bağların
-    /// yeniden kurulmasını sağlar — mutabakatın temeli.
-    pub fn seed_from_positions(&mut self, positions: &[sinyal_proto::PositionRec]) {
+    /// `POSITION_MAGIC` bizim gönderdiğimiz emirlerde `client_id` taşır.
+    ///
+    /// # Bu yol pratikte ASIL yoldur
+    ///
+    /// `OrderSendAsync` anında `MqlTradeResult.order` genellikle 0'dır ve
+    /// `request_id` yalnızca `TRADE_TRANSACTION_REQUEST` olayında dolu gelir.
+    /// Yani "bilet → client_id" bağı çoğu zaman yalnızca buradan, bir sonraki
+    /// durum yayınıyla kurulur.
+    ///
+    /// Bu yüzden tohumlamadan sonra bekleyenleri **yeniden taramak şart**:
+    /// aksi halde bağ kurulmuş olsa bile kuyrukta bekleyen olaylar orada kalır
+    /// ve süresi dolunca kimliksiz yayımlanır. (İlk sürümde tam olarak bu
+    /// oluyordu: açılış olayları `id:""` ile gidiyordu.)
+    ///
+    /// Artık çözülebilen bekleyen olayları döndürür.
+    #[must_use = "cozulen bekleyen olaylar yayimlanmali"]
+    pub fn seed_from_positions(&mut self, positions: &[sinyal_proto::PositionRec]) -> Vec<Res> {
         for p in positions {
             if p.magic != 0 {
                 self.by_position.entry(p.ticket).or_insert(p.magic);
                 self.by_position.entry(p.identifier).or_insert(p.magic);
+                // Hedging'de açılış emrinin bileti pozisyon biletidir; aynı
+                // kimliği emir tarafına da yaz ki `order` taşıyan olaylar da
+                // çözülsün.
+                self.by_order.entry(p.ticket).or_insert(p.magic);
             }
         }
         self.prune();
+        let mut out = Vec::new();
+        self.flush_resolvable(&mut out);
+        out
     }
 
     /// Durum anlık görüntüsündeki bekleyen emirlerden bağ kur.
-    pub fn seed_from_orders(&mut self, orders: &[sinyal_proto::OrderRec]) {
+    ///
+    /// Artık çözülebilen bekleyen olayları döndürür.
+    #[must_use = "cozulen bekleyen olaylar yayimlanmali"]
+    pub fn seed_from_orders(&mut self, orders: &[sinyal_proto::OrderRec]) -> Vec<Res> {
         for o in orders {
             if o.magic != 0 {
                 self.by_order.entry(o.ticket).or_insert(o.magic);
+                if o.position_id != 0 {
+                    self.by_position.entry(o.position_id).or_insert(o.magic);
+                }
             }
         }
         self.prune();
+        let mut out = Vec::new();
+        self.flush_resolvable(&mut out);
+        out
     }
 
     /// Bir olayı işle. Yayımlanmaya hazır olayları döndürür.
@@ -190,13 +211,26 @@ impl OrderJoin {
             }
         }
 
-        // Hedging'de açılış emrinin bileti pozisyon bileti olur; biri
-        // biliniyorsa diğerini de bağla.
+        // Hedging'de açılış emrinin bileti pozisyon bileti olur: emri bilen,
+        // pozisyonu da bilir.
+        //
+        // # Ters yön KASITLI olarak yapılmıyor
+        //
+        // "Pozisyonu bilen emri de bilir" ÇIKARIMI YANLIŞTIR. Bir pozisyona
+        // dokunan her emir o pozisyonun sahibine ait değildir: K1'in açtığı
+        // pozisyonu K2 kapatabilir. Kapatma emrinin bileti pozisyondan
+        // türetilseydi, K2'nin dolum olayları K1'e atfedilirdi — canlı testte
+        // tam olarak bu oldu.
+        //
+        // Kapatma emrinin sahibi doğru yoldan öğrenilir: `SEND_ACK` →
+        // `by_request`, ardından `TRADE_TRANSACTION_REQUEST` olayı hem
+        // `request_id` hem (EA `result.order`'ı ilettiği için) bileti taşır.
+        // `resolve` de bileti pozisyondan ÖNCE denediği için doğru kimlik
+        // kazanır; bilet bilinmiyorsa pozisyon sahibine düşer ki bu makul bir
+        // geri çekilmedir.
         if r.order != 0 && r.position != 0 {
             if let Some(&cid) = self.by_order.get(&r.order) {
                 self.by_position.entry(r.position).or_insert(cid);
-            } else if let Some(&cid) = self.by_position.get(&r.position) {
-                self.by_order.entry(r.order).or_insert(cid);
             }
         }
     }
@@ -265,6 +299,7 @@ impl OrderJoin {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sinyal_proto::res_kind;
 
     fn ack(client_id: u64, request_id: u32, order: u64) -> Res {
         Res {
@@ -356,7 +391,7 @@ mod tests {
             ..Default::default()
         };
         p.volume = 0.01;
-        j.seed_from_positions(&[p]);
+        assert!(j.seed_from_positions(&[p]).is_empty());
 
         let out = j.on_event(txn(0, 0, 901, 900));
         assert_eq!(out.len(), 1);
@@ -367,10 +402,89 @@ mod tests {
     fn order_magic_seeds_binding_for_pending_orders() {
         let mut j = OrderJoin::new();
         let o = sinyal_proto::OrderRec { ticket: 777, magic: 99, ..Default::default() };
-        j.seed_from_orders(&[o]);
+        assert!(j.seed_from_orders(&[o]).is_empty());
 
         let out = j.on_event(txn(0, 777, 0, 0));
         assert_eq!(out[0].client_id, 99);
+    }
+
+    #[test]
+    fn seeding_flushes_already_pending_events() {
+        // GERİLEME TESTİ — canlı demoda gözlenen hata.
+        //
+        // `OrderSendAsync` anında bilet 0 geldiği için açılış dolum olayları
+        // çözülemeden beklemeye alınıyordu. Bağ bir sonraki durum yayınında
+        // (POSITION_MAGIC) kuruluyordu, AMA tohumlamadan sonra bekleyenler
+        // taranmadığı için olaylar kuyrukta kalıp süresi dolunca `id:""` ile
+        // yayımlanıyordu. Canlı testte açılışın 8 olayından 5'i böyle gitti.
+        let mut j = OrderJoin::new();
+
+        // Dolum olayları gelir — hiçbir bağ yok, beklemeye alınırlar.
+        assert!(j.on_event(txn(0, 942629420, 0, 0)).is_empty());
+        assert!(j.on_event(txn(0, 942629420, 931483305, 942629420)).is_empty());
+        assert_eq!(j.pending_len(), 2);
+
+        // Bir saniye sonra durum yayını gelir: pozisyonun magic'i client_id 2.
+        let p = sinyal_proto::PositionRec {
+            ticket: 942629420,
+            identifier: 942629420,
+            magic: 2,
+            ..Default::default()
+        };
+        let flushed = j.seed_from_positions(&[p]);
+
+        assert_eq!(flushed.len(), 2, "tohumlama bekleyenleri serbest bırakmalı");
+        assert!(flushed.iter().all(|r| r.client_id == 2));
+        assert_eq!(j.pending_len(), 0);
+        assert_eq!(j.unattributed, 0, "hicbir olay kimliksiz kalmamali");
+    }
+
+    #[test]
+    fn closing_order_is_attributed_to_closer_not_position_owner() {
+        // GERİLEME TESTİ — canlı demoda gözlenen ikinci hata.
+        //
+        // K1 pozisyonu açtı, K2 kapattı. Kapatma olayları K1'e atfediliyordu
+        // çünkü `learn` "pozisyonu bilen emri de bilir" diye ters yönde çıkarım
+        // yapıyordu. K2'yi bekleyen istemci kendi olaylarını göremezdi.
+        let mut j = OrderJoin::new();
+
+        // K1 (client_id=1) pozisyonu açar.
+        j.on_event(ack(1, 100, 0));
+        j.on_event(txn(100, 942629420, 0, 0));
+        let _ = j.on_event(txn(0, 942629420, 931483305, 942629420));
+
+        // K2 (client_id=2) kapatma emri gönderir.
+        j.on_event(ack(2, 200, 0));
+        // REQUEST olayı: request_id + (EA `result.order` ilettiği için) bilet.
+        j.on_event(txn(200, 942629638, 0, 0));
+
+        // Kapatma dolumu: yeni emir bileti, AMA K1'in pozisyon bileti.
+        let out = j.on_event(txn(0, 942629638, 931483501, 942629420));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].client_id, 2, "kapatan K2'ye ait olmali, acan K1'e degil");
+
+        // Pozisyonun sahipliği bozulmamalı: yalnızca pozisyon taşıyan bir olay
+        // hâlâ açan tarafa düşer.
+        let out = j.on_event(txn(0, 0, 0, 942629420));
+        assert_eq!(out[0].client_id, 1, "pozisyonun sahibi hala K1");
+    }
+
+    #[test]
+    fn position_owner_is_a_fallback_when_order_ticket_unknown() {
+        // Bilet bilinmiyorsa pozisyon sahibine düşmek makul: istemci en azından
+        // "bu benim pozisyonuma dokundu" bilgisini alır.
+        let mut j = OrderJoin::new();
+        let p = sinyal_proto::PositionRec {
+            ticket: 900,
+            identifier: 900,
+            magic: 7,
+            ..Default::default()
+        };
+        let _ = j.seed_from_positions(&[p]);
+
+        // Elle kapatma: bilinmeyen emir bileti, bilinen pozisyon.
+        let out = j.on_event(txn(0, 555_555, 0, 900));
+        assert_eq!(out[0].client_id, 7);
     }
 
     #[test]

@@ -102,7 +102,12 @@ impl Registry {
         g.get(instance)?.name_of(id).map(|s| s.to_owned())
     }
 
-    /// Sembol adını bir örnekte çöz.
+    /// Sembol adını BELİRLİ bir örnekte çöz.
+    ///
+    /// Bugün üretim yolunda çağrılan `resolve_any`; bu ise açık örnek hedefli
+    /// karşılığı. Testler örnek-başına ayrımı buradan sabitliyor (aynı sembol
+    /// adı iki broker'da farklı `symbol_id` alabilir), o yüzden duruyor.
+    #[allow(dead_code)]
     pub fn resolve(&self, instance: &str, name: &str) -> Option<u32> {
         let g = self.inner.read().unwrap_or_else(|e| e.into_inner());
         g.get(instance)?.id_of(name)

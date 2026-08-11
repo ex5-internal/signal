@@ -396,6 +396,10 @@ pub struct TickSnap {
     pub s: String,
     pub b: f64,
     pub a: f64,
+    /// last (CFD/forex'te 0 olabilir) — canlı `tick` ile aynı alan adı, ki
+    /// istemci anlık görüntü ile akışı aynı şekilde işleyebilsin.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub l: f64,
     pub ms: i64,
     /// Bu fiyatın yaşı (ms). Büyükse sembol hareketsiz veya akış durmuş.
     pub age_ms: i64,

@@ -229,7 +229,17 @@ async fn handle(stream: TcpStream, ctx: Arc<Ctx>) -> Result<(), String> {
     let mut rx = ctx.events.subscribe();
     let mut subs = Subs::default();
     let auth_required = ctx.token.is_some();
-    let mut level = Level::Public;
+
+    // Token TANIMLI DEĞİLSE bağlantı doğrudan Trader başlar.
+    //
+    // Aksi halde `--token` verilmeyen bir kurulumda hiçbir istemci Trader'a
+    // yükselemez (`auth` "sunucuda token tanimli degil" der) ve işlem yüzeyi
+    // KALICI olarak kilitli kalırdı — üstelik `hello` tam tersini,
+    // `auth_required_for_trading: false` diyerek ilan ederdi. Bu tutarsızlık
+    // canlı testte ortaya çıktı: emir "auth gerekli" ile reddedildi.
+    //
+    // `--token` verildiği anda başlangıç seviyesi tekrar Public olur.
+    let mut level = if auth_required { Level::Public } else { Level::Trader };
 
     let hello = ServerMsg::Hello {
         proto: sinyal_proto::ring::RING_VERSION,
@@ -239,7 +249,7 @@ async fn handle(stream: TcpStream, ctx: Arc<Ctx>) -> Result<(), String> {
         // Piyasa verisi daima token'sız; yalnızca hesap ve emir kilitli.
         public_feed: true,
         auth_required_for_trading: auth_required,
-        level: Level::Public.name(),
+        level: level.name(),
     };
     send(&mut out, &hello).await?;
 
@@ -393,11 +403,12 @@ fn handle_client_msg(
     Some(match cm {
         ClientMsg::Auth { token } => {
             match ctx.token.as_deref() {
-                // Sunucuda token tanımlı değilse yükseltme yapılamaz; sessizce
-                // "tamam" demek istemciyi yanıltırdı.
-                None => vec![ServerMsg::Error {
-                    msg: "sunucuda token tanimli degil — islem yurutme kapali".into(),
-                }],
+                // Sunucuda token yoksa bağlantı zaten Trader olarak başlamıştır
+                // (bkz. `level` başlatması). Hata döndürmek yerine mevcut
+                // seviyeyi bildiriyoruz: istemcinin `auth` göndermesi zararsız
+                // olmalı, aksi halde aynı istemci kodu token'lı ve token'sız
+                // kurulumlarda farklı davranmak zorunda kalırdı.
+                None => vec![ServerMsg::Authed { level: level.name() }],
                 Some(expected) if secret_eq(expected, &token) => {
                     *level = Level::Trader;
                     vec![ServerMsg::Authed { level: Level::Trader.name() }]
@@ -468,6 +479,7 @@ fn handle_client_msg(
                     s,
                     b: t.bid,
                     a: t.ask,
+                    l: t.last,
                     ms: t.time_msc,
                     age_ms: (now_ms - t.time_msc).max(0),
                     src,
@@ -1020,5 +1032,116 @@ mod tests {
     fn comment_is_truncated_to_fit_the_wire_field() {
         let long = "x".repeat(200);
         assert!(short(&long).len() < COMMENT_LEN);
+    }
+
+    fn ctx_with(token: Option<&str>) -> Ctx {
+        let (events, _rx) = broadcast::channel(16);
+        Ctx {
+            registry: Arc::new(Registry::default()),
+            events,
+            cmd_tx: HashMap::new(),
+            token: token.map(str::to_owned),
+            trading: true,
+            allow_live: false,
+            deviation: 20,
+            orders: Arc::new(OrderTracker::new()),
+            candles: Arc::new(Mutex::new(crate::candles::CandleStore::new())),
+        }
+    }
+
+    /// Bağlantının başlangıç seviyesi — `serve_conn` ile aynı kural.
+    fn start_level(ctx: &Ctx) -> Level {
+        if ctx.token.is_some() { Level::Public } else { Level::Trader }
+    }
+
+    #[test]
+    fn without_a_token_trading_is_open_as_hello_advertises() {
+        // GERİLEME TESTİ — canlı testte yakalandı.
+        //
+        // `hello` token yokken `auth_required_for_trading: false` ilan ediyor,
+        // ama bağlantı Public başlayıp `auth` da yükseltemediği için emir
+        // "auth gerekli" ile reddediliyordu: yüzey kalıcı olarak kilitliydi ve
+        // sunucu kendi ilanıyla çelişiyordu.
+        let ctx = ctx_with(None);
+        let mut level = start_level(&ctx);
+        assert_eq!(level, Level::Trader, "token yoksa dogrudan trader");
+
+        let mut subs = Subs::default();
+        let out = handle_client_msg(ClientMsg::Positions, &ctx, &mut subs, &mut level).unwrap();
+        assert!(
+            !matches!(out.first(), Some(ServerMsg::Error { .. })),
+            "token yokken hesap sorgusu reddedilmemeli: {out:?}"
+        );
+
+        // `auth` göndermek zararsız olmalı — istemci kodu iki kurulumda da aynı.
+        let out = handle_client_msg(
+            ClientMsg::Auth { token: "herhangi".into() },
+            &ctx,
+            &mut subs,
+            &mut level,
+        )
+        .unwrap();
+        assert!(matches!(out.first(), Some(ServerMsg::Authed { .. })));
+        assert_eq!(level, Level::Trader);
+    }
+
+    #[test]
+    fn with_a_token_trading_stays_locked_until_auth() {
+        let ctx = ctx_with(Some("gizli"));
+        let mut level = start_level(&ctx);
+        assert_eq!(level, Level::Public);
+        let mut subs = Subs::default();
+
+        // Token'sız: reddedilmeli.
+        let out = handle_client_msg(ClientMsg::Positions, &ctx, &mut subs, &mut level).unwrap();
+        assert!(matches!(out.first(), Some(ServerMsg::Error { .. })));
+
+        // Yanlış token: seviye DEĞİŞMEMELİ.
+        let out =
+            handle_client_msg(ClientMsg::Auth { token: "yanlis".into() }, &ctx, &mut subs, &mut level)
+                .unwrap();
+        assert!(matches!(out.first(), Some(ServerMsg::Error { .. })));
+        assert_eq!(level, Level::Public, "basarisiz denemeden sonra public kalmali");
+
+        // Doğru token: yükselir.
+        let out =
+            handle_client_msg(ClientMsg::Auth { token: "gizli".into() }, &ctx, &mut subs, &mut level)
+                .unwrap();
+        assert!(matches!(out.first(), Some(ServerMsg::Authed { .. })));
+        assert_eq!(level, Level::Trader);
+
+        // Artık geçmeli.
+        let out = handle_client_msg(ClientMsg::Positions, &ctx, &mut subs, &mut level).unwrap();
+        assert!(!matches!(out.first(), Some(ServerMsg::Error { .. })));
+    }
+
+    #[test]
+    fn market_data_never_requires_auth_even_with_a_token() {
+        // Kullanıcının açık isteği: grafik/piyasa yüzeyi token'sız.
+        let ctx = ctx_with(Some("gizli"));
+        let mut level = start_level(&ctx);
+        let mut subs = Subs::default();
+
+        for msg in
+            [ClientMsg::Symbols, ClientMsg::Snapshot { symbols: vec![] }, ClientMsg::Ping]
+        {
+            let out = handle_client_msg(msg, &ctx, &mut subs, &mut level).unwrap();
+            assert!(
+                !matches!(out.first(), Some(ServerMsg::Error { .. })),
+                "piyasa yuzeyi token istememeli: {out:?}"
+            );
+        }
+
+        // Ama `order` KANALI hesap gizliliği kapsamında — token ister.
+        let out = handle_client_msg(
+            ClientMsg::Subscribe { channels: vec!["tick.*".into(), "order".into()] },
+            &ctx,
+            &mut subs,
+            &mut level,
+        )
+        .unwrap();
+        assert!(subs.tick_all, "tick aboneligi kurulmali");
+        assert!(!subs.orders, "emir kanali token olmadan acilmamali");
+        assert!(matches!(out.first(), Some(ServerMsg::Error { .. })));
     }
 }

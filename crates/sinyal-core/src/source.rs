@@ -140,6 +140,9 @@ fn reader_loop(
     // Sembol tablosunu ilk anda yükle — tick akışını isimlendirebilmek için.
     refresh_symbols(&session, &registry, &instance);
     let mut last_sym_refresh = Instant::now();
+    // Durum yoklaması sembol yenilemesinden ayrı: sıklığı korelasyon
+    // ihtiyacına göre uyarlanıyor (bkz. aşağıdaki `state_due`).
+    let mut last_state_refresh = Instant::now() - Duration::from_secs(1);
 
     let mut join = OrderJoin::new();
     let mut batch = vec![Tick::default(); 512];
@@ -265,17 +268,37 @@ fn reader_loop(
             }
         }
 
-        // --- 5) Periyodik bakım ---
-        if last_sym_refresh.elapsed() >= Duration::from_secs(1) {
-            refresh_symbols(&session, &registry, &instance);
-
-            // Durum görüntüsü: hesap + açık pozisyonlar + bekleyen emirler.
-            // Aynı zamanda eşleştiriciyi besler — `POSITION_MAGIC` bizim
-            // `client_id`'mizi taşıdığı için çekirdek yeniden başlasa bile
-            // bağlar buradan yeniden kurulur (mutabakatın temeli).
+        // --- 5) Durum görüntüsü (uyarlanır sıklık) ---
+        //
+        // Durum yalnızca hesap/pozisyon sorguları için değil, **korelasyon için
+        // de** okunur: `POSITION_MAGIC` bizim `client_id`'mizi taşır, yani
+        // "bilet → client_id" bağı buradan kurulur. Çekirdek yeniden başlasa
+        // bile bağlar bu yolla geri gelir — mutabakatın temeli.
+        //
+        // Sıklık uyarlanır: normalde saniyede bir yeter, ama atfedilmeyi
+        // bekleyen olay varken 1 saniye beklemek dolum olaylarının kimliksiz
+        // yayımlanmasına yol açardı. Bekleyen varken 2 ms'de bir yokluyoruz;
+        // EA `OnTrade`'de durumu "kirli" işaretleyip bir sonraki timer'da
+        // (~16 ms) yayımladığı için bağ pratikte iki hane ms içinde kurulur.
+        let state_due = if join.pending_len() > 0 {
+            last_state_refresh.elapsed() >= Duration::from_millis(2)
+        } else {
+            last_state_refresh.elapsed() >= Duration::from_secs(1)
+        };
+        if state_due {
             if let Some(st) = session.state() {
-                join.seed_from_positions(&st.positions);
-                join.seed_from_orders(&st.orders);
+                // Tohumlama yeni bağ kurabilir; bunun üzerine artık
+                // çözülebilen bekleyen olayları HEMEN yayımla. (Bu adım
+                // eksikti: bağ kuruluyor ama kuyruktakiler taranmıyordu, bu
+                // yüzden açılış olayları süresi dolup kimliksiz gidiyordu.)
+                for ev in join.seed_from_positions(&st.positions) {
+                    did_work = true;
+                    emit_order(&tx, &inst, &ev);
+                }
+                for ev in join.seed_from_orders(&st.orders) {
+                    did_work = true;
+                    emit_order(&tx, &inst, &ev);
+                }
                 if st.truncated {
                     eprintln!(
                         "[{instance}] UYARI: durum listesi kesildi (pozisyon {}/{}, emir {}/{})",
@@ -287,6 +310,12 @@ fn reader_loop(
                 }
                 registry.set_state(&instance, st);
             }
+            last_state_refresh = Instant::now();
+        }
+
+        // --- 6) Periyodik bakım ---
+        if last_sym_refresh.elapsed() >= Duration::from_secs(1) {
+            refresh_symbols(&session, &registry, &instance);
 
             last_sym_refresh = Instant::now();
             let mut s = stats.lock().unwrap_or_else(|e| e.into_inner());
@@ -297,7 +326,7 @@ fn reader_loop(
             s.join_unattributed = join.unattributed;
         }
 
-        // --- 6) Bekleme stratejisi ---
+        // --- 7) Bekleme stratejisi ---
         // Önce kısa süre dönerek bekle (düşük gecikme), sonra uykuya geç
         // (boş piyasada CPU yakmamak için). Sıkı döngü p50'yi düşürür ama
         // seans dışında bir çekirdeği %100'de tutardı.

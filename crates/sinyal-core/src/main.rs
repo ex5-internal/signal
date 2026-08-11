@@ -208,11 +208,16 @@ async fn main() {
 
     // Periyodik durum raporu: akışın canlı olup olmadığını görmenin en hızlı
     // yolu. Sessiz bir daemon, "çalışıyor mu bilmiyorum" demektir.
+    let telemetry_candles = candles.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
         tick.tick().await;
         loop {
             tick.tick().await;
+            let bars = {
+                let cs = telemetry_candles.lock().unwrap_or_else(|e| e.into_inner());
+                cs.total_bars()
+            };
             for (inst, st) in &stats_all {
                 let s = *st.lock().unwrap_or_else(|e| e.into_inner());
                 if !s.connected {
@@ -220,11 +225,30 @@ async fn main() {
                     continue;
                 }
                 println!(
-                    "[{inst}] tick={} dom={} emir={} | EA-kayip={} birikmis={}",
-                    s.ticks, s.books, s.orders, s.ea_tick_loss, s.backlog
+                    "[{inst}] tick={} dom={} emir={} bar={} | EA-kayip={} birikmis={} \
+                     | eslesme: bekleyen={} gec={} kimliksiz={}",
+                    s.ticks,
+                    s.books,
+                    s.orders,
+                    bars,
+                    s.ea_tick_loss,
+                    s.backlog,
+                    s.join_pending,
+                    s.join_late,
+                    s.join_unattributed,
                 );
                 if s.ea_tick_loss > 0 {
                     println!("[{inst}] UYARI: EA halkaya yazamadı — tick KAYBEDİLDİ.");
+                }
+                // Kimliksiz olay her zaman hata değil (terminalden elle yapılan
+                // işlemler de böyle görünür), ama emir gönderiyorsak ve sayaç
+                // artıyorsa korelasyon bozuk demektir — sessiz kalmasın.
+                if s.join_unattributed > 0 && s.orders > 0 {
+                    println!(
+                        "[{inst}] NOT: {} emir olayi hicbir komuta baglanamadi \
+                         (elle islem yaptiysan normal).",
+                        s.join_unattributed
+                    );
                 }
             }
         }
