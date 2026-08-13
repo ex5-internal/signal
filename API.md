@@ -243,6 +243,26 @@ Yükseldikten sonra: `account`, `positions`, `orders`, `order`, `close`,
 `id` **idempotency anahtarıdır** — aynı `id` ikinci kez gelirse `duplicate`
 döner ve emir GÖNDERİLMEZ. Çift pozisyon açılmaz.
 
+### ⚠️ `expiration` TEK BAŞINA GÖNDERİLİRSE YOK SAYILIR
+
+Bu sessiz bir tuzak ve emri **sonsuza kadar bekleyen emir olarak bırakır**.
+Çalışması için `time` alanı da **zorunludur**:
+
+```json
+{"op":"order","id":"x-1","action":"pending","type":"buy_limit",
+ "symbol":"GOLD","volume":0.01,"price":4388.20,
+ "time":"specified","expiration":1786492800}
+```
+
+- `time` verilmezse varsayılan `gtc` olur ve EA `expiration`'ı **hiç
+  atamaz** — hata da vermez, emir kalıcı olur ve istemci bunu telden
+  anlayamaz.
+- **`expiration` birimi MUTLAK epoch SANİYEDİR**, göreli değil. "120 saniye
+  sonra dolsun" için `şimdi + 120` göndermelisiniz.
+
+Süre dolduğunda şu an **`expired` bildirimi gönderilmiyor**; biletin
+düştüğünü `{"op":"orders"}` ile görebilirsiniz. Bu eksik giderilecek.
+
 ### Emir sonucu iki aşamalıdır — karıştırmayın
 
 ```json
@@ -273,6 +293,35 @@ bir işlem. Olay asla atılmaz, kimliksiz yayımlanır.
 - `lagged` mesajı gelirse akışta **boşluk** oluşmuştur; mum geçmişi yeniden
   çekilmelidir.
 - Zaman alanlarının hepsi **broker sunucu saatidir**. Broker DST uygulayabilir.
+
+---
+
+## 5b. Muhtemelen aradığınız ve ZATEN VAR olan şeyler
+
+Entegre olan sistemler bunları eksik sanıp kendi tarafında yeniden yazmaya
+kalkıyor. Hepsi mevcut:
+
+| İhtiyaç | İşlem / alan |
+|---|---|
+| Stop'u **broker tarafına** taşımak | `{"op":"modify_sltp","id":"..","ticket":N,"sl":..,"tp":..}` |
+| Açık pozisyonun SL/TP'si | `positions[].sl`, `.tp` |
+| Açık pozisyonun **yüzen** kârı ve swap'ı | `positions[].profit`, `.swap` |
+| LIMIT / STOP emir | `action:"pending"` + `type:"buy_limit"` … |
+| Bekleyen emri iptal | `{"op":"cancel","id":"..","ticket":N}` |
+| Bekleyen emrin **kalan** hacmi | `orders[].volume_initial` − `.volume_current` |
+
+> **Stop'u köprüde tutmayın.** Köprü çökerse pozisyon korumasız kalır.
+> `modify_sltp` ile SL'i broker'a yazın; MT5 sunucusu tutar ve `sinyald`
+> ölse bile korur. Köprüdeki stop yalnızca **yedek** olarak kalsın.
+
+### Henüz OLMAYAN ve bilmeniz gerekenler
+
+| Eksik | Ne yapmalı |
+|---|---|
+| Kapanış `txn`'inde **gerçekleşmiş** kâr/komisyon/swap | Şimdilik dolum fiyatlarından hesaplayın |
+| Dolum anındaki `bid`/`ask` | `tick` akışından en yakın tick'le eşleştirin |
+| `{"kind":"expired"}` | `{"op":"orders"}` ile biletin düştüğünü görün |
+| Simülatörde komisyon/swap | Paper/replay PnL'i **iyimserdir** |
 
 ---
 
@@ -352,6 +401,50 @@ piyasa açılana kadar beklenmelidir.
 Bize ait olmayan işlemler — terminalden elle yapılmış. Olay **asla atılmaz**,
 kimliksiz yayımlanır. Sinyal sistemi bunları kendi emri sanmamalı ama yok da
 saymamalı: hesabın durumunu değiştirmişlerdir.
+
+---
+
+## 7. Backtest — 3 aylık gerçek tick verisi HAZIR
+
+Beklemeye gerek yok. Broker'ın tick geçmişi geri çekildi:
+
+```
+25.828.292 tick     13 Mayıs → 13 Ağustos 2026     66 işlem günü
+```
+
+Bunlar **gerçek broker tick'leri** — bardan türetilmiş sentetik veri değil.
+Gerçek spread ve gerçek tick zamanlaması korunuyor.
+
+```bash
+sinyald --replay ./veri --replay-date 20260513-20260812 \
+        --replay-speed 0 --bind 127.0.0.1:8788
+```
+
+Bağlanın: `ws://127.0.0.1:8788` — token istemez.
+
+**Aynı protokol.** Tek fark `hello.mode = "replay"`. Kod yolunuz değişmez;
+yalnızca bağlandığınız port değişir.
+
+| | |
+|---|---|
+| `--replay-speed 0` | Beklemeden en hızlı. 66 gün dakikalar sürer. |
+| `--replay-speed 1` | Gerçek zamanlı |
+| `--replay-from/to` | `09:00`/`17:00` — **her güne ayrı ayrı** uygulanır |
+| `replay_done` | Yalnızca **aralığın sonunda**. Gün geçişinde bağlantı kopmaz. |
+
+Tek bağlantıda 66 gün akar; gün sınırında durumunuz sıfırlanmaz, yani
+**gün-aşırı pozisyon taşıma da test edilir**.
+
+### Replay'de neyin farklı olduğunu bilin
+
+**MT5 mum geçmişi YOK.** `candles` cevabı `src_kind: "tick"` ve
+`hist: "off"` döner; mumlar yalnızca kayıttaki tick'lerden üretilir.
+
+**Simülatör iyimser.** Komisyon, swap, requote ve kısmi dolum modellenmiyor;
+kayma varsayılanı gerçekte ölçülenden düşük. Yani replay PnL'i canlıdan
+**daha iyi** çıkar. Bar tabanlı bir testin gerçek yürütmede tersine dönmesi
+bu yüzden olur — replay tick tabanlı olduğu için çok daha yakın, ama
+**birebir değil**.
 
 ---
 
