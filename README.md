@@ -23,6 +23,26 @@ beslemektir — böylece test ile canlı arasında veri farkı oluşmaz.
 Yeni başlıyorsan sırayla oku. `MIMARI.md` "neden böyle", `GELISTIRME.md` "neye
 dikkat" sorusunu cevaplar; ikisi de koddan çıkarılamayacak bilgi içerir.
 
+### Tüketici sistemle mesajlaşma
+
+Sinyal üreten sistem **ayrı bir makinede, ayrı bir oturumda** çalışıyor
+(`signal@65.108.93.247`). İki oturum birbirine doğrudan mesaj gönderemez;
+aralarındaki kanal sunucudaki şu dizindir:
+
+```
+/home/signal/mesaj/BENIOKU.md       protokol
+/home/signal/mesaj/windows-den.md   bu taraf YAZAR
+/home/signal/mesaj/linux-den.md     bu taraf yalnızca OKUR
+```
+
+SSH anahtarı: `C:\Users\admin\.ssh-ex5\ex5-prod.key` (agent'ta değil, dosyada;
+`-o IdentitiesOnly=yes` ile kullan).
+
+Kalıcı bulgular buraya değil **belgelere** yazılır — mesaj kaybolur, belge
+kalır. Mesaj dosyası "şunu ölçtüm, şu belgede" demek içindir.
+
+Tüketicinin ham tick arşivi de aynı sunucuda: `/home/signal/tick-veri/`.
+
 ---
 
 ## Neye benziyor
