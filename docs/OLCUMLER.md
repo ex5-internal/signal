@@ -661,6 +661,57 @@ alan MT5'ten olduğu gibi taşınıyor.
 
 ---
 
+## 15. SWAP ÖLÇÜLDÜ — ve GOLD'da LONG pahalı
+
+Korumalı çift (0,01 LONG + 0,01 SHORT) gece devrine bırakıldı. Devir broker
+00:00 = **21:00 UTC**. Devirden hemen sonra okunan değerler:
+
+| yön | 0,01 lot / gece |
+|---|---|
+| **LONG** | **−0,89$** |
+| **SHORT** | **+0,11$** |
+
+Asimetri büyük ve yön belirleyici: long taşımak short taşımanın 8 katı
+maliyetli, üstelik short **kazandırıyor**.
+
+### Bağlam: bu, bir işlemin kârı kadar
+
+Tüketici sistemin ölçtüğü ortalama işlem kârı **~0,96$**. Yani bir long
+pozisyonu bir gece taşımak, **bir işlemin tüm kârını** siler.
+
+Ölçüm anında hesapta 44 pozisyon açıktı (43 long + 1 short, 42'si tüketici
+sistemin):
+
+```
+yuzen K/Z          : +73,83$
+swap yuku          : −38,16$   (43 × −0,89  +  1 × +0,11)
+swap dahil net     : +35,67$
+```
+
+**Tek gecede yüzen kârın %52'si swap'e gitti.** Sistemin ortalama tutma
+süresi 22–30 dakika olduğu için normalde swap hiç devreye girmez — ama o gece
+42 pozisyon devri geçti.
+
+### ⚠️ Devir anında GOLD KAPALI — çıkamazsınız
+
+Bunlar birleşince gerçek bir tuzak oluyor: GOLD'un günlük molası **broker
+00:00–01:00**, yani **swap'in kesildiği anla aynı saat**.
+
+Ölçüldü — devirden 3 dakika sonra pozisyon kapatma denemesi:
+
+```json
+{"kind":"txn","retcode":10018}   // MARKET_CLOSED
+```
+
+Yani devir yaklaşırken pozisyonunuz açıksa: swap kesilir **ve** bir saat
+boyunca çıkamazsınız. "Devirden hemen önce kapat" stratejisi, bir saniye geç
+kalırsa hiç çalışmaz.
+
+**Pratik kural:** GOLD pozisyonlarını broker 23:5x'ten **önce** kapatın;
+o pencereyi kaçırırsanız 01:00'e kadar mahsursunuz.
+
+---
+
 ## Henüz ÖLÇÜLMEMİŞ — bunlara güvenme
 
 Aşağıdakiler kodda yazılı ama **canlıda doğrulanmadı**. Sinyal sistemine
