@@ -313,6 +313,23 @@ sanılıp yanlış teşhis yazıldı.
 İkisini de sorgulamadan "temizlendi" demeyin. Piyasaya yakın `pending` emirle
 deney yapan her istemci için geçerlidir.
 
+### Bir pozisyonun KÖPRÜDEN mi geldiğini `client_id` söyler
+
+Aynı hesaba birden fazla şey dokunuyorsa (elle işlem, başka bir EA, ikinci bir
+istemci) pozisyonun kaynağını ayırmanız gerekir. Alan `positions[].client_id`:
+
+| `client_id` | anlamı |
+|---|---|
+| `0` | terminalden **elle** ya da başka bir EA/script'ten |
+| `≠ 0` | **bu köprüden**, `order` işlemiyle. Her emirde bir artan sayaç. |
+
+> ⚠️ **`comment` bu iş için KULLANILAMAZ — ölçüldü.** `order` işlemine
+> `"comment":"olcum-swap"` gönderildi; `positions[]` cevabında `comment`
+> **boş** geldi. Emirdeki yorum pozisyona taşınmıyor.
+
+Ardışık bir `client_id` bloğu, tek bir istemcinin arka arkaya gönderdiği
+emirler demektir — kaynak ayıklamada en hızlı ipucu budur.
+
 ### 🛡️ Stop'u EMİRLE BİRLİKTE gönderin — korumasız pencere hiç doğmasın
 
 `order` işlemi **`sl` ve `tp` alanlarını kabul eder** (`0` = konmadı). MT5 emri
