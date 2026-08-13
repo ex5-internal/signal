@@ -654,18 +654,48 @@ saymamalı: hesabın durumunu değiştirmişlerdir.
 Beklemeye gerek yok. Broker'ın tick geçmişi geri çekildi:
 
 ```
-25.828.292 tick     13 Mayıs → 13 Ağustos 2026     66 işlem günü
+26.378.012 tick     13 Mayıs → 13 Ağustos 2026     67 gün     1,18 GB
 ```
+
+Sayı **diskteki dosyalardan** doğrulandı (2026-08-13) ve canlı kayıt sürdüğü
+için her gün artar. Tüm dosyalar 48'e tam bölünüyor, eksik sembol tablosu yok.
 
 Bunlar **gerçek broker tick'leri** — bardan türetilmiş sentetik veri değil.
 Gerçek spread ve gerçek tick zamanlaması korunuyor.
 
 ```bash
 sinyald --replay ./veri --replay-date 20260513-20260812 \
-        --replay-speed 0 --bind 127.0.0.1:8788
+        --replay-speed 1000 --bind 127.0.0.1:8788 --capacity 262144
 ```
 
 Bağlanın: `ws://127.0.0.1:8788` — token istemez.
+
+### 🔴 `--replay-speed 0` KULLANMAYIN — verinin %99'unu düşürür
+
+Ölçüldü (tek gün, 541.771 tick, `--capacity 262144`):
+
+| `--replay-speed` | ulaşan | düşen | süre |
+|---|---|---|---|
+| `0` | 4.968 | **649.416** | 1,1 sn |
+| `5000` | 346.045 | 205.792 | 17,4 sn |
+| **`1000`** | **541.771** | **0** | 86,4 sn |
+
+Darboğaz **istemci değil, üretici**: hiç işlem yapmayan, geleni doğrudan diske
+yazan bir istemciyle de aynı kayıp ölçüldü. `speed 0`'da üretici hiç
+frenlenmiyor.
+
+Üç şey **zorunlu**:
+
+1. **`--replay-speed 1000`** kullanın (gün başına ~86 sn).
+2. **`lagged` mesajlarını sayın.** Bir tane bile gelirse koşumu iptal edin —
+   `{"t":"lagged","dropped":N}`.
+3. **`replay_done.ticks`e güvenmeyin.** O alan *oynatılan* tick'i söyler,
+   *ulaşan*ı değil. `speed 0` turunda istemci 4.968 tick aldı ve `replay_done`
+   yine `"ticks":541771` dedi.
+
+> **Replay süreç başına BİR KEZ oynatılır.** İlk istemciyi bekler, oynatır,
+> biter. Sonradan bağlanan istemci **sıfır tick** alır ama yine dolu bir
+> `replay_done` görür. Yeni koşum için süreci yeniden başlatın.
 
 **Aynı protokol.** Tek fark `hello.mode = "replay"`. Kod yolunuz değişmez;
 yalnızca bağlandığınız port değişir.

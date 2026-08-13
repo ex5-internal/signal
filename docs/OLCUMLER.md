@@ -343,6 +343,90 @@ Tam liste ve her bulgunun çürütme gerekçesi denetim çıktısında.
 
 ---
 
+## 9. Replay'i veri taşıma aracı olarak kullanmak
+
+Tüketici sistem, 3 aylık tick verisini dosya kopyalamadan almak için replay
+akışını "işleme" değil **"indirme"** aracı olarak kullanmayı önerdi: soketten
+geleni hiç işlemeden diske yaz, sonra çevrimdışı koştur. Fikir doğru, ama
+önerilen komut **verinin %99'unu kaybettiriyor**.
+
+### Envanter (2026-08-13 ölçümü)
+
+| | |
+|---|---|
+| dosya | **67** gün, `20260513` … `20260813` |
+| tick | **26.378.012** |
+| boyut | 1.266.144.576 bayt (1,18 GB) |
+| 48'e bölünmeyen dosya | **YOK** — hepsi tam |
+| sembol tablosu | her tick gününe karşılık `symbols-YYYYMMDD.jsonl`, **eksik yok** |
+
+> **Belgelerdeki iki sayı da yanlıştı.** API.md 25.828.292 tick / 66 gün,
+> OLCUMLER.md 25.426.116 tick / 92 gün diyordu. 92 sayısı geri-doldurmanın
+> *denediği* takvim günü, 25,4 M ise *tekilleştirme öncesi* indirilen tick
+> sayısıydı. Diskteki gerçek: **67 gün / 26.378.012 tick** — ve canlı kayıt
+> sürdüğü için her gün artıyor.
+
+### `symbol_id` günler arasında DEĞİŞMEMİŞ
+
+`replay.rs:84-93` tabloyu her gün yeniden yüklüyor, yani değişebilir. 67 günün
+tamamı tarandı: **tek bir eşleme var.**
+
+```
+0=AUDUSD 1=EURUSD 2=GBPUSD 3=GOLD 4=NZDUSD
+5=USDCAD 6=USDCHF 7=USDCNH 8=USDJPY 9=USDSEK
+```
+
+Bu veri kümesi için `GOLD = 3` sabittir. Yine de gün başına doğrulamak
+doğrudur; garanti protokolde değil, veride.
+
+### ⚠️ `--replay-speed 0` verinin %99'unu düşürüyor
+
+Hız taraması, tek gün (`20260812`, 541.771 tick), `--capacity 262144`:
+
+| `--replay-speed` | ulaşan tick | `lagged` olayı | düşen | süre |
+|---|---|---|---|---|
+| **0** | 4.968 | 13.446 | 649.416 | 1,1 sn |
+| 5000 | 346.045 | 307 | 205.792 | 17,4 sn |
+| **1000** | **541.771** | **0** | **0** | **86,4 sn** |
+
+**Darboğaz istemci değil, üretici.** Hiçbir işlem yapmayan, geleni doğrudan
+diske yazan bir istemciyle de ölçüldü: `speed 0`'da yine 649.840 tick düştü.
+"İşleme yapmazsam kanal dolmaz" varsayımı **yanlış** — `speed 0`'da üretici
+hiç frenlenmiyor ve soket taşıyamıyor.
+
+**Kayıpsız hız: `--replay-speed 1000`.** Gün başına ~86 sn → 67 gün ≈ 96 dk.
+
+### ⚠️ `replay_done.ticks` ULAŞAN tick'i DEĞİL, OYNATILANI söyler
+
+`speed 0` turunda istemci 4.968 tick aldı; `replay_done` yine şunu dedi:
+
+```json
+{"t":"replay_done","ticks":541771,"last_ms":1786589997937,"days":1,"days_played":1}
+```
+
+Yalnızca `replay_done`'a bakan bir istemci, 541.771 tick aldığını sanır.
+**`lagged` sayılmadan bu akıştan çıkan hiçbir sonuç geçerli değildir.**
+Tüketicinin "tek `lagged` gelirse koşumu iptal et" kararı doğrudur ve
+zorunludur.
+
+### ⚠️ Replay süreç başına BİR KEZ oynatılır
+
+İlk istemciyi bekler, oynatır, biter. Oynatma bittikten **sonra** bağlanan
+istemci **sıfır tick** alır ama yine `ticks: 541771` içeren bir `replay_done`
+görür — ölçüldü.
+
+Yani: **bir süreç = bir oynatma = bir istemci.** Yeni koşum için süreç
+yeniden başlatılmalı.
+
+### Şu an ayakta olan
+
+```
+PID 27816  CANLI   0.0.0.0:8787   (üretim — dokunulmadı)
+PID 44396  REPLAY  0.0.0.0:8788   --replay-date 20260812 --replay-speed 1000
+```
+
+---
+
 ## Henüz ÖLÇÜLMEMİŞ — bunlara güvenme
 
 Aşağıdakiler kodda yazılı ama **canlıda doğrulanmadı**. Sinyal sistemine
