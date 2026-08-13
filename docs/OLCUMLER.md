@@ -530,6 +530,64 @@ geldi.
 
 ---
 
+## 13. GOLD'da KOMİSYON YOK — maliyetin tamamı spread
+
+Tüketici sistemin 66 günlük backtest sonucu tek bir bilinmeyene takılmıştı:
+komisyon 0$ ise 1.000$ → 10.127$; 1$ ise **margin call**. Ölçüldü.
+
+**Yöntem — MQL5 betiği gerekmedi:** pozisyon aç, kapat, `account.balance`ı
+önce/sonra oku, fiyattan hesaplanan K/Z ile karşılaştır. Fark = komisyon + swap.
+
+| hacim | dolan | kayma | spread | **komisyon** |
+|---|---|---|---|---|
+| 0,01 lot | 0,01 | 0 point | 57 point | **0,0000$** |
+| 0,10 lot | 0,10 | 0 point | 55 point | **0,0000$** |
+| 0,50 lot | 0,50 | 0 point | 53 point | **0,0000$** |
+
+Ayrıca 0,01 lotta 5 ardışık tur: her birinde `bakiye_farkı == fiyat_K/Z`,
+sapma 0,0000. Toplam **8 gidiş-dönüş, 3 hacim, istisnasız sıfır.**
+
+### Kayma her hacimde sıfır, kısmi dolum yok
+
+0,50 lotta bile `dolan == istenen`. Ölçek büyütmek bu hacimlerde ek maliyet
+getirmiyor (0,50 lot ≈ 217.000$ nominal, 1:1000 kaldıraçla marj sorun olmadı).
+
+### Spread dağılımı (408 tick, 90 sn)
+
+```
+min=40  p50=52  p90=53  p99=54  max=59   (point)
+ortalama 49 point = 0,49$ / 0.01 lot
+```
+
+### Hesap kimliği
+
+```
+login 318262494 · XMGlobal-MT5 7 · XM Global Limited
+USD · 1:1000 · demo · hedging
+```
+
+`hedging`: pozisyon kapatma **ticket zorunlu** ister, sembolle kapatılmaz.
+
+### ⚠️ Çekince: bu bir DEMO hesap
+
+Demo sunucular bazen komisyonu modellemez. Ölçüm bu hesapta kesin; **gerçek
+hesapta aynı hesap tipiyle yeniden ölçülmelidir.** Spread'in ~52 point olması
+komisyonsuz bir Standard/Micro profiliyle tutarlı (Zero hesabında spread çok
+daha dar olur ve komisyon çıkar), yani sonuç makul — ama demo'dan.
+
+### Swap: ölçüm sürüyor
+
+Gece devri beklendiği için henüz yok. Korumalı çift açık bırakıldı
+(`946181832` + `946181926`, ters yönler, piyasa riski ~0, yalnız swap
+birikir). Broker 00:00 = 21:00 UTC devrinden sonra `positions[].swap` okunacak.
+
+> **Kendi ölçüm hatam:** bu turda "gecikme 14.000 ms" değerleri üretildi;
+> bunlar **gerçek gecikme değil**, betiğin olay toplama penceresi. Gerçek
+> uçtan uca gecikme §7'de ölçüldü: **48 ms** medyan. 14 sn hiçbir yerde
+> kullanılmamalı.
+
+---
+
 ## Henüz ÖLÇÜLMEMİŞ — bunlara güvenme
 
 Aşağıdakiler kodda yazılı ama **canlıda doğrulanmadı**. Sinyal sistemine
