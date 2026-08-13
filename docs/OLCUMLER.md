@@ -465,24 +465,46 @@ yazsın, ya da kaydın kaynağı `flags` ile bildirilsin.
 
 ---
 
-## 11. `stops_level` tabloda `0` ama gerçekte ~20–25 point
+## 11. `stops_level` GERÇEKTEN `0` — önceki "20–25 point" iddiası YANLIŞTI
 
-Açık pozisyona SL kademeli yaklaştırılarak ölçüldü:
+### ❌ Önce yanlış ölçüldü, tüketici ona göre kod değiştirdi
+
+İlk turda "eşik 20–25 point" bildirildi. **Yanlıştı.** Tüketici sistem buna
+dayanarak "limit fiyatı piyasaya 30 point'ten yakınsa doğrudan market" kuralı
+koydu — yani tam kazanmaya çalıştığı LIMIT avantajının bir kısmından oldu.
+
+**Yöntem hatası:** açık pozisyonun SL'i fiyata kademeli yaklaştırılıyordu. O
+yöntem bozuk, çünkü (a) stop tetiklenip pozisyonu kapatıyor, test kendini
+bitiriyor, (b) fiyat oynayınca SL yanlış tarafa geçip `10013` üretiyor.
+Elde kalan tek `10016` örneği bu gürültüdendi.
+
+### ✅ Doğru ölçüm: bekleyen emirle, pozisyon hiç açılmadan
 
 ```
-mesafe 25 point -> kabul
-mesafe 20 point -> RED 10016
+buy_limit, piyasadan 4 … 60 point asagida, 3 tur, 57 emir
+  -> 57/57 KABUL. Tek bir 10016 YOK.
+
+buy_limit sabit 100 pt asagida, SL limit fiyatina 1 … 100 point
+  -> 13/13 KABUL. SL mesafesi 1 POINT bile kabul ediliyor.
 ```
 
-**`stops_level: 0` "sınır yok" demek değildir** — broker dinamik bir eşik
-uyguluyor. Eşik spread'in (55 point) kabaca yarısına denk geliyor ama bu bir
-kural olarak doğrulanmadı.
+**Sembol tablosundaki `stops_level: 0` gerçekten doğru.** Bu brokerda GOLD
+için yerleştirme mesafesi kısıtı yoktur.
 
-> Ölçümün zayıf yanı: 20 point altındaki denemeler `10013` döndürdü (fiyat
-> oynadığı için SL yanlış tarafa geçmişti), yani eşikte **tek** temiz örnek
-> var. Kesin sayı gerekiyorsa sabit fiyatlı bir turla yeniden ölçülmeli.
+### Gerçek sebep: mesafe değil, TARAF
 
-Pratik öneri: limit/stop fiyatlarını piyasadan **en az 30 point** uzak tutun.
+Tüketicinin 19 limit emrinden 2'sinin `10016` almasının kalan tek makul
+açıklaması: limit fiyatı, karar ile sunucunun emri işlemesi arasında piyasanın
+**yanlış tarafına** geçti. `buy_limit` mevcut ask'in üstüne düşerse
+geçersizdir.
+
+Tüketicinin ölçtüğü gecikme zinciri **1,238 sn**; GOLD bu sürede 10–20 point
+oynayabiliyor. Yani kural şu: **mesafe, gecikme boyunca fiyatın oynayabileceği
+miktardan büyük olmalı.** Broker dayatması değil, gecikmenin sonucu — ve
+gecikmeyi kısaltmak mesafeyi daraltmayı mümkün kılar.
+
+Bu, §7'deki "karar gecikmesini kısaltmak `deviation` ayarlamaktan kat kat
+değerli" bulgusunun ikinci kez, farklı bir yoldan doğrulanmasıdır.
 
 ---
 
