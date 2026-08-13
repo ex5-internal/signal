@@ -274,10 +274,40 @@ Yükseldikten sonra: `account`, `positions`, `orders`, `order`, `close`,
 {"op":"close","id":"benim-3","ticket":942649399}
 {"op":"cancel","id":"benim-4","ticket":942418505}
 {"op":"modify_sltp","id":"benim-5","ticket":942649399,"sl":4300,"tp":4400}
+{"op":"order","id":"benim-6","symbol":"GOLD","side":"buy","type":"market","volume":0.01,"sl":4366.85,"tp":4381.85}
 ```
 
 `id` **idempotency anahtarıdır** — aynı `id` ikinci kez gelirse `duplicate`
 döner ve emir GÖNDERİLMEZ. Çift pozisyon açılmaz.
+
+### 🛡️ Stop'u EMİRLE BİRLİKTE gönderin — korumasız pencere hiç doğmasın
+
+`order` işlemi **`sl` ve `tp` alanlarını kabul eder** (`0` = konmadı). MT5 emri
+ve stop'u **tek istekte** işler; pozisyon **SL ile doğar**.
+
+**Canlıda ölçüldü (2026-08-13, GOLD):**
+
+```json
+{"op":"order",...,"volume":0.01,"sl":4366.85,"tp":4381.85}
+→ positions: ticket=945733772 sl=4366.85 tp=4381.85
+```
+
+İki adımlı yolda (`order` → dolum bekle → bileti öğren → `modify_sltp`)
+pozisyon, dolum olayı gelene kadar **korumasızdır**. Köprü tam o aralıkta
+zombileşirse pozisyon saatlerce SL'siz kalır — tüketici sistemin bildirdiği
+"11 pozisyon 10+ saat korumasız" olayı bu penceredir. Emirle birlikte
+gönderim bu pencereyi **tamamen kapatır**.
+
+Bilinmesi gerekenler:
+
+- Stop geçersizse (`stops_level` ihlali) MT5 **tüm isteği** `10016` ile
+  reddeder: korumasız pozisyon **oluşmaz**. İki adımlı yolda aynı hata
+  pozisyon **açıkken** olur.
+- ⚠️ **Bu yol için `sltp_unverified` doğrulaması KURULMAZ.** Doğrulama defteri
+  yalnızca `modify_sltp` komutunda devreye girer. Emirle birlikte SL
+  gönderdiyseniz dolumdan sonra `positions[].sl` değerini **kendiniz okuyun**.
+- Stop'u sonradan **değiştirmek** için (trailing vb.) yine `modify_sltp`
+  kullanılır; o yolda doğrulama devrededir.
 
 ### ⚠️ `expiration` TEK BAŞINA GÖNDERİLİRSE YOK SAYILIR
 
@@ -520,11 +550,14 @@ kalkıyor. Hepsi mevcut:
 | **Kısmi** dolumu tam dolumdan ayırmak | `order` olayındaki `order_state` (`3` = `PARTIAL`) |
 | Bekleyen emrin süresinin dolduğu | `{"t":"order","kind":"expired"}` |
 | Broker SL'i gerçekten kurdu mu | `{"t":"order","kind":"sltp_unverified"}` uyarısı |
+| Stop'u **emirle birlikte** koymak (korumasız pencere yok) | `order` içindeki `sl` / `tp` |
+| Açık pozisyonun stop'unu **sonradan** değiştirmek | `{"op":"modify_sltp","id":"..","ticket":N,"sl":..,"tp":..}` |
 
 > **Stop'u köprüde tutmayın — ama köprü stop'unu da KALDIRMAYIN.**
-> `modify_sltp` ile SL'i broker'a yazın: MT5 sunucusu tutar ve `sinyald`
-> ölse bile korur. Köprüdeki stop **yedek** olarak kalsın. Broker SL'i
-> reddedebilir; o durumda `sltp_unverified` gelir ve yedeğiniz tek
+> SL'i tercihen **emirle birlikte** (`order` içindeki `sl`), değiştirirken
+> `modify_sltp` ile broker'a yazın: MT5 sunucusu tutar ve `sinyald` ölse bile
+> korur. Köprüdeki stop **yedek** olarak kalsın. Broker SL'i reddedebilir;
+> `modify_sltp` yolunda o durumda `sltp_unverified` gelir ve yedeğiniz tek
 > koruma olur. Ayrıntı: §4, "Stop broker tarafında, köprü stop'u YEDEK".
 
 ### Henüz OLMAYAN ve bilmeniz gerekenler

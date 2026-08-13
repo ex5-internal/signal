@@ -208,6 +208,141 @@ Uyarı **geldi**. Ayrıca geçersiz deneme, önceden kurulmuş geçerli SL'i
 
 ---
 
+## 7. Kayma kalibrasyonu — maliyet üçe ayrılıyor
+
+Tüketici sistem toplam giriş maliyetini **85 point** ölçmüştü. Bizim tek
+ölçümümüz spread 57 + kayma 3 = 60 veriyordu. 60 ≠ 85; fark nereden geliyor?
+
+Doğru ayrıştırma (ALIŞ için):
+
+```
+toplam = fiyat − KARAR_ANI_bid
+       = (fiyat − dolum_ask)       → KAYMA       (deviation ile sınırlanır)
+       + (dolum_ask − dolum_bid)   → SPREAD      (broker'ın fiyatı)
+       + (dolum_bid − karar_bid)   → SÜRÜKLENME  (karar ile dolum arasında
+                                                  piyasanın hareketi)
+```
+
+### 1. tur — 10 örnek, GEÇERSİZ (yöntem hatası)
+
+```
+KAYMA       ort=−2.5   medyan=0
+SPREAD      ort=56.2   medyan=57
+SÜRÜKLENME  ort=28.5   medyan=18    min=−10  max=106
+TOPLAM      ort=82.2   medyan=78
+```
+
+Toplam 82.2, tüketicinin 85'iyle örtüştü. **Ama bu tur geçersizdir:** "karar
+anı" fiyatı `snapshot` ile alınıyordu ve toplama döngüsü yüzünden 4 saniyeye
+kadar bayattı. Sürüklenme bu yüzden şişti. `gecikme_ms` değerleri de (~12000)
+gerçek gecikme değil, betiğin kendi döngü süresiydi.
+
+### 2. tur — sıkı karar anı, GEÇERLİ
+
+Tick akışına abone olunup **en son gelen tick** karar fiyatı sayıldı ve emir
+aynı anda gönderildi. Gerçek bir sinyal sisteminin davranışı budur.
+
+```
+KAYMA       ort=0      medyan=0     min=0    max=0
+SPREAD      ort=54.6   medyan=55    min=54   max=55
+SÜRÜKLENME  ort=−9     medyan=−2    min=−65  max=14
+TOPLAM      ort=45.6   medyan=52    min=−11  max=69
+GECİKME     ort=48 ms  medyan=48    min=39   max=58
+```
+
+**Sonuçlar:**
+
+1. **Kayma 10/10 örnekte tam SIFIR.** `deviation` ayarıyla uğraşmanın bu
+   broker'da GOLD için hiçbir getirisi yok.
+2. **Spread çok kararlı**: 54–55 point, sapma yok. Modellenmesi kolay.
+3. **Sürüklenme karar gecikmesine doğrudan bağlı.** 4 sn bayat kararla
+   ort. +28.5 point, 48 ms'lik kararla ort. **−9 point** (yani hafif
+   LEHTE). Maliyetin "ulaşılamaz fiyat" diye görünen kısmı büyük ölçüde
+   **kendi karar gecikmenizdir**, brokerin kötülüğü değil.
+4. Toplam giriş maliyeti 85 → **46 point**e düşüyor; neredeyse tamamı
+   spread.
+
+> **Bu, tüketici sistem için doğrudan eyleme dönüşür:** sinyal ile emir
+> arasındaki gecikmeyi kısaltmak, `deviation` ayarlamaktan **kat kat**
+> değerlidir. 4 saniyelik gecikme GOLD'da işlem başına ~28 point (0.28$)
+> ödetiyor; 0.01 lotta brüt kârın üçte biri.
+
+Simülatör için: `DEFAULT_SLIPPAGE_POINTS = 1.0` ölçülen **0**'a karşı zaten
+muhafazakâr; asıl eksik **sürüklenme** bileşeni ve o, karar gecikmesinin
+fonksiyonu — sabit bir sayı olarak modellenemez.
+
+---
+
+## 8. Koruma yolunun adversaryal denetimi
+
+37 ajanlı salt-okunur kod denetimi: 5 arıza merceği (dolum–SL penceresi,
+reddedilme yolları, bileşen ölümleri, kısmi/çoklu pozisyon, çifte tetik),
+ardından her iddiayı **çürütmeye** çalışan ikinci tur. 32 iddiadan **9'u
+çürütüldü**, 23'ü kaldı.
+
+İkisi canlıda **bizzat doğrulandı**:
+
+### 8a. `order` işlemi `sl`/`tp` alıyor — ve çalışıyor ✅
+
+```json
+{"op":"order",...,"volume":0.01,"sl":4366.85,"tp":4381.85}
+→ positions: ticket=945733772 sl=4366.85 tp=4381.85
+```
+
+Yol kodda uçtan uca bağlıydı (`wire.rs:145-148` → `server.rs:1517-1518` →
+`msg.rs:325-326` → `SinyalCollector.mq5:981-982`) ama **API.md'de hiç
+yazmıyordu**. Tüketici bu yüzden zorunlu olarak iki adımlı, korumasız
+pencereli yolu kullanıyordu. **Düzeltme kod değil, belge idi** — API.md'ye
+eklendi.
+
+Kalan uyarı: emirle gelen SL, `sltp_unverified` defterine **kaydolmuyor**
+(`arm_sltp_verify` yalnızca `ClientMsg::ModifySltp` dalından çağrılıyor,
+`server.rs:1175`). Bu yolu kullanan istemci `positions[].sl`i kendisi
+okumalı.
+
+### 8b. `symbol_id = 0` hatası — gerçek ama LATENT ⚠️
+
+`submit_simple` (`server.rs:1432`) `..Default::default()` kullanıyor, yani
+`modify_sltp` / `close` / `cancel` komutları **`symbol_id = 0`** ile gidiyor.
+EA de `req.symbol = g_name[0]` yapıyor (`SinyalCollector.mq5:969-977`).
+
+Ölçüm: tablodaki 0. sembol **AUDUSD**. EURUSD pozisyonuna `modify_sltp`
+gönderildi → **çalıştı** (`sl=1.1519` kuruldu). Kapatma da çalıştı, üstelik
+`close` yolunda `req.price` AUDUSD'nin fiyatından okunuyor
+(`SinyalCollector.mq5:1067-1075`) — EURUSD pozisyonu için ~0.65 fiyat
+gönderiliyor.
+
+**Yani MT5, `position` bileti verildiğinde `symbol` ve `price` alanlarını
+yok sayıyor.** Hata gerçek, bugün zarar vermiyor, ama **broker/MT5 davranışına
+bağımlı** — başka bir yürütme kipinde sessizce kırılabilir. Düzeltilmeli.
+
+### 8c. Denetimin çürüttükleri
+
+9 iddia çürütüldü. Bunlar **sorun değil**, buraya not düşülüyor ki tekrar
+gündeme gelince yeniden araştırılmasın: komut halkası dolduğunda sessiz düşme,
+broker retcode'unun hiç yorumlanmaması, kısmi dolumda doğan ek pozisyonlar,
+EA'daki "pozisyon yok" kapısının TOCTOU olması ve `id: ""` eşleştirme iddiası
+bunlar arasında.
+
+### 8d. Doğrulanmayı bekleyen kalan bulgular
+
+23 bulgunun geri kalanı **kodda okundu, canlıda ölçülmedi**. Ana temalar:
+
+- `state_age_ms` EA'nın yayın yaşını değil, köprünün **okuma** anını damgalıyor
+  (`state.rs:141`) → zombi köprüde bayatlık ölçüsü yalan söyleyebilir
+- Doğrulama defteri **tek atışlık**: 3 sn penceresinden sonra stop'un yerinde
+  kaldığı bir daha kontrol edilmiyor (`server.rs:2158`)
+- İstemci köprünün zombi olduğunu **anlayamıyor**: `ping` canlılık kanıtı
+  değil, `positions` cevabında yaş alanı yok (`server.rs:1027`)
+- Köprüde **yedek stop mantığı yok** — `SltpGuard` belgesi olduğunu ima ediyor,
+  kodun geri kalanı "yedek istemcide" diyor (`server.rs:388`)
+- Çok örnekli kurulumda komut **rastgele** bir örneğe gidiyor
+  (`HashMap::keys().next()`, `server.rs:1429`)
+
+Tam liste ve her bulgunun çürütme gerekçesi denetim çıktısında.
+
+---
+
 ## Henüz ÖLÇÜLMEMİŞ — bunlara güvenme
 
 Aşağıdakiler kodda yazılı ama **canlıda doğrulanmadı**. Sinyal sistemine
