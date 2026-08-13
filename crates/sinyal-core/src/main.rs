@@ -9,6 +9,7 @@
 //! sinyald --instance mt5-1 --record ./veri
 //! sinyald --instance mt5-1 --paper-bind 127.0.0.1:8788 --sim-slippage 2
 //! sinyald --replay ./veri --replay-date 20260811 --replay-speed 0
+//! sinyald --import-backfill ...\MQL5\Files\Sinyal\backfill --data-dir ./veri --instance mt5-1
 //! ```
 //!
 //! # Üç kip, tek protokol
@@ -45,6 +46,7 @@
 //! konsola yazılır — modellenmeyen bir maliyeti tahmin etmektense hiç
 //! eklememek, sonucun ne olduğu konusunda dürüst kalmayı sağlar.
 
+mod backfill;
 mod candles;
 mod hist_bridge;
 mod history;
@@ -123,6 +125,13 @@ struct RawPaper {
     slippage: Option<f64>,
 }
 
+/// Ham geri-doldurma bayrakları (bkz. `backfill.rs`).
+#[derive(Default)]
+struct RawImport {
+    src: Option<String>,
+    data_dir: Option<String>,
+}
+
 struct Args {
     instances: Vec<String>,
     bind: String,
@@ -139,6 +148,9 @@ struct Args {
     replay: Option<ReplayCfg>,
     /// `Some` ise CANLI kipin yanında AYRICA bir paper dinleyicisi açılır.
     paper: Option<PaperCfg>,
+    /// `Some` ise İÇE AKTARMA kipi: hiçbir şey dinlenmez, paylaşımlı belleğe
+    /// dokunulmaz; geri-doldurulmuş dosyalar kanonik kayda taşınır ve çıkılır.
+    import: Option<backfill::ImportOpts>,
     /// Simülasyonda daima ALEYHTE uygulanan kayma (point).
     ///
     /// Hem replay hem paper için geçerli: iki kipin dolum fiyatı ayrışırsa
@@ -160,6 +172,7 @@ impl Args {
     fn from_argv(argv: Vec<String>) -> Result<Self, String> {
         let mut raw = RawReplay::default();
         let mut paper = RawPaper::default();
+        let mut imp = RawImport::default();
         let mut a = Args {
             instances: Vec::new(),
             // Varsayılan localhost: bu uç EMİR YÜRÜTEBİLİYOR, kazara ağa
@@ -173,6 +186,7 @@ impl Args {
             record: None,
             replay: None,
             paper: None,
+            import: None,
             sim_slippage: sim::DEFAULT_SLIPPAGE_POINTS,
         };
         let mut i = 0;
@@ -237,6 +251,14 @@ impl Args {
                     raw.balance = Some(num()?);
                     i += 2;
                 }
+                "--import-backfill" => {
+                    imp.src = Some(val()?);
+                    i += 2;
+                }
+                "--data-dir" => {
+                    imp.data_dir = Some(val()?);
+                    i += 2;
+                }
                 "--paper-bind" => {
                     paper.bind = Some(val()?);
                     i += 2;
@@ -289,6 +311,81 @@ impl Args {
                 ));
             }
             a.sim_slippage = s;
+        }
+
+        if let Some(src) = imp.src.take() {
+            // --- İÇE AKTARMA kipi (geri-doldurulmuş tick dosyaları) ---
+            //
+            // Bu kip bir SUNUCU DEĞİL: hiçbir port dinlenmez, paylaşımlı
+            // belleğe bağlanılmaz, iş bitince süreç çıkar. Diğer kiplerle
+            // birlikte verilen bayrakları sessizce yok saymak, operatörün
+            // "canlıyı da başlattım" sanmasına yol açardı.
+            if raw.dir.is_some() {
+                return Err(
+                    "--import-backfill ile --replay birlikte kullanılamaz: içe aktarma \
+                     kayda YAZAR, replay kayıttan OKUR. İkisini aynı çalıştırmada \
+                     yapmak, oynatılan günün altından dosyayı çekmek olurdu."
+                        .into(),
+                );
+            }
+            if a.record.is_some() {
+                return Err(
+                    "--import-backfill ile --record birlikte kullanılamaz: ikisi de aynı \
+                     kayıt dizinine yazar ve dizinin tek yazar kilidi bunu zaten \
+                     reddeder. Önce kaydı durdur, sonra içe aktar."
+                        .into(),
+                );
+            }
+            if paper.bind.is_some() || a.trading {
+                return Err(
+                    "--import-backfill hiçbir emir yürütmez ve hiçbir port dinlemez; \
+                     --paper-bind / --enable-trading burada anlamsız."
+                        .into(),
+                );
+            }
+            let Some(data_dir) = imp.data_dir.take() else {
+                return Err(
+                    "--import-backfill --data-dir <dizin> ister: içe aktarma hangi kayıt \
+                     kökünün altına yazacağını TAHMİN ETMEZ. Kaydedicinin --record \
+                     dizinini ver."
+                        .into(),
+                );
+            };
+            // Örnek adı hedef dizinin ta kendisi (`<data-dir>/<instance>`):
+            // varsayılana düşmek, kaydı yanlış örneğin altına yazmak olurdu.
+            let instance = match a.instances.len() {
+                1 => a.instances[0].clone(),
+                0 => {
+                    return Err(
+                        "--import-backfill --instance <ad> ister: kayıt \
+                         <data-dir>/<instance> altında tutulur ve hangi örneğin \
+                         geçmişini doldurduğunu tahmin etmiyoruz."
+                            .into(),
+                    )
+                }
+                n => {
+                    return Err(format!(
+                        "--import-backfill tek bir --instance ile kullanılır ({n} verildi): \
+                         geri-doldurulan dosyalar tek bir örneğin kaydına taşınır."
+                    ))
+                }
+            };
+            a.import = Some(backfill::ImportOpts {
+                src_dir: PathBuf::from(src),
+                data_dir: PathBuf::from(data_dir),
+                instance,
+            });
+            return Ok(a);
+        }
+        if imp.data_dir.is_some() {
+            // Sessizce yok saymak, "--import-backfill yazmayı unuttum" hatasını
+            // fark edilmez yapardı: operatör hedefi verdiğini sanırken hiçbir
+            // şey içe aktarılmamış olurdu.
+            return Err(
+                "--data-dir yalnızca --import-backfill ile kullanılır; canlı kayıt dizini \
+                 --record, oynatım dizini --replay ile verilir."
+                    .into(),
+            );
         }
 
         if let Some(dir) = raw.dir.take() {
@@ -480,6 +577,24 @@ REPLAY (kayıttan oynatım — paylaşımlı belleğe HİÇ dokunmaz):
   hello.mode replay'de \"replay\" olur ve hello kapsamı (replay_from_ms /
   replay_to_ms) ilan eder; başka hiçbir mesaj biçimi değişmez.
 
+GERİ-DOLDURMA İÇE AKTARMA (sunucu değil: iş bitince çıkar):
+  --import-backfill DIZIN  MQL5 Service'in yazdığı <Sembol>-YYYYMMDD.bin
+                           dosyalarını KANONİK kayıt biçimine taşı.
+  --data-dir DIZIN         Hedef kayıt kökü (ZORUNLU; kaydedicinin --record
+                           dizini). Yazılan dosyalar:
+                             DIZIN/<instance>/ticks-YYYYMMDD.bin
+                             DIZIN/<instance>/symbols-YYYYMMDD.jsonl
+  --instance AD            Hangi örneğin kaydına yazılacak (ZORUNLU, tek).
+
+  Gün dosyası zaten varsa BİRLEŞTİRİLİR (üzerine yazılmaz): iki kaynak
+  time_msc ile sıralanır ve aynı (symbol_id,time_msc,bid,ask) dörtlüsü bir
+  kez yazılır. Aynı içe aktarmayı iki kez çalıştırmak çıktıyı DEĞİŞTİRMEZ.
+
+  DİKKAT: geçmiş tick'lerde YEREL ALIM ZAMANI yoktur; Service `recv_ms`
+  alanına BROKER saatini yazar. Replay temposu `recv_ms` farkından
+  üretildiği için bu günlerde tempo broker saatinden gelir. Özet bunu ve
+  ölçülen saat farkını AÇIKÇA yazar.
+
 PAPER (canlı veri, simüle yürütme — AYNI süreçte İKİNCİ dinleyici):
   --paper-bind ADDR   Paper portu. --instance ile birlikte kullanılır,
                       --replay ile KULLANILAMAZ (replay zaten simüle).
@@ -599,6 +714,21 @@ async fn main() {
             std::process::exit(2);
         }
     };
+
+    // İÇE AKTARMA: sunucu hiç kurulmaz. Bu kipte tek iş diski diske taşımak;
+    // paylaşımlı bellek, yayın kanalı ve dinleyici HİÇ oluşturulmaz.
+    if let Some(opts) = &args.import {
+        match backfill::import(opts) {
+            Ok(sum) => {
+                print!("{sum}");
+                return;
+            }
+            Err(e) => {
+                eprintln!("hata: geri-doldurma ice aktarilamadi: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
 
     let registry = Arc::new(Registry::new());
     let candles = Arc::new(Mutex::new(candles::CandleStore::new()));
@@ -1321,6 +1451,74 @@ mod tests {
             .contains("--sim-slippage"));
         assert!(err(&["--paper-bind", "127.0.0.1:8788", "--paper-balance", "-5"])
             .contains("--paper-balance"));
+    }
+
+    // --- İÇE AKTARMA kipi bayrakları ---
+
+    #[test]
+    fn import_needs_a_destination_and_an_instance_it_will_not_guess() {
+        // Hedefi tahmin etmek, geçmişi YANLIŞ örneğin kaydına karıştırmak
+        // olurdu; ve bu ancak aylar sonra "bu tick'ler nereden geldi" diye
+        // sorulduğunda fark edilirdi.
+        let e = err(&["--import-backfill", "gecmis"]);
+        assert!(e.contains("--data-dir"), "eksik bayrak adiyla anilmali: {e}");
+
+        let e = err(&["--import-backfill", "gecmis", "--data-dir", "veri"]);
+        assert!(e.contains("--instance"), "{e}");
+
+        let e = err(&[
+            "--import-backfill",
+            "gecmis",
+            "--data-dir",
+            "veri",
+            "--instance",
+            "a",
+            "--instance",
+            "b",
+        ]);
+        assert!(e.contains("--instance"), "tek ornek istendigi soylenmeli: {e}");
+
+        // Sessizce yok saymak, "--import-backfill yazmayı unuttum" hatasını
+        // fark edilmez yapardı.
+        assert!(err(&["--data-dir", "veri"]).contains("--import-backfill"));
+
+        let a = Args::from_argv(argv(&[
+            "--import-backfill",
+            "gecmis",
+            "--data-dir",
+            "veri",
+            "--instance",
+            "mt5-1",
+        ]))
+        .unwrap();
+        let imp = a.import.expect("ice aktarma kipi kurulmali");
+        assert_eq!(imp.src_dir, PathBuf::from("gecmis"));
+        assert_eq!(imp.data_dir, PathBuf::from("veri"));
+        assert_eq!(imp.instance, "mt5-1");
+        // Bu kip bir sunucu DEĞİL: canlı varsayılanları kurulmamalı.
+        assert!(a.replay.is_none() && a.paper.is_none() && a.record.is_none());
+    }
+
+    #[test]
+    fn import_refuses_to_share_a_run_with_the_other_modes() {
+        // İçe aktarma kayda YAZAR; replay okur, kaydedici de yazar. Aynı
+        // çalıştırmada ikisi, oynatılan/kaydedilen günün altından dosyayı
+        // çekmek olurdu — ve `--record` ile aynı dizin kilidi zaten çakışırdı.
+        for extra in [
+            vec!["--replay", "veri", "--replay-date", "20260811"],
+            vec!["--record", "veri"],
+            vec!["--paper-bind", "127.0.0.1:8788"],
+            vec!["--enable-trading"],
+        ] {
+            let mut flags =
+                vec!["--import-backfill", "gecmis", "--data-dir", "veri", "--instance", "mt5-1"];
+            flags.extend(extra.iter().copied());
+            let e = err(&flags);
+            assert!(
+                e.contains("--import-backfill"),
+                "{extra:?} icin acik hata bekleniyordu: {e}"
+            );
+        }
     }
 
     #[test]

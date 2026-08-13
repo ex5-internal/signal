@@ -117,7 +117,10 @@ $targets = @{
     'Experts'        = @(@{ Src = Join-Path $repo 'mql5\Experts\SinyalCollector.mq5'; Name = 'SinyalCollector.mq5' })
     # Gecmis besleyici AYRI bir programdir (Service): CopyRates EA thread'ini
     # bloklar, o yuzden tick toplama yolunda olamaz.
-    'Services'       = @(@{ Src = Join-Path $repo 'mql5\Services\SinyalHistory.mq5'; Name = 'SinyalHistory.mq5' })
+    'Services'       = @(
+        @{ Src = Join-Path $repo 'mql5\Services\SinyalHistory.mq5';  Name = 'SinyalHistory.mq5' }
+        @{ Src = Join-Path $repo 'mql5\Services\SinyalBackfill.mq5'; Name = 'SinyalBackfill.mq5' }
+    )
 }
 
 foreach ($sub in $targets.Keys) {
@@ -196,6 +199,7 @@ if ($Compile) {
         $toCompile = @(
             @{ Path = Join-Path $DataDir 'MQL5\Experts\SinyalCollector.mq5'; Label = 'EA' }
             @{ Path = Join-Path $DataDir 'MQL5\Services\SinyalHistory.mq5';  Label = 'Service' }
+            @{ Path = Join-Path $DataDir 'MQL5\Services\SinyalBackfill.mq5'; Label = 'Backfill' }
         )
         foreach ($item in $toCompile) {
             if (-not (Test-Path $item.Path)) {

@@ -422,10 +422,26 @@ const LOCK_NAME: &str = ".lock";
 /// dosyaları serpiştirilmiş append yüzünden bozulur ve bu aylar sonra
 /// "grafik saçmalıyor" olarak fark edilir.
 #[derive(Debug)]
-struct DirLock {
+pub(crate) struct DirLock {
     _file: File,
     #[cfg_attr(windows, allow(dead_code))]
     path: PathBuf,
+}
+
+/// Kayıt dizinini kaydedici DIŞINDAN kilitle.
+///
+/// Geri-doldurma içe aktarıcısı gün dosyalarını **yeniden yazıyor** (birleştir
+/// + atomik `rename`). Aynı anda `--record` ile çalışan bir daemon varsa,
+/// onun bizim okuduğumuz ile yazdığımız an arasında eklediği tick'ler
+/// `rename` ile SİLİNİRDİ — üstelik sessizce. Kilit aynı `.lock` dosyası
+/// olduğu için iki taraf da birbirini görür.
+pub(crate) fn lock_dir(data_dir: &Path) -> Result<DirLock, RecError> {
+    fs::create_dir_all(data_dir).map_err(|e| RecError::Io {
+        what: "dizin olusturma",
+        path: data_dir.to_path_buf(),
+        source: e,
+    })?;
+    DirLock::acquire(data_dir)
 }
 
 impl DirLock {
@@ -629,7 +645,11 @@ impl Recorder {
 }
 
 /// Örnek adı dosya yolunda güvenli mi.
-fn instance_ok(s: &str) -> bool {
+///
+/// Kaydediciden başkası da kullanıyor: geri-doldurma içe aktarıcısı
+/// (`backfill.rs`) aynı dizin düzenine yazıyor ve aynı yol kaçışlarına karşı
+/// aynı denetimi yapmak zorunda.
+pub(crate) fn instance_ok(s: &str) -> bool {
     !s.is_empty()
         && s != "."
         && s != ".."
