@@ -336,6 +336,19 @@ Bu bir tercih değil, **kural**:
 | `modify_sltp` ile broker'a yazılan SL | **ASIL koruma.** MT5 sunucusu tutar; `sinyald` ölse, VPS kapansa, ağ kopsa bile çalışır. |
 | İstemcinin kendi stop mantığı | **YEDEK.** Kaldırmayın. |
 
+**Bu iddia canlıda ÖLÇÜLDÜ (2026-08-13, GOLD).** Pozisyon açıldı, SL kondu,
+`sinyald` süreci `Stop-Process -Force` ile **öldürüldü**, 15 sn beklendi,
+yeniden başlatıldı:
+
+```
+SL kur              -> sl=4369.28
+sinyald ÖLDÜR       -> süreç yok
+yeniden başlat      -> sl=4369.28   (değişmedi)
+```
+
+Stop gerçekten broker tarafındadır. Yöntem ve ham çıktı:
+[docs/OLCUMLER.md](docs/OLCUMLER.md#6-stop-gerçekten-broker-tarafında-mı-tüketicinin-asıl-şikâyeti)
+
 Köprüdeki stop **tek başına yeterli değildir**: köprü zombi kalırsa
 (bağlantı ayakta görünür ama hiçbir şey işlemez) pozisyonlar saatlerce
 kapanmadan durur. Bu gerçekten yaşandı: köprü 8 saat zombi kaldı, 11
@@ -361,6 +374,16 @@ Bu yüzden köprü komuttan sonra **3 saniye** boyunca durum yayınındaki
  "istenen_sl":4300.0,"gercek_sl":0.0,"state_age_ms":840,
  "comment":"durum yayinindaki sl istenen degere ulasmadi — broker stop'u uygulamamis olabilir"}
 ```
+
+> ⚠️ **`kind` alanına bakın, `t` alanına değil.** Bu uyarı `t: "order"`
+> mesajının içinde `kind: "sltp_unverified"` olarak gelir — `t` alanı
+> `"sltp_unverified"` **olmaz**. Ölçüm yapılırken bu hataya biz düştük:
+> uyarı gelmişti, filtre `t`ye baktığı için "gelmedi" sanıldı.
+
+Canlıda doğrulandı: LONG pozisyona fiyatın **üstünde** SL gönderildiğinde
+broker `retcode 10016 "Invalid stops"` döndü ve uyarı **geldi**
+(`istenen_sl:4428.62, gercek_sl:0.0, state_age_ms:223`). Geçersiz deneme,
+önceden kurulmuş geçerli SL'i **bozmadı**.
 
 - **Bu bir HATA DEĞİL, bir UYARIDIR.** Emir kabul edilmiş olabilir;
   söylenen tek şey, kurulduğunun **doğrulanamadığı**dır.

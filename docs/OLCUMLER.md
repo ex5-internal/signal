@@ -164,15 +164,60 @@ UTC gün sınırı farkından doğan 16.904 yinelenen kayıt atıldı.
 
 ---
 
+---
+
+## 6. Stop gerçekten broker tarafında mı? (tüketicinin asıl şikâyeti)
+
+Tüketici sistem şunu bildirmişti: *"köprü 8 saat zombi kaldı, 11 pozisyon 10+
+saat korumasız kaldı."* Bunun tek doğru testi köprüyü **gerçekten öldürmektir**.
+
+Yöntem: 0.01 GOLD alındı → `modify_sltp` ile SL kondu → `positions`'tan
+doğrulandı → **`sinyald` süreci `Stop-Process -Force` ile öldürüldü** → 15 sn
+beklendi → köprü yeniden başlatıldı → pozisyon tekrar soruldu.
+
+```
+ticket = 945682242
+2) SL kur          -> positions: sl=4369.28 tp=4384.28      [GEÇTİ]
+4) sinyald ÖLDÜR   -> süreç yok
+5) yeniden başlat  -> ticket=945682242 sl=4369.28 tp=4384.28 [GEÇTİ]
+6) temizlik        -> pozisyon kapatıldı
+```
+
+**SL, köprü ölüp yeniden doğduktan sonra değişmeden duruyor.** Stop broker
+tarafındadır; köprünün ölmesi pozisyonu korumasız bırakmaz.
+
+### Broker stop'u REDDEDERSE sessiz kalmıyor
+
+LONG pozisyona bilerek geçersiz SL (fiyatın **üstünde**) gönderildi:
+
+```json
+{"t":"order","kind":"ack","retcode":10016,"comment":"Invalid stops"}
+{"t":"order","kind":"sltp_unverified","ticket":945688906,
+ "istenen_sl":4428.62,"gercek_sl":0.0,"state_age_ms":223,
+ "comment":"durum yayinindaki sl istenen degere ulasmadi - broker stop'u uygulamamis olabilir"}
+```
+
+Uyarı **geldi**. Ayrıca geçersiz deneme, önceden kurulmuş geçerli SL'i
+**bozmadı** (4369.28 olduğu gibi kaldı).
+
+> **Kendi ölçüm betiğimdeki hata:** ilk turda "uyarı gelmedi" raporlandı. Uyarı
+> gelmişti; betik `t` alanında `sltp_unverified` arıyordu, oysa uyarı
+> `t:"order"` + `kind:"sltp_unverified"` biçiminde geliyor. Sistem değil,
+> kontrol yanlıştı. Buraya yazılıyor çünkü aynı hatayı tüketici sistem de
+> yapabilir: **`kind` alanına bakın, `t` alanına değil.**
+
+---
+
 ## Henüz ÖLÇÜLMEMİŞ — bunlara güvenme
 
 Aşağıdakiler kodda yazılı ama **canlıda doğrulanmadı**. Sinyal sistemine
 "çalışıyor" diye bildirilmemeli:
 
-- **Broker stop'unun kurulduğunun doğrulanması** (`sltp_unverified`) — kod
-  yazıldı, 443 birim testi geçiyor, **canlı testi yapılmadı**
 - `{"kind":"expired"}` olayının gerçekten üretilmesi
 - `RECONCILE` yoluyla gerçekleşmiş `profit`/`commission`/`swap` — henüz yok
+- Köprü **öldüğü sırada** gönderilen bir `modify_sltp`in akıbeti (yukarıdaki
+  test köprüyü SL kurulduktan *sonra* öldürüyor; kurulmadan önce öldürseydi
+  ne olurdu ölçülmedi)
 
 Bu oturumda birim testleri geçen **iki** entegrasyon hatası ancak gerçek turda
 yakalandı (kayıt→replay sembol şeması; `deploy.ps1`'in başarısız derlemeyi
