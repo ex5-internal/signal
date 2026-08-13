@@ -280,6 +280,39 @@ Yükseldikten sonra: `account`, `positions`, `orders`, `order`, `close`,
 `id` **idempotency anahtarıdır** — aynı `id` ikinci kez gelirse `duplicate`
 döner ve emir GÖNDERİLMEZ. Çift pozisyon açılmaz.
 
+### 🔴 `cancel` DOLMUŞ emri geri almaz — "0 bekleyen emir" temizlik kanıtı DEĞİL
+
+Bekleyen emirleri toplu iptal edip sonra `{"op":"orders"}` ile "kalan: 0"
+görmek, **hiçbir şeyin açık kalmadığı anlamına gelmez.** Dolan emir artık
+bekleyen emir değildir — **pozisyondur** ve `cancel` ona dokunmaz.
+
+```
+kalan bekleyen emir: 0
+```
+
+Bu çıktı iki farklı dünyayla uyumludur:
+- hepsi iptal edildi ✔
+- **hepsi doldu ve pozisyona döndü** ✖
+
+Yani başarıyı başarısızlıktan ayıramaz.
+
+**Bu gerçek bir olaydır, uydurma bir uyarı değil.** `stops_level` ölçümü
+sırasında piyasaya 4–60 point mesafede 57 `buy_limit` kuruldu; GOLD'da o
+mesafedeki limitler saniyeler içinde doldu. Temizlik yalnızca `cancel`
+gönderdi, "0 bekleyen emir" görüp tamam sayıldı — geriye **42 korumasız
+pozisyon** kaldı ve saatlerce fark edilmedi. Üstelik başka bir sisteme ait
+sanılıp yanlış teşhis yazıldı.
+
+**Doğru temizlik iki adımlıdır:**
+
+```json
+{"op":"orders"}      → kalan bekleyen emirler   (cancel ile temizlenir)
+{"op":"positions"}   → DOLMUŞ olanlar           (close ile temizlenir)
+```
+
+İkisini de sorgulamadan "temizlendi" demeyin. Piyasaya yakın `pending` emirle
+deney yapan her istemci için geçerlidir.
+
 ### 🛡️ Stop'u EMİRLE BİRLİKTE gönderin — korumasız pencere hiç doğmasın
 
 `order` işlemi **`sl` ve `tp` alanlarını kabul eder** (`0` = konmadı). MT5 emri
