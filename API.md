@@ -127,6 +127,16 @@ Bağlantı kurulur kurulmaz sunucu `hello` gönderir:
 Kanal adında **sembol büyük/küçük harf duyarlıdır**, broker'daki ad ne ise o
 yazılmalı. Joker: `tick.*`.
 
+> ⚠️ **Çıplak `"tick"` SESSİZCE yok sayılır.** Kanal adı `tick.<SEMBOL>` veya
+> `tick.*` biçiminde olmak zorundadır. Tanınmayan kanal adı hata döndürmez,
+> sadece hiç veri gelmez (`server.rs:496-519`). Bu ölçüm yapılırken bize de
+> oldu: `{"channels":["tick"]}` gönderildi, 20 saniye sessizlik, "piyasa
+> kapalı" sanıldı — piyasa açıktı.
+>
+> `ms` alanı ölçüldü: **UTC + 10800 sn, tam UTC+3** (2026-08-13). `Bar.t` ile
+> aynı tabandadır. Doğrudan "epoch UTC" sanıp çevirirseniz 3 saat kayarsınız;
+> broker DST uygularsa fark mevsimlik değişir, sabit varsaymayın.
+
 ### Sadakat: hangi sembolde her tick geliyor
 
 `{"op":"symbols"}` cevabındaki iki alan gecikme sınıfını söyler:
@@ -169,6 +179,32 @@ broker saati, epoch **ms**), `o h l c`, `ticks` (bar içi tick sayısı —
 Bunlar **aynı fiyat serisi değildir**. MT5'in FX barları bid tabanlıdır; bizim
 barlarımız mid'dir. GOLD'da fark **20-30 point** mertebesindedir. Strateji MT5
 ile aynı seriyi görmek zorundaysa `src_kind: "mt5"` beklenmelidir.
+
+**Ölçüldü (2026-08-13, GOLD):** `hist: "ok"` ile taze çekilen barda `close`,
+o andaki `bid` ile **birebir eşit** (fark 0.00). `src_kind: "mt5"` barları
+GOLD'da bid tabanlıdır. Ayrıntı ve yöntem: [docs/OLCUMLER.md](docs/OLCUMLER.md).
+
+> Karşılaştırma yaparken `hist: "cached"` cevabını kullanmayın — bar depodan
+> gelir ve o arada fiyat kaymış olur; ölçüm kirlenir, seri değil.
+
+### 🔴 Backtest ile canlı AYNI fiyat tabanında DEĞİL
+
+Bu, mumları kullanan her strateji için en önemli maddedir:
+
+| kip | `src_kind` | fiyat tabanı |
+|---|---|---|
+| canlı | `mt5` | **BID** |
+| replay / backtest | `tick` | **MID** |
+
+Replay'de MT5 geçmişi **yoktur**, bu yüzden `src_kind` daima `"tick"` ve `hist`
+daima `"off"`tur. Yani `candles`'a dayanan bir backtest MID barlarla, aynı
+stratejinin canlı hâli BID barlarla çalışır. Her işlemde **yarım spread**
+kadar sistematik fark demektir — GOLD'da ~28 point.
+
+**Çözüm — istemci tarafında, bugün:** replay'de mumu `candles`'tan almayın;
+tick akışındaki **`b` (bid)** alanından kendiniz kurun. Replay tick'leri bid ve
+ask'i ayrı ayrı taşır, yani bid barı üretmek için gereken her şey kayıtta
+mevcuttur. Böylece backtest de canlı da BID olur ve taban belirsizliği kalkar.
 
 ### `hist` — "veri yok" ile "sistem bozuk" ayrımı
 
@@ -384,6 +420,30 @@ Satışta yönler terstir: kayma `bid - price`.
 - Bu değerler EA'nın **dolum anındaki** tick önbelleğinden okunur. Sonradan
   `tick` akışından eşleştirmek aynı şey değildir: aradaki milisaniyelerde
   piyasa değişir ve ölçtüğünüz kayma gerçekte olmayan bir şey olur.
+
+#### Ölçülen ayrışma (GOLD, 0.01 lot, 2026-08-13)
+
+GOLD'da `contract_size=100`, `point=0.01` → 0.01 lot için **1$ = 100 point**.
+
+| bileşen | ölçülen | point |
+|---|---|---|
+| spread | 0.57$ | 57 |
+| **dolum kayması** | **0.03$** | **3** |
+| kalan — *ulaşılamaz fiyat* | ~0.25$ | ~25 |
+
+Maliyetin büyük kısmı **kayma değil**: motorun verdiği fiyat ile piyasanın
+farkı. İkisi ayrı şeydir çünkü müdahale aracı ayrıdır:
+
+- **kayma** → `deviation` alanıyla sınırlanabilir
+- **ulaşılamaz fiyat** → `deviation` işe yaramaz; yalnızca **emir tipiyle**
+  (LIMIT) müdahale edilebilir
+
+> Daha önce bu belge üzerinden "kayma 27 point" bilgisi verildiyse **yanlıştı**;
+> ölçüm 3 point gösterdi. Düzeltmenin gerekçesi:
+> [docs/OLCUMLER.md](docs/OLCUMLER.md#2-giriş-maliyetinin-ayrışması).
+
+**Simülatör bu bileşeni hiç modellemiyor** — paper/replay defteri bu yüzden
+sistematik olarak iyimserdir.
 
 ### Ham MT5 durumu: `order_state` / `txn_type`
 

@@ -17,6 +17,7 @@ beslemektir — böylece test ile canlı arasında veri farkı oluşmaz.
 | [**API.md**](API.md) | WebSocket protokolü. Sinyal sistemine verilecek uç. |
 | [**docs/MIMARI.md**](docs/MIMARI.md) | Kararların **gerekçesi**. Bir şeyi basitleştirmeden önce oku. |
 | [**docs/GELISTIRME.md**](docs/GELISTIRME.md) | Dağıtım, protokol değiştirme, **sessizce bozan tuzaklar**. |
+| [**docs/OLCUMLER.md**](docs/OLCUMLER.md) | Canlıda **ölçülmüş** sayılar: mum tabanı, giriş maliyeti, zaman farkı. Tahmine dayanmadan önce buraya bak. |
 
 Yeni başlıyorsan sırayla oku. `MIMARI.md` "neden böyle", `GELISTIRME.md` "neye
 dikkat" sorusunu cevaplar; ikisi de koddan çıkarılamayacak bilgi içerir.
