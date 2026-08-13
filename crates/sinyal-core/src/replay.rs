@@ -449,15 +449,11 @@ impl Recording {
     }
 }
 
-/// `<data-dir>/<instance>/ticks-YYYYMMDD.bin`
-pub fn ticks_path(data_dir: &Path, instance: &str, date: &str) -> PathBuf {
-    data_dir.join(instance).join(format!("ticks-{date}.bin"))
-}
-
-/// `<data-dir>/<instance>/symbols-YYYYMMDD.jsonl`
-pub fn symbols_path(data_dir: &Path, instance: &str, date: &str) -> PathBuf {
-    data_dir.join(instance).join(format!("symbols-{date}.jsonl"))
-}
+// Ad deseni burada TEKRARLANMAZ — `record` modulu tek kaynaktir. Yazan ve
+// okuyan taraf ayni fonksiyonu cagirmazsa, biri degisip digeri unutuldugunda
+// yazici bir dosyaya yazip okuyucu baskasini arar ve bu hicbir derleme hatasi
+// vermeden "kayit bos" olarak gorunur.
+pub use crate::record::{symbols_path_str as symbols_path, tick_path_str as ticks_path};
 
 /// Kayıt dizinini, verilen tarihe ait tick dosyası olan örnekler için tara.
 ///

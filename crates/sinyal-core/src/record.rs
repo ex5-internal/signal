@@ -201,22 +201,48 @@ pub fn decode_all(bytes: &[u8]) -> Vec<TickRec> {
 }
 
 /// Bir gün dosyasını yükle. Yarım yazılmış son kayıt **hata değildir**.
-#[allow(dead_code)] // replay tarafının giriş kapısı
+///
+/// Ham çözücü budur; `replay::load_ticks` bunu sarar ve kullanıcıya dönük
+/// zengin hataları ekler. Çözme mantığı (48 bayt, ofsetler, kırpma kuralı)
+/// **yalnızca burada** yaşar.
 pub fn load_ticks(path: &Path) -> std::io::Result<Vec<TickRec>> {
     Ok(decode_all(&fs::read(path)?))
 }
 
+// ---------------------------------------------------------------------------
+// Dosya adları — TEK KAYNAK
+// ---------------------------------------------------------------------------
+//
+// Ad deseni bu dosyada, YALNIZCA burada yazılıdır. Daha önce altı ayrı yerde
+// tekrarlanıyordu (bu modülün yazıcısında, ölü yardımcılarında ve `replay`in
+// okuyucusunda). Deseni bir yerde değiştirip diğerini unutmak, yazıcının bir
+// dosyaya yazıp okuyucunun başka bir dosyayı aramasına yol açardı — hiçbir
+// derleme hatası vermeden, "kayıt boş görünüyor" olarak.
+//
+// Geri-doldurma (geçmiş tick indirme) bu biçime yazan ÜÇÜNCÜ taraf olacak;
+// tekilleştirme o yüzden önce yapıldı.
+
 /// `<data-dir>/<instance>/ticks-YYYYMMDD.bin`
-#[allow(dead_code)]
-pub fn tick_path(data_dir: &Path, instance: &str, stamp: u32) -> PathBuf {
-    data_dir.join(instance).join(format!("ticks-{stamp:08}.bin"))
+pub fn tick_path_str(data_dir: &Path, instance: &str, date: &str) -> PathBuf {
+    data_dir.join(instance).join(format!("ticks-{date}.bin"))
 }
 
 /// `<data-dir>/<instance>/symbols-YYYYMMDD.jsonl`
-#[allow(dead_code)]
-pub fn symbols_path(data_dir: &Path, instance: &str, stamp: u32) -> PathBuf {
-    data_dir.join(instance).join(format!("symbols-{stamp:08}.jsonl"))
+pub fn symbols_path_str(data_dir: &Path, instance: &str, date: &str) -> PathBuf {
+    data_dir.join(instance).join(format!("symbols-{date}.jsonl"))
 }
+
+/// Gün damgasını dosya adındaki metin biçimine çevir (`20260811`).
+pub fn date_str(stamp: u32) -> String {
+    format!("{stamp:08}")
+}
+
+/// `<data-dir>/<instance>/ticks-YYYYMMDD.bin`
+pub fn tick_path(data_dir: &Path, instance: &str, stamp: u32) -> PathBuf {
+    tick_path_str(data_dir, instance, &date_str(stamp))
+}
+
+
 
 /// Bu örnek için kayıtlı günler (YYYYMMDD), artan sırada.
 ///
@@ -814,7 +840,7 @@ impl Writer {
                 return false;
             }
         }
-        let path = self.dir.join(format!("ticks-{:08}.bin", stamp_of_day(day)));
+        let path = self.dir.join(format!("ticks-{}.bin", date_str(stamp_of_day(day))));
         // append: var olan günün üstüne yazmaz, sonuna ekler. Daemon gün
         // içinde yeniden başlarsa kayıt kaldığı yerden devam eder.
         match OpenOptions::new().create(true).append(true).open(&path) {
@@ -934,7 +960,7 @@ impl Writer {
         }
 
         let at_ms = now_ms();
-        let path = self.dir.join(format!("symbols-{:08}.jsonl", day_stamp(at_ms)));
+        let path = self.dir.join(format!("symbols-{}.jsonl", date_str(day_stamp(at_ms))));
         let line = format!("{{\"at_ms\":{at_ms},\"items\":{items_json}}}\n");
         // Satır seyrek (yalnızca değişimde): dosyayı açık tutmuyoruz.
         let res = OpenOptions::new()
