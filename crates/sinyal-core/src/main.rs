@@ -9,6 +9,7 @@
 //! sinyald --instance mt5-1 --record ./veri
 //! sinyald --instance mt5-1 --paper-bind 127.0.0.1:8788 --sim-slippage 2
 //! sinyald --replay ./veri --replay-date 20260811 --replay-speed 0
+//! sinyald --replay ./veri --replay-date 20260513-20260812 --replay-from 09:00 --replay-to 17:00
 //! sinyald --import-backfill ...\MQL5\Files\Sinyal\backfill --data-dir ./veri --instance mt5-1
 //! ```
 //!
@@ -432,14 +433,17 @@ impl Args {
             }
             let Some(date) = raw.date else {
                 return Err(
-                    "--replay --replay-date YYYYMMDD ister (gün sınırı UTC). Hangi günün \
-                     kaydının oynatılacağını tahmin etmiyoruz."
+                    "--replay --replay-date ister (gün sınırı UTC): 20260513 (tek gün), \
+                     20260513-20260812 (aralık, ikisi de dahil) ya da 20260513- (o günden \
+                     kayıttaki sona kadar). Hangi günün kaydının oynatılacağını tahmin \
+                     etmiyoruz."
                         .into(),
                 );
             };
             // Biçim hatasını diske dokunmadan yakala: "20260811" yerine
-            // "2026-08-11" yazan biri hatayı hemen görmeli.
-            replay::parse_yyyymmdd(&date).map_err(|e| format!("--replay-date: {e}"))?;
+            // "2026-08-11" yazan biri hatayı hemen görmeli. Aralık biçimi de
+            // burada çözülür; ters aralık (bitiş < başlangıç) da burada patlar.
+            replay::parse_date_spec(&date).map_err(|e| format!("--replay-date: {e}"))?;
             for (flag, v) in [("--replay-from", &raw.from), ("--replay-to", &raw.to)] {
                 if let Some(s) = v {
                     replay::parse_hhmm(s).map_err(|e| format!("{flag}: {e}"))?;
@@ -568,14 +572,40 @@ SEÇENEKLER:
 
 REPLAY (kayıttan oynatım — paylaşımlı belleğe HİÇ dokunmaz):
   --replay DIZIN      Kaydın kök dizini. --instance ile KULLANILAMAZ.
-  --replay-date GUN   YYYYMMDD (ZORUNLU, gün sınırı UTC)
-  --replay-from HH:MM Kapsam başlangıcı, UTC (istege bagli)
-  --replay-to   HH:MM Kapsam sonu, UTC (istege bagli)
+  --replay-date GUN   ZORUNLU, gün sınırı UTC. Üç biçim:
+                        20260513            tek gün
+                        20260513-20260812   aralık, İKİSİ DE DAHİL
+                        20260513-           o günden kayıttaki sona kadar
+  --replay-from HH:MM Gün içi kapsam başlangıcı, UTC (istege bagli)
+  --replay-to   HH:MM Gün içi kapsam sonu, UTC (istege bagli)
   --replay-speed N    1.0 = gerçek zamanlı (varsayılan), 0 = beklemeden en hızlı
   --replay-balance N  Sentetik başlangıç bakiyesi (varsayılan 10000)
 
   hello.mode replay'de \"replay\" olur ve hello kapsamı (replay_from_ms /
   replay_to_ms) ilan eder; başka hiçbir mesaj biçimi değişmez.
+
+  ARALIK: günler kronolojik sırayla, TEK BAĞLANTIDA, kesintisiz akar ve
+  replay_done yalnızca ARALIĞIN SONUNDA gelir — istemci gün değiştiğini fark
+  etmemelidir. 66 ayrı süreç başlatmak sadece zahmet değil DOĞRULUK sorunuydu:
+  gün sınırında bağlantı koptuğunda sinyal sisteminin durumu sıfırlanır ve
+  gerçekte TAŞINACAK bir pozisyon taşınmamış olurdu.
+
+  --replay-from / --replay-to aralıkla birlikte HER GÜNE ayrı ayrı uygulanır
+  (ör. her günün 09:00-17:00'si).
+
+  Kayıtta olmayan günler (hafta sonu, tatil) ve 0 baytlık gün dosyaları
+  SESSİZCE atlanır; aralıkta HİÇ gün bulunamazsa hata AÇIKTIR.
+
+  replay_done her zaman days / days_played taşır. Aralığın ortasındaki bir
+  gün okunamazsa oynatım orada durur ve mesaj ayrıca truncated:true taşır —
+  bu çalıştırmanın sonuçları EKSİK bir kaydın sonucudur. Kesintiyi sessiz
+  bırakmak, 3 aylık sanılan bir backtest'i tek günün sonucuyla raporlamak
+  olurdu.
+
+  Günler arası bekleme en fazla 1 sn'dir (hız çarpanına da bölünür): Cuma
+  23:58'den Pazartesi 01:00'e geçerken recv_ms farkı ~49 SAATtir ve
+  kırpılmasaydı --replay-speed 1 ile oynatım 49 saat uyurdu. Gün İÇİNDEKİ
+  boşluklar KIRPILMAZ — onlar gerçek piyasa sessizliğidir.
 
 GERİ-DOLDURMA İÇE AKTARMA (sunucu değil: iş bitince çıkar):
   --import-backfill DIZIN  MQL5 Service'in yazdığı <Sembol>-YYYYMMDD.bin
@@ -696,12 +726,18 @@ fn warn_if_recording_lacks_contract_size(missing: &[String]) {
 }
 
 /// Epoch ms → gün içi `HH:MM:SS.mmm` (UTC).
-///
-/// Kapsam tek gün içinde olduğu için tarihi tekrar yazmıyoruz; tarih zaten
-/// `--replay-date`.
 fn hhmmss_utc(ms: i64) -> String {
     let t = ms.rem_euclid(DAY_MS);
     format!("{:02}:{:02}:{:02}.{:03}", t / 3_600_000, (t / 60_000) % 60, (t / 1000) % 60, t % 1000)
+}
+
+/// Epoch ms → `YYYYMMDD HH:MM:SS.mmm` (UTC).
+///
+/// Replay kapsamı artık tek güne sığmak zorunda değil (`--replay-date`
+/// aralık alabiliyor); yalnızca saati yazmak, hangi günün saati olduğunu
+/// belirsiz bırakır ve 66 günlük bir aralıkta bu bilgi işe yaramaz olurdu.
+fn stamp_hhmmss_utc(ms: i64) -> String {
+    format!("{} {}", record::date_str(record::day_stamp(ms)), hhmmss_utc(ms))
 }
 
 #[tokio::main]
@@ -787,11 +823,20 @@ async fn main() {
             };
             let (from_ms, to_ms) = rec.span();
             let instances = rec.instances.clone();
-            let items = rec.len();
+            let days = rec.days.clone();
             // Emir gönderilmeden ÖNCE söylenmeli: `contract_size` taşımayan
             // bir kayıtla açılan replay, ilk emre kadar sorunsuz görünür ve
             // sorun ancak retcode 10013 ile ortaya çıkardı.
-            let missing_contract = symbols_missing_contract_size(&rec.symbols);
+            //
+            // Yalnızca SON günün tablosuna bakılıyor: 66 günün tablosunu
+            // açılışta okumak, kaydın tamamına dokunmak olurdu.
+            let missing_contract = match rec.symbols_of_last_day() {
+                Ok(s) => symbols_missing_contract_size(&s),
+                Err(e) => {
+                    eprintln!("hata: kayit yuklenemedi: {e}");
+                    std::process::exit(1);
+                }
+            };
 
             let (done_tx, done_rx) = tokio::sync::watch::channel(None);
             // Motor oynatımdan ÖNCE kurulur: oynatım thread'i her tick'te
@@ -828,11 +873,39 @@ async fn main() {
             println!("sinyald REPLAY kipinde — diskteki kayittan oynatiliyor");
             println!("  kayit    : {} ({})", cfg.opts.data_dir.display(), cfg.opts.date);
             println!("  ornekler : {}", instances.join(", "));
+            // Gün sayısı ve gerçekten bulunan ilk/son gün YAZILIYOR: istenen
+            // aralıkta hafta sonu ve tatiller yok ve operatör "3 ay istedim,
+            // 66 gun bulundu" doğrulamasını burada yapabilmeli.
+            match (days.first(), days.last()) {
+                (Some(f), Some(l)) if days.len() > 1 => {
+                    println!("  gunler   : {} gun ({f} .. {l}, eksik gunler atlandi)", days.len());
+                }
+                (Some(f), _) => println!("  gun      : {f}"),
+                _ => {}
+            }
+            // Tarih de yazılıyor: aralık kipinde yalnız saat yazmak, hangi
+            // günün saati olduğunu belirsiz bırakırdı.
             println!(
-                "  kapsam   : {} .. {} UTC ({items} tick)",
-                hhmmss_utc(from_ms),
-                hhmmss_utc(to_ms)
+                "  kapsam   : {} .. {} UTC",
+                stamp_hhmmss_utc(from_ms),
+                stamp_hhmmss_utc(to_ms)
             );
+            if cfg.opts.from.is_some() || cfg.opts.to.is_some() {
+                println!(
+                    "  gun ici  : {} .. {} — HER GUNE ayri ayri uygulanir",
+                    cfg.opts.from.as_deref().unwrap_or("00:00"),
+                    cfg.opts.to.as_deref().unwrap_or("24:00"),
+                );
+            }
+            if days.len() > 1 {
+                println!(
+                    "  Gunler TEK BAGLANTIDA, kesintisiz akar; replay_done yalnizca"
+                );
+                println!(
+                    "  ARALIGIN SONUNDA gelir. Gunler arasi bekleme en fazla {} ms.",
+                    replay::REPLAY_GAP_MAX_MS
+                );
+            }
             println!(
                 "  tempo    : {}",
                 if cfg.opts.speed == 0.0 {
@@ -1076,10 +1149,22 @@ async fn main() {
                 let end = *rx.borrow();
                 if let Some(end) = end {
                     println!(
-                        "[replay] oynatim bitti: {} tick, son broker saati {} UTC",
+                        "[replay] oynatim bitti: {} tick, {}/{} gun, son broker saati {} UTC",
                         end.ticks,
-                        hhmmss_utc(end.last_ms)
+                        end.days_played,
+                        end.days,
+                        stamp_hhmmss_utc(end.last_ms)
                     );
+                    // Kesinti sessiz kalmamalı: eksik bir kaydın sonucunu tam
+                    // sanmak, backtest'i sessizce yanlış yapar.
+                    if end.days_played < end.days {
+                        eprintln!(
+                            "[replay] UYARI: ARALIK YARIDA KESILDI — {} gun planlandi, {} gun oynatildi. \
+                             Bu calistirmanin sonuclari EKSIK bir kaydin sonucudur \
+                             (istemciye de replay_done.truncated=true gitti).",
+                            end.days, end.days_played
+                        );
+                    }
                     break;
                 }
             }
@@ -1525,7 +1610,72 @@ mod tests {
     fn day_time_formatting_is_utc_and_millisecond_exact() {
         assert_eq!(hhmmss_utc(3_661_123), "01:01:01.123");
         assert_eq!(hhmmss_utc(0), "00:00:00.000");
-        // Tarih düşer, gün içi saat kalır — kapsam zaten tek gün.
         assert_eq!(hhmmss_utc(DAY_MS + 1_000), "00:00:01.000");
+    }
+
+    #[test]
+    fn the_replay_span_is_printed_with_its_date_because_a_range_spans_days() {
+        // Yalnızca saati yazmak tek günde işe yarıyordu; 66 günlük bir
+        // aralıkta "17:00:00" hangi günün 17:00'si olduğunu söylemez.
+        assert_eq!(stamp_hhmmss_utc(0), "19700101 00:00:00.000");
+        assert_eq!(stamp_hhmmss_utc(DAY_MS + 3_661_123), "19700102 01:01:01.123");
+    }
+
+    // --- --replay-date: gün aralığı ---
+
+    #[test]
+    fn replay_date_accepts_a_day_a_closed_range_and_an_open_range() {
+        for spec in ["20260513", "20260513-20260812", "20260513-"] {
+            let a = Args::from_argv(argv(&["--replay", "veri", "--replay-date", spec]))
+                .unwrap_or_else(|e| panic!("{spec} kabul edilmeliydi: {e}"));
+            // Ham değer olduğu gibi taşınmalı: çözümü `replay::load` yapar.
+            assert_eq!(a.replay.expect("replay kipi").opts.date, spec);
+        }
+    }
+
+    #[test]
+    fn a_malformed_replay_date_range_is_caught_before_touching_the_disk() {
+        // Hepsi AÇIK hata vermeli ve hangi bayrak olduğunu SÖYLEMELİ:
+        // aralığı sessizce ilk parçaya indirmek, istenmeyen bir günü
+        // oynatmak olurdu ve sonuç doğru görünürdü.
+        for spec in [
+            "2026-08-11",                 // ISO tarih
+            "20260513-20260812-20260901", // fazladan ayirici
+            "-20260812",                  // baslangic yok
+            "2026051-20260812",           // kisa baslangic
+            "20260513-2026081",           // kisa bitis
+            "20260812-20260513",          // ters aralik
+        ] {
+            let e = err(&["--replay", "veri", "--replay-date", spec]);
+            assert!(e.contains("--replay-date"), "{spec}: hangi bayrak oldugu soylenmeli: {e}");
+        }
+
+        // Ters aralık, biçim hatasından AYRI bir sebeple reddedilmeli.
+        let e = err(&["--replay", "veri", "--replay-date", "20260812-20260513"]);
+        assert!(e.contains("20260812-20260513"), "verilen deger yazilmali: {e}");
+
+        // Eksik bayrak mesajı da üç biçimi anmalı.
+        let e = err(&["--replay", "veri"]);
+        assert!(e.contains("20260513-20260812"), "kabul edilen bicimler yazilmali: {e}");
+    }
+
+    #[test]
+    fn the_day_window_flags_still_work_alongside_a_range() {
+        // `--replay-from` / `--replay-to` aralıkla birlikte HER GÜNE
+        // uygulanır; ayrıştırma bunları aralık kipinde de kabul etmeli.
+        let a = Args::from_argv(argv(&[
+            "--replay",
+            "veri",
+            "--replay-date",
+            "20260513-20260812",
+            "--replay-from",
+            "09:00",
+            "--replay-to",
+            "17:00",
+        ]))
+        .unwrap();
+        let cfg = a.replay.expect("replay kipi");
+        assert_eq!(cfg.opts.from.as_deref(), Some("09:00"));
+        assert_eq!(cfg.opts.to.as_deref(), Some("17:00"));
     }
 }

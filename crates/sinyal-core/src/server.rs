@@ -242,6 +242,15 @@ pub struct ReplayEnd {
     pub ticks: u64,
     /// Oynatılan son tick'in broker saati; kapsam boşsa 0.
     pub last_ms: i64,
+    /// Oynatılması planlanan gün sayısı (aralıktaki kayıtlı günler).
+    pub days: u32,
+    /// Gerçekten oynatılan gün sayısı.
+    ///
+    /// `days`ten küçükse aralık yarıda kesilmiştir. Bu iki sayı tel üzerine
+    /// çıkıyor: bir gün okunamadığında oynatım duruyordu ama istemci normal
+    /// bir `replay_done` gördüğü için 3 aylık sandığı bir backtest'i tek
+    /// günün sonucuyla raporlayabilirdi.
+    pub days_played: u32,
 }
 
 /// Replay kipinin bağlamı.
@@ -708,6 +717,11 @@ fn replay_done(end: ReplayEnd) -> ServerMsg {
         ticks: end.ticks,
         // 0 "kayıt boştu" demek; sıfır zaman damgası göndermek uydurma olurdu.
         last_ms: (end.last_ms != 0).then_some(end.last_ms),
+        days: end.days,
+        days_played: end.days_played,
+        // Planlanan günlerin hepsi oynatılmadıysa bu çalıştırmanın sonucu
+        // EKSİK bir kaydın sonucudur ve istemci bunu bilmek zorundadır.
+        truncated: end.days_played < end.days,
     }
 }
 

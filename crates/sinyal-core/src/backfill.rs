@@ -1163,11 +1163,14 @@ mod tests {
         let rec = crate::replay::load(&opts)
             .expect("ice aktarilan gun replay tarafindan YUKLENEBILMELI");
         assert_eq!(rec.instances, vec![INST.to_string()]);
-        assert_eq!(rec.len(), 64);
+        // Tick'ler gün gün yüklenir (aralık kipinde 66 günü birden RAM'e
+        // almamak için); bu kayıt tek gün, o günü isteyip içine bakıyoruz.
+        let day = rec.load_day(0).expect("gun yuklenebilmeli");
+        assert_eq!(day.items.len(), 64);
 
         // ASIL TUZAK: symbol_id → ad. Kopmuşsa replay her tick'i atlar ve
         // akış SESSİZCE boşalır.
-        let items = &rec.symbols[0].last().unwrap().items;
+        let items = &day.symbols[0].last().unwrap().items;
         let name = items.iter().find(|i| i.id == 3).map(|i| i.s.as_str());
         assert_eq!(name, Some("GOLD"), "kimlik cozulemedi: {items:?}");
         // Sembol özellikleri de taşınmalı: contract_size 0 kalsaydı

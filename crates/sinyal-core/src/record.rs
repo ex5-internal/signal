@@ -1413,7 +1413,10 @@ mod tests {
             .expect("kaydedicinin urettigi dizin replay tarafindan YUKLENEBILMELI");
 
         assert_eq!(loaded.instances, vec![inst.to_string()]);
-        assert_eq!(loaded.len(), pushed.len(), "her kayit geri gelmeli");
+        // Tick'ler gün gün yüklenir (aralık kipinde 66 günü birden RAM'e
+        // almamak için); bu kayıt tek gün, o günü isteyip içine bakıyoruz.
+        let loaded = loaded.load_day(0).expect("gun yuklenebilmeli");
+        assert_eq!(loaded.items.len(), pushed.len(), "her kayit geri gelmeli");
 
         // Fiyatlar ve broker saati BİT DÜZEYİNDE aynı dönmeli: kayıt biçimi
         // yuvarlama yapmaz, yaparsa strateji kayıttan farklı bir seri görür.

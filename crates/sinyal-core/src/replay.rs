@@ -47,6 +47,51 @@
 //! `src_kind: "tick"`, `hist: "off"` der ve `hist_note` sebebi açıkça söyler
 //! ([`HIST_NOTE`]).
 //!
+//! # Gün aralığı
+//!
+//! `--replay-date` üç biçim kabul eder ([`parse_date_spec`]):
+//!
+//! ```text
+//! 20260513              tek gün
+//! 20260513-20260812     aralık, İKİSİ DE DAHİL
+//! 20260513-             o günden kayıtta ne varsa sonuna kadar
+//! ```
+//!
+//! Aralık **tek bağlantıda, kesintisiz** akar: günler kronolojik sırayla
+//! oynatılır ve [`crate::server::ReplayEnd`] (`replay_done`) yalnızca
+//! ARALIĞIN SONUNDA duyurulur. İstemci gün değiştiğini fark etmemelidir —
+//! amacın kendisi bu. 66 ayrı süreç başlatıp 66 kez bağlanmak sadece zahmet
+//! değil, **doğruluk** sorunuydu: gün sınırında bağlantı koptuğunda sinyal
+//! sisteminin durumu sıfırlanır ve gerçekte TAŞINACAK bir pozisyon
+//! taşınmamış olurdu. Gün-aşırı davranış ancak böyle sınanabilir.
+//!
+//! Kayıtta olmayan günler (hafta sonu, tatil) **sessizce atlanır**; 0 baytlık
+//! gün dosyaları da öyle. Ama aralıkta HİÇ gün bulunamazsa hata AÇIKTIR
+//! ([`ReplayError::NoRecordingInRange`]) — sessizce boş akışa dönüşmek,
+//! "sistem çalışıyor ama piyasa hareketsiz" yanılsaması üretirdi.
+//!
+//! `--replay-from` / `--replay-to` aralıkla birlikte verildiğinde **HER GÜNE
+//! ayrı ayrı** uygulanır (ör. her günün 09:00-17:00'si).
+//!
+//! # Günler arası boşluk KIRPILIR
+//!
+//! Tempo `recv_ms` farkından üretilir. Cuma 23:58'den Pazartesi 01:00'e
+//! geçerken bu fark ~49 SAATtir ve `--replay-speed 1` ile oynatım 49 saat
+//! uyurdu. Günler arası bekleme bu yüzden en fazla [`REPLAY_GAP_MAX_MS`]
+//! olur (hız çarpanına da bölünür). Gün İÇİNDEKİ boşluklar **kırpılmaz** —
+//! onlar gerçek piyasa sessizliğidir ve sadakatin parçasıdır.
+//!
+//! # Bellek
+//!
+//! Aralığın tamamı belleğe ALINMAZ: [`Recording`] yalnızca gün listesini ve
+//! kapsamı tutar, tick'ler gün gün [`Recording::load_day`] ile yüklenip o gün
+//! bitince bırakılır. 1,15 GB'lik 25,8 milyon kaydı RAM'e almak kabul
+//! edilemezdi.
+//!
+//! Sembol tablosu da **her gün için yeniden** yüklenir: sembol kimlikleri
+//! günler arasında DEĞİŞEBİLİR ve tick'i eski günün tablosuyla isimlendirmek
+//! yanlış sembol adı yaymak olurdu.
+//!
 //! # Kullanım kısıtı
 //!
 //! `--replay` ile `--instance` **aynı anda kullanılamaz**: örnek listesi
@@ -80,6 +125,15 @@ pub const HIST_NOTE: &str =
 
 /// Bir günün milisaniyesi. Gün sınırı UTC.
 const DAY_MS: i64 = 86_400_000;
+
+/// İki GÜN arasında beklenecek en uzun süre (ms, hız çarpanına bölünmeden).
+///
+/// Gün içi boşluklar gerçek piyasa sessizliğidir ve aynen beklenir. Günler
+/// ARASI boşluk ise kaydın kendisinden değil, kaydın gün dosyalarına
+/// bölünmesinden gelir: Cuma kapanışı ile Pazartesi açılışı arasında ~49 saat
+/// vardır ve `--replay-speed 1` ile oynatım gerçekten 49 saat uyurdu. Bu
+/// kırpma olmadan çok günlü replay pratikte KULLANILAMAZ.
+pub const REPLAY_GAP_MAX_MS: i64 = 1_000;
 
 // ---------------------------------------------------------------------------
 // TickRec — dosyadaki sabit 48 baytlık kayıt
@@ -225,6 +279,12 @@ pub enum ReplayError {
     NoDataDir(PathBuf),
     /// Dizinde bu tarihe ait hiçbir örnek kaydı yok.
     NoRecording { dir: PathBuf, date: String },
+    /// İstenen gün ARALIĞINDA tek bir gün kaydı bile yok.
+    ///
+    /// Tek tek eksik günler (hafta sonu, tatil) sessizce atlanır; aralığın
+    /// TAMAMEN boş olması ise yazım hatası ya da yanlış dizin demektir ve
+    /// sessizce boş akışa dönüşmemelidir.
+    NoRecordingInRange { dir: PathBuf, start: String, end: Option<String> },
     /// Tick dosyası okunamadı.
     Io { path: PathBuf, err: io::Error },
     /// Tick dosyası var ama tek bir tam kayıt bile içermiyor.
@@ -237,6 +297,10 @@ pub enum ReplayError {
     BadSymbolsLine { path: PathBuf, line: usize, err: String },
     /// `--replay-date` biçimi YYYYMMDD değil.
     BadDate(String),
+    /// `--replay-date` ne tek gün ne de tanınan bir aralık biçimi.
+    BadDateSpec(String),
+    /// Aralığın başlangıcı bitişinden sonra.
+    BadDateRange { start: String, end: String },
     /// `--replay-from` / `--replay-to` biçimi HH:MM değil.
     BadTime(String),
     /// `--replay-speed` negatif veya sonlu değil.
@@ -259,6 +323,14 @@ impl std::fmt::Display for ReplayError {
                  (beklenen: <ornek>/ticks-{date}.bin)",
                 dir.display()
             ),
+            Self::NoRecordingInRange { dir, start, end } => write!(
+                f,
+                "{} altinda {}..{} araliginda TEK BIR gun kaydi bile yok \
+                 (beklenen: <ornek>/ticks-YYYYMMDD.bin)",
+                dir.display(),
+                start,
+                end.as_deref().unwrap_or("(kayittaki son gun)"),
+            ),
             Self::Io { path, err } => write!(f, "{} okunamadi: {err}", path.display()),
             Self::EmptyTicks { path, len } => write!(
                 f,
@@ -278,6 +350,17 @@ impl std::fmt::Display for ReplayError {
                 write!(f, "{}:{line} bozuk sembol satiri: {err}", path.display())
             }
             Self::BadDate(s) => write!(f, "--replay-date YYYYMMDD olmali, verilen: {s:?}"),
+            Self::BadDateSpec(s) => write!(
+                f,
+                "--replay-date bicimi anlasilamadi: {s:?}. Kabul edilenler: \
+                 20260513 (tek gun), 20260513-20260812 (aralik, IKISI DE DAHIL), \
+                 20260513- (o gunden kayitta ne varsa sonuna kadar)"
+            ),
+            Self::BadDateRange { start, end } => write!(
+                f,
+                "--replay-date araliginin baslangici bitisinden SONRA: {start}-{end}. \
+                 Gunler kronolojik oynatilir, ters aralik oynatilamaz."
+            ),
             Self::BadTime(s) => write!(f, "saat HH:MM olmali (UTC), verilen: {s:?}"),
             Self::BadSpeed(v) => write!(
                 f,
@@ -317,6 +400,65 @@ pub fn parse_yyyymmdd(s: &str) -> Result<i64, ReplayError> {
         return Err(bad());
     }
     Ok(days_from_civil(y, m, d) * DAY_MS)
+}
+
+/// `--replay-date` değerinin çözülmüş hâli.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DateSpec {
+    /// `20260513` — tek gün.
+    Day(String),
+    /// `20260513-20260812` (ikisi de dahil) ya da `20260513-` (sona kadar).
+    Range { start: String, end: Option<String> },
+}
+
+impl DateSpec {
+    /// Aralığın (ya da tek günün) başlangıç damgası.
+    pub fn start(&self) -> &str {
+        match self {
+            Self::Day(d) => d,
+            Self::Range { start, .. } => start,
+        }
+    }
+
+    pub fn is_range(&self) -> bool {
+        matches!(self, Self::Range { .. })
+    }
+}
+
+/// `--replay-date` değerini çöz.
+///
+/// ```text
+/// 20260513              tek gün
+/// 20260513-20260812     aralık, İKİSİ DE DAHİL
+/// 20260513-             o günden kayıtta ne varsa sonuna kadar
+/// ```
+///
+/// Tek gün biçimi [`DateSpec::Day`] verir ve davranışı **aynen korunur**:
+/// aralık desteği eklemek, tek günlük replay'i tek satır bile değiştirmemeli.
+///
+/// Ayırıcı `-` seçildi çünkü `YYYYMMDD` içinde `-` yoktur; `2026-08-11` yazan
+/// biri üç parça üretir ve AÇIK bir hata alır. Sessizce ilk parçayı gün
+/// saymak, istenmeyen bir günü oynatmak olurdu.
+pub fn parse_date_spec(s: &str) -> Result<DateSpec, ReplayError> {
+    let bad = || ReplayError::BadDateSpec(s.to_owned());
+    let Some((a, b)) = s.split_once('-') else {
+        // Tek gün: hatanın kendisi `BadDate` kalmalı — mevcut mesaj ve
+        // mevcut testler bunu bekliyor.
+        parse_yyyymmdd(s)?;
+        return Ok(DateSpec::Day(s.to_owned()));
+    };
+    if b.contains('-') {
+        return Err(bad());
+    }
+    let start_ms = parse_yyyymmdd(a).map_err(|_| bad())?;
+    if b.is_empty() {
+        return Ok(DateSpec::Range { start: a.to_owned(), end: None });
+    }
+    let end_ms = parse_yyyymmdd(b).map_err(|_| bad())?;
+    if end_ms < start_ms {
+        return Err(ReplayError::BadDateRange { start: a.to_owned(), end: b.to_owned() });
+    }
+    Ok(DateSpec::Range { start: a.to_owned(), end: Some(b.to_owned()) })
 }
 
 /// `HH:MM` → gece yarısından itibaren milisaniye.
@@ -385,11 +527,15 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 pub struct ReplayOpts {
     /// `--replay <data-dir>`
     pub data_dir: PathBuf,
-    /// `--replay-date YYYYMMDD` (zorunlu)
+    /// `--replay-date` HAM değeri (zorunlu); [`parse_date_spec`] çözer.
+    ///
+    /// `20260513` | `20260513-20260812` | `20260513-`
     pub date: String,
-    /// `--replay-from HH:MM` (UTC)
+    /// `--replay-from HH:MM` (UTC).
+    ///
+    /// Aralıkla birlikte verilirse **HER GÜNE ayrı ayrı** uygulanır.
     pub from: Option<String>,
-    /// `--replay-to HH:MM` (UTC)
+    /// `--replay-to HH:MM` (UTC) — aralıkta HER GÜNE uygulanır.
     pub to: Option<String>,
     /// `--replay-speed N`; 1.0 = gerçek zamanlı, 0 = beklemeden en hızlı.
     pub speed: f64,
@@ -410,28 +556,145 @@ impl ReplayOpts {
 /// Oynatma kuyruğundaki tek öğe.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PlayItem {
-    /// [`Recording::instances`] içindeki indeks.
+    /// [`Recording::instances`] içindeki indeks — **birleşik listede**, o
+    /// günün kendi listesinde değil. Örnek kümesi günden güne değişebilir ve
+    /// yerel indeks kullanmak, ikinci günde tick'i YANLIŞ örneğe yazardı.
     pub inst: usize,
     pub rec: TickRec,
 }
 
-/// Diskten yüklenmiş, oynatmaya hazır kayıt.
+/// Tek bir günün belleğe alınmış kaydı.
+///
+/// Bir seferde **yalnızca bir tanesi** yaşar: 66 günlük bir aralık 1,15 GB
+/// ve 25,8 milyon kayıttır, hepsini birden RAM'e almak kabul edilemez. Gün
+/// bitince bu yapı düşer ve belleği geri verir.
 #[derive(Debug)]
-pub struct Recording {
-    /// Kayıt dizininde bulunan örnek adları (sıralı).
-    pub instances: Vec<String>,
-    /// Oynatılacak kayıtlar — **kayıt sırası korunmuş**.
+pub struct DayData {
+    /// `YYYYMMDD`.
+    pub date: String,
+    /// O günün oynatılacak kayıtları — **kayıt sırası korunmuş**.
     pub items: Vec<PlayItem>,
-    /// Örnek başına, `at_ms`'e göre sıralı sembol tablosu görüntüleri.
+    /// [`Recording::instances`] ile HİZALI sembol tablosu görüntüleri; o gün
+    /// kaydı olmayan örnek için boş.
+    ///
+    /// Tablo her gün için yeniden yüklenir: sembol kimlikleri günler arasında
+    /// DEĞİŞEBİLİR ve tick'i eski günün tablosuyla isimlendirmek yanlış sembol
+    /// adı yaymak olurdu.
     pub symbols: Vec<Vec<SymbolSnapshot>>,
-    /// İstenen pencere (yarı açık: `[from, to)`), epoch ms.
+    /// Bu güne uygulanan pencere (yarı açık: `[from, to)`), epoch ms.
     pub window_from_ms: i64,
     pub window_to_ms: i64,
+    /// Pencereye KIRPILMADAN önceki gerçek kapsam; boş pencere hatasında
+    /// kullanıcıya "kayıt aslında şu aralığı içeriyor" diyebilmek için.
+    /// Kayıt boşsa sırasıyla `i64::MAX` / `i64::MIN`.
+    pub raw_first_ms: i64,
+    pub raw_last_ms: i64,
+}
+
+impl DayData {
+    fn new(
+        date: String,
+        items: Vec<PlayItem>,
+        symbols: Vec<Vec<SymbolSnapshot>>,
+        window_from_ms: i64,
+        window_to_ms: i64,
+        raw_first_ms: i64,
+        raw_last_ms: i64,
+    ) -> Self {
+        #[cfg(test)]
+        probe::enter(items.len());
+        Self { date, items, symbols, window_from_ms, window_to_ms, raw_first_ms, raw_last_ms }
+    }
+}
+
+/// Aynı anda kaç günün belleğe alındığını ölçen sayaç — **yalnızca test**.
+///
+/// "66 günü birden yüklemiyoruz" bir yorum değil, sınanması gereken bir
+/// özellik: `Recording`e bir `items` alanı eklemek tüm testleri yeşil
+/// bırakırdı ve bellek patlaması ancak üretimde görülürdü.
+///
+/// Sayaçlar THREAD YEREL: testler paralel koşar ve süreç geneli bir sayaç
+/// komşu testin yüklediği günleri sayardı. Oynatım senkrondur, yani bir
+/// günün yüklenmesi ve düşmesi hep aynı thread'de olur.
+#[cfg(test)]
+pub(crate) mod probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static DAYS_LIVE: Cell<usize> = const { Cell::new(0) };
+        static DAYS_PEAK: Cell<usize> = const { Cell::new(0) };
+        static TICKS_LIVE: Cell<usize> = const { Cell::new(0) };
+        static TICKS_PEAK: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn enter(ticks: usize) {
+        DAYS_LIVE.with(|c| {
+            c.set(c.get() + 1);
+            DAYS_PEAK.with(|p| p.set(p.get().max(c.get())));
+        });
+        TICKS_LIVE.with(|c| {
+            c.set(c.get() + ticks);
+            TICKS_PEAK.with(|p| p.set(p.get().max(c.get())));
+        });
+    }
+
+    pub(crate) fn leave(ticks: usize) {
+        DAYS_LIVE.with(|c| c.set(c.get().saturating_sub(1)));
+        TICKS_LIVE.with(|c| c.set(c.get().saturating_sub(ticks)));
+    }
+
+    pub(crate) fn reset() {
+        DAYS_LIVE.with(|c| c.set(0));
+        DAYS_PEAK.with(|c| c.set(0));
+        TICKS_LIVE.with(|c| c.set(0));
+        TICKS_PEAK.with(|c| c.set(0));
+    }
+
+    /// `(aynı anda en çok kaç gün, aynı anda en çok kaç tick)`.
+    pub(crate) fn peak() -> (usize, usize) {
+        (DAYS_PEAK.with(Cell::get), TICKS_PEAK.with(Cell::get))
+    }
+}
+
+#[cfg(test)]
+impl Drop for DayData {
+    fn drop(&mut self) {
+        probe::leave(self.items.len());
+    }
+}
+
+/// Oynatılacak GÜNLERİN planı — tick'ler burada DEĞİL.
+///
+/// Adı hâlâ `Recording`: tüketicinin gördüğü şey bir kaydın oynatılması ve
+/// tek gün ile aralık arasında tel üzerinde hiçbir fark yok. Değişen tek şey,
+/// bu yapının artık tick'lerin KENDİSİNİ değil nerede olduklarını tutması —
+/// aralığın tamamını belleğe almamak için (bkz. [`DayData`]).
+#[derive(Debug)]
+pub struct Recording {
+    /// Aralıktaki TÜM günlerde görülen örnek adları — birleşik ve sıralı.
+    ///
+    /// Birleşik olmak zorunda: bir örnek aralığın ortasında kayda başlamış
+    /// olabilir ve `hello.instances` ile [`PlayItem::inst`] oynatım boyunca
+    /// SABİT bir listeye bakmalı.
+    pub instances: Vec<String>,
+    /// Oynatılacak günler (`YYYYMMDD`), **kronolojik**. Kayıtta olmayan
+    /// günler burada zaten yoktur.
+    pub days: Vec<String>,
     /// Gerçekten kapsanan aralık — `hello.replay_from_ms` / `replay_to_ms`.
+    /// TÜM aralığı kapsar: ilk dolu günün ilk tick'i, son dolu günün sonuncusu.
     pub covered_from_ms: i64,
     pub covered_to_ms: i64,
     /// `--replay-speed`.
     pub speed: f64,
+    /// `--replay-date`in çözülmüş hâli (tanılama ve açılış çıktısı için).
+    pub spec: DateSpec,
+    data_dir: PathBuf,
+    /// `--replay-from` / `--replay-to`, gece yarısından itibaren ms. HER GÜNE
+    /// ayrı ayrı uygulanır.
+    from_off: i64,
+    to_off: i64,
+    /// Gün başına, o gün kaydı olan örneklerin [`Self::instances`] indeksleri.
+    day_insts: Vec<Vec<usize>>,
 }
 
 impl Recording {
@@ -440,12 +703,120 @@ impl Recording {
         (self.covered_from_ms, self.covered_to_ms)
     }
 
-    pub fn len(&self) -> usize {
-        self.items.len()
+    /// Oynatılacak gün sayısı.
+    pub fn day_count(&self) -> usize {
+        self.days.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
+    /// Gün içi pencere, gece yarısından itibaren ms `(from, to)`.
+    pub fn day_window(&self) -> (i64, i64) {
+        (self.from_off, self.to_off)
+    }
+
+    /// `days[i]` gününü belleğe al.
+    ///
+    /// **Her çağrı diske gider ve dönen değer düştüğünde bellek geri verilir.**
+    /// Oynatım günleri tek tek böyle yükler; sonucu saklamak, kaçınmaya
+    /// çalıştığımız şeyin ta kendisi olurdu.
+    pub fn load_day(&self, i: usize) -> Result<DayData, ReplayError> {
+        let date = &self.days[i];
+        let day_ms = parse_yyyymmdd(date)?;
+        let window_from_ms = day_ms + self.from_off;
+        let window_to_ms = day_ms + self.to_off;
+
+        let n = self.instances.len();
+        let mut per_inst: Vec<Vec<TickRec>> = vec![Vec::new(); n];
+        let mut symbols: Vec<Vec<SymbolSnapshot>> = vec![Vec::new(); n];
+        let mut raw_first_ms = i64::MAX;
+        let mut raw_last_ms = i64::MIN;
+
+        for &g in &self.day_insts[i] {
+            let inst = &self.instances[g];
+            let recs = load_ticks(&ticks_path(&self.data_dir, inst, date))?;
+            // Sembol tablosu O GÜNÜN dosyasından: kimlikler günler arasında
+            // değişebilir.
+            symbols[g] = load_symbols(&symbols_path(&self.data_dir, inst, date))?;
+            for r in &recs {
+                raw_first_ms = raw_first_ms.min(r.recv_ms);
+                raw_last_ms = raw_last_ms.max(r.recv_ms);
+            }
+            // Pencereye kırp. Yarı açık `[from, to)`: iki bitişik pencere
+            // böylece örtüşmeden döşenir.
+            per_inst[g] = recs
+                .into_iter()
+                .filter(|r| r.recv_ms >= window_from_ms && r.recv_ms < window_to_ms)
+                .collect();
+        }
+
+        let items = merge_by_recv_ms(&per_inst);
+        Ok(DayData::new(
+            date.clone(),
+            items,
+            symbols,
+            window_from_ms,
+            window_to_ms,
+            raw_first_ms,
+            raw_last_ms,
+        ))
+    }
+
+    /// SON günün sembol tabloları — açılıştaki `contract_size` uyarısı için.
+    ///
+    /// Tüm aralık taranmıyor: 66 günün tablosunu açılışta okumak, kaydın
+    /// tamamına dokunmak olurdu. Uyarı zaten "kaydın son hâli" hakkında.
+    pub fn symbols_of_last_day(&self) -> Result<Vec<Vec<SymbolSnapshot>>, ReplayError> {
+        let Some(i) = self.days.len().checked_sub(1) else { return Ok(Vec::new()) };
+        let mut out = Vec::new();
+        for &g in &self.day_insts[i] {
+            out.push(load_symbols(&symbols_path(
+                &self.data_dir,
+                &self.instances[g],
+                &self.days[i],
+            ))?);
+        }
+        Ok(out)
+    }
+
+    /// Kapsanan aralığı bul: ilk DOLU günün ilk tick'i, son DOLU günün son
+    /// tick'i.
+    ///
+    /// Baştan ve sondan yürünüyor, hepsi yüklenmiyor: tipik durumda iki gün
+    /// okunur ve ikisi de hemen bırakılır. Pencere yüzünden boş kalan günler
+    /// atlanır — `--replay-from 09:00` verilen bir aralıkta ilk günün 09:00
+    /// öncesi bitmiş olması, kapsamın o günden başladığını söylemeyi
+    /// gerektirmez.
+    fn compute_span(&self) -> Result<(i64, i64), ReplayError> {
+        let mut raw_first_ms = i64::MAX;
+        let mut raw_last_ms = i64::MIN;
+        let mut front: Option<(usize, i64, i64)> = None; // (gun, ilk, son)
+        for i in 0..self.days.len() {
+            let d = self.load_day(i)?;
+            raw_first_ms = raw_first_ms.min(d.raw_first_ms);
+            raw_last_ms = raw_last_ms.max(d.raw_last_ms);
+            if let (Some(f), Some(l)) = (d.items.first(), d.items.last()) {
+                front = Some((i, f.rec.recv_ms, l.rec.recv_ms));
+                break;
+            }
+        }
+        let Some((fi, from_ms, mut to_ms)) = front else {
+            // Buraya gelindiyse TÜM günler yüklendi; kaydın gerçek kapsamı
+            // elimizde ve kullanıcıya söylenmeli.
+            let day0 = parse_yyyymmdd(&self.days[0])?;
+            return Err(ReplayError::EmptyWindow {
+                first_ms: raw_first_ms,
+                last_ms: raw_last_ms,
+                from_ms: day0 + self.from_off,
+                to_ms: day0 + self.to_off,
+            });
+        };
+        for i in (fi + 1..self.days.len()).rev() {
+            let d = self.load_day(i)?;
+            if let Some(l) = d.items.last() {
+                to_ms = l.rec.recv_ms;
+                break;
+            }
+        }
+        Ok((from_ms, to_ms))
     }
 }
 
@@ -463,15 +834,8 @@ pub fn discover_instances(data_dir: &Path, date: &str) -> Result<Vec<String>, Re
     if !data_dir.is_dir() {
         return Err(ReplayError::NoDataDir(data_dir.to_path_buf()));
     }
-    let rd = fs::read_dir(data_dir)
-        .map_err(|err| ReplayError::Io { path: data_dir.to_path_buf(), err })?;
     let mut out = Vec::new();
-    for ent in rd {
-        let ent = ent.map_err(|err| ReplayError::Io { path: data_dir.to_path_buf(), err })?;
-        if !ent.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            continue;
-        }
-        let Some(name) = ent.file_name().to_str().map(str::to_owned) else { continue };
+    for name in subdirs(data_dir)? {
         if ticks_path(data_dir, &name, date).is_file() {
             out.push(name);
         }
@@ -484,6 +848,75 @@ pub fn discover_instances(data_dir: &Path, date: &str) -> Result<Vec<String>, Re
         });
     }
     Ok(out)
+}
+
+/// Kayıt kökündeki alt dizinler (= örnek adayları), keşif sırasında.
+fn subdirs(data_dir: &Path) -> Result<Vec<String>, ReplayError> {
+    let rd = fs::read_dir(data_dir)
+        .map_err(|err| ReplayError::Io { path: data_dir.to_path_buf(), err })?;
+    let mut out = Vec::new();
+    for ent in rd {
+        let ent = ent.map_err(|err| ReplayError::Io { path: data_dir.to_path_buf(), err })?;
+        if !ent.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let Some(name) = ent.file_name().to_str().map(str::to_owned) else { continue };
+        out.push(name);
+    }
+    Ok(out)
+}
+
+/// Bu güne ait, EN AZ bir tam kayıt içeren tick dosyası olan örnekler.
+///
+/// **Yalnızca aralık kipinde** kullanılır. Hafta sonu ve tatillerde dosya ya
+/// hiç yoktur ya da 0 bayttır; bunlar sessizce atlanmalı, yoksa 3 aylık bir
+/// backtest ilk cumartesinde hata verip dururdu.
+///
+/// Tek gün kipinde bu süzgeç YOKTUR: orada boş bir dosya hâlâ AÇIK bir
+/// hatadır, çünkü kullanıcı tam olarak o günü istemiştir ve sessizce boş
+/// akış almak istediği son şeydir.
+fn instances_with_data(data_dir: &Path, date: &str) -> Result<Vec<String>, ReplayError> {
+    let mut out = Vec::new();
+    for name in subdirs(data_dir)? {
+        let p = ticks_path(data_dir, &name, date);
+        let Ok(md) = fs::metadata(&p) else { continue };
+        if !md.is_file() || md.len() == 0 {
+            continue;
+        }
+        if (md.len() as usize) < TICK_REC_SIZE {
+            // 0 bayt "kayıt yok" demek; 0 ile 48 arası bayt ise BOZUK bir
+            // dosya demek. Atlıyoruz ama sessizce değil.
+            eprintln!(
+                "[replay] {}: tek bir tam kayit bile yok ({} bayt) — bu gun atlandi",
+                p.display(),
+                md.len()
+            );
+            continue;
+        }
+        out.push(name);
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Kayıt dizinindeki TÜM günler (`YYYYMMDD`), kronolojik ve tekilleştirilmiş.
+///
+/// Takvimi gün gün yürümüyoruz, DİSKTE ne varsa onu listeliyoruz: hafta sonu
+/// ve tatil böylece kendiliğinden düşer ve "kayıtta ne varsa sonuna kadar"
+/// (`20260513-`) biçimi de aynı yoldan cevaplanır.
+pub fn discover_days(data_dir: &Path) -> Result<Vec<String>, ReplayError> {
+    if !data_dir.is_dir() {
+        return Err(ReplayError::NoDataDir(data_dir.to_path_buf()));
+    }
+    let mut stamps: Vec<u32> = Vec::new();
+    for name in subdirs(data_dir)? {
+        let days = crate::record::list_days(data_dir, &name)
+            .map_err(|err| ReplayError::Io { path: data_dir.join(&name), err })?;
+        stamps.extend(days);
+    }
+    stamps.sort_unstable();
+    stamps.dedup();
+    Ok(stamps.into_iter().map(crate::record::date_str).collect())
 }
 
 /// Bir tick dosyasını oku.
@@ -554,12 +987,20 @@ pub fn load_symbols(path: &Path) -> Result<Vec<SymbolSnapshot>, ReplayError> {
     Ok(out)
 }
 
-/// Bir günün kaydını yükle, pencereye kırp, örnekleri birleştir.
+/// Oynatılacak günleri çöz, doğrula ve kapsamı ölç.
+///
+/// Bu fonksiyon **tick yüklemeyi bitirmez**: yalnızca gün listesini kurar ve
+/// kapsamı ölçmek için gereken kadarını (ilk ve son dolu gün) okuyup bırakır.
+/// Aralığın tamamı belleğe ancak oynatım sırasında, gün gün girer.
+///
+/// Diskle konuşmadan önce yakalanan hatalar (biçim, ters pencere, negatif
+/// hız) burada da yakalanır: operatörün yazım hatasını dosya sisteminden
+/// dönmesini beklemeden görmesi gerekir.
 pub fn load(opts: &ReplayOpts) -> Result<Recording, ReplayError> {
     if !opts.speed.is_finite() || opts.speed < 0.0 {
         return Err(ReplayError::BadSpeed(opts.speed));
     }
-    let day = parse_yyyymmdd(&opts.date)?;
+    let spec = parse_date_spec(&opts.date)?;
     let from_off = match &opts.from {
         Some(s) => parse_hhmm(s)?,
         None => 0,
@@ -574,66 +1015,89 @@ pub fn load(opts: &ReplayOpts) -> Result<Recording, ReplayError> {
             to: opts.to.clone().unwrap_or_else(|| "24:00".into()),
         });
     }
-    let window_from_ms = day + from_off;
-    let window_to_ms = day + to_off;
 
-    let instances = discover_instances(&opts.data_dir, &opts.date)?;
-
-    // Her örnek için: tick'ler + sembol görüntüleri. Sembol dosyasının
-    // yokluğu burada patlar — tick'i olan ama tablosu olmayan bir örnek
-    // sessizce atlanamaz.
-    let mut per_inst: Vec<Vec<TickRec>> = Vec::with_capacity(instances.len());
-    let mut symbols: Vec<Vec<SymbolSnapshot>> = Vec::with_capacity(instances.len());
-    for inst in &instances {
-        per_inst.push(load_ticks(&ticks_path(&opts.data_dir, inst, &opts.date))?);
-        symbols.push(load_symbols(&symbols_path(&opts.data_dir, inst, &opts.date))?);
-    }
-
-    // Kırpma öncesi gerçek kapsam — boş pencere hatasında kullanıcıya "kayıt
-    // aslında şu aralığı içeriyor" diyebilmek için.
-    let mut first_ms = i64::MAX;
-    let mut last_ms = i64::MIN;
-    for recs in &per_inst {
-        for r in recs {
-            first_ms = first_ms.min(r.recv_ms);
-            last_ms = last_ms.max(r.recv_ms);
+    // --- hangi günler, her günde hangi örnekler ---
+    let (days, per_day_names) = match &spec {
+        // Tek gün: davranış AYNEN korunuyor. Eksik kayıt, boş dosya ve eksik
+        // sembol tablosu burada hâlâ AÇIK hatadır — kullanıcı tam olarak bu
+        // günü istedi.
+        DateSpec::Day(d) => (vec![d.clone()], vec![discover_instances(&opts.data_dir, d)?]),
+        DateSpec::Range { start, end } => {
+            let lo = parse_yyyymmdd(start)?;
+            let hi = match end {
+                Some(e) => Some(parse_yyyymmdd(e)?),
+                None => None,
+            };
+            let mut days = Vec::new();
+            let mut names = Vec::new();
+            for d in discover_days(&opts.data_dir)? {
+                let Ok(ms) = parse_yyyymmdd(&d) else { continue };
+                if ms < lo || hi.is_some_and(|h| ms > h) {
+                    continue;
+                }
+                let insts = instances_with_data(&opts.data_dir, &d)?;
+                // Hafta sonu / tatil / 0 baytlık gün: SESSİZCE atlanır.
+                if insts.is_empty() {
+                    continue;
+                }
+                days.push(d);
+                names.push(insts);
+            }
+            if days.is_empty() {
+                return Err(ReplayError::NoRecordingInRange {
+                    dir: opts.data_dir.clone(),
+                    start: start.clone(),
+                    end: end.clone(),
+                });
+            }
+            (days, names)
         }
-    }
+    };
 
-    // Pencereye kırp. Yarı açık `[from, to)`: iki bitişik pencere böylece
-    // örtüşmeden döşenir.
-    let trimmed: Vec<Vec<TickRec>> = per_inst
-        .into_iter()
-        .map(|v| {
-            v.into_iter()
-                .filter(|r| r.recv_ms >= window_from_ms && r.recv_ms < window_to_ms)
+    // Örnek listesi TÜM günlerin birleşimi: bir örnek aralığın ortasında
+    // kayda başlamış olabilir ve `PlayItem::inst` oynatım boyunca sabit bir
+    // listeye bakmalı.
+    let mut instances: Vec<String> = per_day_names.iter().flatten().cloned().collect();
+    instances.sort();
+    instances.dedup();
+    let day_insts: Vec<Vec<usize>> = per_day_names
+        .iter()
+        .map(|ns| {
+            ns.iter()
+                .map(|n| {
+                    instances.iter().position(|k| k == n).expect("birlesim listesi tum adlari icerir")
+                })
                 .collect()
         })
         .collect();
 
-    let items = merge_by_recv_ms(&trimmed);
-    if items.is_empty() {
-        return Err(ReplayError::EmptyWindow {
-            first_ms,
-            last_ms,
-            from_ms: window_from_ms,
-            to_ms: window_to_ms,
-        });
+    let mut rec = Recording {
+        instances,
+        days,
+        covered_from_ms: 0,
+        covered_to_ms: 0,
+        speed: opts.speed,
+        spec,
+        data_dir: opts.data_dir.clone(),
+        from_off,
+        to_off,
+        day_insts,
+    };
+
+    // Sembol tabloları ŞİMDİ doğrulanıyor, oynatımın ortasında değil.
+    // Dosyalar küçüktür (jsonl) ve 66 tanesini okumak ucuzdur; buna karşılık
+    // 40. günde patlayan bir replay, saatler süren bir testi çöpe atardı.
+    // Tick'ler burada OKUNMAZ: asıl hacim onlarda.
+    for (i, date) in rec.days.iter().enumerate() {
+        for &g in &rec.day_insts[i] {
+            load_symbols(&symbols_path(&rec.data_dir, &rec.instances[g], date))?;
+        }
     }
 
-    let covered_from_ms = items.first().map(|i| i.rec.recv_ms).unwrap_or(window_from_ms);
-    let covered_to_ms = items.last().map(|i| i.rec.recv_ms).unwrap_or(window_to_ms);
-
-    Ok(Recording {
-        instances,
-        items,
-        symbols,
-        window_from_ms,
-        window_to_ms,
-        covered_from_ms,
-        covered_to_ms,
-        speed: opts.speed,
-    })
+    let (from_ms, to_ms) = rec.compute_span()?;
+    rec.covered_from_ms = from_ms;
+    rec.covered_to_ms = to_ms;
+    Ok(rec)
 }
 
 /// Örnek dosyalarını `recv_ms`'e göre k-yollu birleştir.
@@ -831,112 +1295,172 @@ pub fn play(
     sim: Option<&crate::server::SimExec>,
 ) -> ReplayEnd {
     let names: Vec<Arc<str>> = rec.instances.iter().map(|s| Arc::from(s.as_str())).collect();
-    // Örnek başına sembol görüntüsü imleci.
-    let mut cursor = vec![0usize; rec.instances.len()];
-
-    seed_symbols(rec, registry, &mut cursor);
-
     let anchor = Instant::now();
-    let base_ms = rec.items.first().map(|i| i.rec.recv_ms).unwrap_or(0);
-    let mut end = ReplayEnd::default();
+    // Plan tel üzerine çıkıyor: aralık yarıda kesilirse istemci `days_played
+    // < days` görüp bu çalıştırmanın EKSİK olduğunu anlayabilmeli.
+    let mut end = ReplayEnd { days: rec.days.len() as u32, ..Default::default() };
 
-    for item in &rec.items {
-        let i = item.inst;
-        let inst_name = &rec.instances[i];
-        let t = &item.rec;
+    // Oynatımın o ana kadar BORÇLANDIĞI sanal süre (ms, hız uygulanmadan).
+    // Tek bir sayaç: gün değişince sıfırlanmaz, yoksa ikinci gün baştan
+    // beklemeye başlar ve tempo her gün sınırında sıçrardı.
+    let mut budget_ms: f64 = 0.0;
+    let mut prev_last_recv: Option<i64> = None;
 
-        // Sembol tablosu bu ana kadar değiştiyse uygula — "o ana kadarki SON
-        // satır" kuralı.
-        apply_symbols_until(rec, registry, &mut cursor, i, t.recv_ms);
-
-        // Tempo: yerel ALIM zamanına göre. `time_msc` aynı değeri taşıyan
-        // ardışık tick'ler olabilir; gerçek varış temposu yalnızca `recv_ms`
-        // ile yeniden üretilebilir.
-        if rec.speed > 0.0 {
-            let target = (t.recv_ms - base_ms).max(0) as f64 / rec.speed;
-            let due = Duration::from_secs_f64((target / 1000.0).max(0.0));
-            let spent = anchor.elapsed();
-            if due > spent {
-                std::thread::sleep(due - spent);
+    for i in 0..rec.days.len() {
+        // Gün gün: dönen `DayData` bu turun sonunda düşer ve belleği bırakır.
+        let day = match rec.load_day(i) {
+            Ok(d) => d,
+            Err(e) => {
+                // Aralığın ortasında bozulan bir kayıt SESSİZCE atlanamaz:
+                // eksik günlerle devam etmek, backtest sonucunu sessizce
+                // yanlış yapardı. Kalan günler oynatılmaz ve sebep yazılır.
+                eprintln!("[replay] {} yuklenemedi: {e}", rec.days[i]);
+                eprintln!(
+                    "[replay] ARALIK YARIDA KESILDI: {} gununden sonrasi OYNATILMADI. \
+                     Bu calistirmanin sonuclari EKSIK bir kaydin sonucudur.",
+                    rec.days[i]
+                );
+                break;
             }
-        }
-
-        // Canlıdaki kural: tablo henüz sembolü tanımıyorsa tick ATLANIR —
-        // isimsiz göndermek istemciyi yanıltırdı.
-        let Some(name) = registry.name_of(inst_name, t.symbol_id) else { continue };
-
-        registry.update_last(
-            inst_name,
-            t.symbol_id,
-            LastTick { bid: t.bid, ask: t.ask, last: t.last, time_msc: t.time_msc },
-        );
-
-        let closed = {
-            let mut cs = candles.lock().unwrap_or_else(|e| e.into_inner());
-            cs.on_tick(&name, t.bid, t.ask, t.time_msc)
         };
-        for cb in closed {
-            let _ = tx.send(FeedEvent::Candle {
-                symbol: Arc::from(cb.symbol.as_str()),
-                tf: cb.tf,
-                bar: cb.bar,
+        // Gün DİSKTEN OKUNDU: bu andan sonra oynatım o günü görmüş sayılır.
+        // Sayaç burada artıyor, tick yayıldığında değil — penceresi boş kalan
+        // bir gün atlanmış değil, İŞLENMİŞTİR ve `--replay-from 09:00` verilen
+        // her aralığı yanlışlıkla "yarıda kesildi" diye damgalamak, gerçek
+        // kesintiyi fark edilmez hâle getirirdi.
+        end.days_played += 1;
+        // Kayıtta olmayan ya da pencerenin dışında kalan gün: sessizce atlanır
+        // (hafta sonu, tatil, `--replay-from` penceresine düşmeyen gün).
+        if day.items.is_empty() {
+            continue;
+        }
+
+        // Sembol imleçleri ve tablosu HER GÜN yeniden kurulur: sembol
+        // kimlikleri günler arasında değişebilir.
+        let mut cursor = vec![0usize; rec.instances.len()];
+        seed_symbols(&day, rec, registry, &mut cursor);
+
+        let base_ms = day.items[0].rec.recv_ms;
+        // GÜNLER ARASI boşluğu kırp. Cuma 23:58 → Pazartesi 01:00 farkı ~49
+        // saattir ve kırpılmazsa oynatım gerçekten 49 saat uyurdu. Gün
+        // İÇİNDEKİ boşluklara dokunulmaz: onlar gerçek piyasa sessizliğidir.
+        if let Some(prev) = prev_last_recv {
+            budget_ms += (base_ms - prev).clamp(0, REPLAY_GAP_MAX_MS) as f64;
+        }
+        let day_start_ms = budget_ms;
+
+        for item in &day.items {
+            let g = item.inst;
+            let inst_name = &rec.instances[g];
+            let t = &item.rec;
+
+            // Sembol tablosu bu ana kadar değiştiyse uygula — "o ana kadarki
+            // SON satır" kuralı.
+            apply_symbols_until(&day, rec, registry, &mut cursor, g, t.recv_ms);
+
+            // Tempo: yerel ALIM zamanına göre. `time_msc` aynı değeri taşıyan
+            // ardışık tick'ler olabilir; gerçek varış temposu yalnızca
+            // `recv_ms` ile yeniden üretilebilir.
+            if rec.speed > 0.0 {
+                let target = (day_start_ms + (t.recv_ms - base_ms).max(0) as f64) / rec.speed;
+                let due = Duration::from_secs_f64((target / 1000.0).max(0.0));
+                let spent = anchor.elapsed();
+                if due > spent {
+                    std::thread::sleep(due - spent);
+                }
+            }
+
+            // Canlıdaki kural: tablo henüz sembolü tanımıyorsa tick ATLANIR —
+            // isimsiz göndermek istemciyi yanıltırdı.
+            let Some(name) = registry.name_of(inst_name, t.symbol_id) else { continue };
+
+            registry.update_last(
+                inst_name,
+                t.symbol_id,
+                LastTick { bid: t.bid, ask: t.ask, last: t.last, time_msc: t.time_msc },
+            );
+
+            let closed = {
+                let mut cs = candles.lock().unwrap_or_else(|e| e.into_inner());
+                cs.on_tick(&name, t.bid, t.ask, t.time_msc)
+            };
+            for cb in closed {
+                let _ = tx.send(FeedEvent::Candle {
+                    symbol: Arc::from(cb.symbol.as_str()),
+                    tf: cb.tf,
+                    bar: cb.bar,
+                });
+            }
+
+            let _ = tx.send(FeedEvent::Tick {
+                instance: names[g].clone(),
+                symbol: Arc::from(name.as_str()),
+                bid: t.bid,
+                ask: t.ask,
+                last: t.last,
+                time_msc: t.time_msc,
+                // Gecikme replay'de ÖLÇÜLEMEZ: kayıtta yakalama damgası yok ve
+                // uydurulmuş bir değer, gecikme ölçen bir tüketiciye yalan
+                // söylerdi. 0 = "ölçüm yok".
+                lat_us: 0,
             });
+
+            // Tetiklenmeler tick'ten SONRA yayılır: istemci önce fiyatı, sonra
+            // o fiyatın doğurduğu dolumu görür. Ters sıra, henüz görmediği bir
+            // fiyattan dolum almış gibi görünürdü.
+            if let Some(s) = sim {
+                crate::server::pump_tick(s, tx, inst_name, &name, t.bid, t.ask, t.time_msc);
+            }
+
+            end.ticks += 1;
+            // Yayılan SON tick'in broker saati. İsimlendirilemediği için
+            // atlanan kayıtlar sayılmaz: istemciye "şuraya kadar oynattım"
+            // derken göndermediğimiz bir tick'i saymak yanlış olurdu.
+            end.last_ms = t.time_msc;
         }
 
-        let _ = tx.send(FeedEvent::Tick {
-            instance: names[i].clone(),
-            symbol: Arc::from(name.as_str()),
-            bid: t.bid,
-            ask: t.ask,
-            last: t.last,
-            time_msc: t.time_msc,
-            // Gecikme replay'de ÖLÇÜLEMEZ: kayıtta yakalama damgası yok ve
-            // uydurulmuş bir değer, gecikme ölçen bir tüketiciye yalan
-            // söylerdi. 0 = "ölçüm yok".
-            lat_us: 0,
-        });
-
-        // Tetiklenmeler tick'ten SONRA yayılır: istemci önce fiyatı, sonra o
-        // fiyatın doğurduğu dolumu görür. Ters sıra, henüz görmediği bir
-        // fiyattan dolum almış gibi görünürdü.
-        if let Some(s) = sim {
-            crate::server::pump_tick(s, tx, inst_name, &name, t.bid, t.ask, t.time_msc);
+        // Günün sonunda kalan sembol görüntülerini de uygula: gün bitiminde
+        // yapılan bir tablo değişikliği `symbols` isteğine yansımalı.
+        for g in 0..rec.instances.len() {
+            apply_symbols_until(&day, rec, registry, &mut cursor, g, i64::MAX);
         }
 
-        end.ticks += 1;
-        // Yayılan SON tick'in broker saati. İsimlendirilemediği için atlanan
-        // kayıtlar sayılmaz: istemciye "şuraya kadar oynattım" derken
-        // göndermediğimiz bir tick'i saymak yanlış olurdu.
-        end.last_ms = t.time_msc;
+        let last_recv = day.items[day.items.len() - 1].rec.recv_ms;
+        budget_ms = day_start_ms + (last_recv - base_ms).max(0) as f64;
+        prev_last_recv = Some(last_recv);
     }
 
-    // Kalan sembol görüntülerini de uygula: kaydın sonunda yapılan bir tablo
-    // değişikliği `symbols` isteğine yansımalı.
-    for i in 0..rec.instances.len() {
-        apply_symbols_until(rec, registry, &mut cursor, i, i64::MAX);
-    }
-
-    // TAM BİR KEZ. Bağlantı düşürülmez; akış son durumda kalır — `hello`daki
-    // kapsam bilgisi bitişi zaten söylüyor, bu mesaj onu doğruluyor.
+    // TAM BİR KEZ ve ARALIĞIN SONUNDA — her gün sonunda DEĞİL. İstemci gün
+    // değiştiğini fark etmemeli; `replay_done` gün başına gitseydi 66 günlük
+    // bir backtest istemciye 66 kez "bitti" derdi.
     let _ = done.send(Some(end));
     end
 }
 
-/// Oynatım başlamadan önceki tabloyu kur.
+/// Bir günün oynatımı başlamadan önceki tabloyu kur.
 ///
 /// Kural "o ana kadarki SON satır"dır. Pencerenin başlangıcından önce hiç
 /// satır yoksa **en eski** satır kullanılır: kaydedilmiş bir tick'in kayıt
 /// anında bir adı vardı; yalnızca tablo satırı sonradan yazılmış olabilir ve
 /// bu yüzden tick'leri isimsiz bırakmak veriyi çöpe atmak olurdu.
-fn seed_symbols(rec: &Recording, registry: &Registry, cursor: &mut [usize]) {
+///
+/// Her gün için yeniden çağrılır ve tabloyu **tamamen değiştirir**: sembol
+/// kimlikleri günler arasında değişebilir ve dünün tablosunu taşımak, bugünün
+/// tick'lerine yanlış sembol adı yapıştırmak olurdu.
+fn seed_symbols(day: &DayData, rec: &Recording, registry: &Registry, cursor: &mut [usize]) {
     for (i, inst) in rec.instances.iter().enumerate() {
-        let snaps = &rec.symbols[i];
-        let start = rec
+        let snaps = &day.symbols[i];
+        // Bu örneğin bu gün kaydı yok: tablosuna dokunma.
+        if snaps.is_empty() {
+            cursor[i] = 0;
+            continue;
+        }
+        let start = day
             .items
             .iter()
             .find(|it| it.inst == i)
             .map(|it| it.rec.recv_ms)
-            .unwrap_or(rec.window_from_ms);
+            .unwrap_or(day.window_from_ms);
         // Pencereden önce satır yoksa EN ESKİ tablo kullanılır (bkz. yukarıda).
         let idx = snaps.iter().rposition(|s| s.at_ms <= start).unwrap_or(0);
         registry.set_symbols(inst, snaps[idx].items.iter().map(SymbolItem::to_entry).collect());
@@ -946,13 +1470,14 @@ fn seed_symbols(rec: &Recording, registry: &Registry, cursor: &mut [usize]) {
 
 /// `now_ms`'e kadar yayımlanmış sembol tablosu değişikliklerini uygula.
 fn apply_symbols_until(
+    day: &DayData,
     rec: &Recording,
     registry: &Registry,
     cursor: &mut [usize],
     inst: usize,
     now_ms: i64,
 ) {
-    let snaps = &rec.symbols[inst];
+    let snaps = &day.symbols[inst];
     let mut applied = None;
     while cursor[inst] < snaps.len() && snaps[cursor[inst]].at_ms <= now_ms {
         applied = Some(cursor[inst]);
@@ -1070,8 +1595,24 @@ mod tests {
 
     /// Tam bir günlük kayıt yaz: tick dosyası + sembol tablosu.
     fn lay_out(dir: &Path, inst: &str, ticks: &[TickRec], snaps: &[SymbolSnapshot]) {
-        write_ticks(&ticks_path(dir, inst, DATE), ticks).expect("tick yazilmali");
-        write_symbols(&symbols_path(dir, inst, DATE), snaps).expect("sembol yazilmali");
+        lay_out_on(dir, inst, DATE, ticks, snaps);
+    }
+
+    /// Aynısı ama gün seçilebilir — aralık testleri için.
+    fn lay_out_on(
+        dir: &Path,
+        inst: &str,
+        date: &str,
+        ticks: &[TickRec],
+        snaps: &[SymbolSnapshot],
+    ) {
+        write_ticks(&ticks_path(dir, inst, date), ticks).expect("tick yazilmali");
+        write_symbols(&symbols_path(dir, inst, date), snaps).expect("sembol yazilmali");
+    }
+
+    /// `days[i]` gününün kayıtları — tick'ler artık plana değil güne ait.
+    fn day_items(r: &Recording, i: usize) -> Vec<PlayItem> {
+        r.load_day(i).expect("gun yuklenebilmeli").items.clone()
     }
 
     fn one_symbol_table(at_ms: i64) -> Vec<SymbolSnapshot> {
@@ -1160,7 +1701,7 @@ mod tests {
         let mut opts = ReplayOpts::new(tmp.path(), DATE);
         opts.speed = 0.0;
         let r = load(&opts).expect("yuklenmeli");
-        assert_eq!(r.len(), written.len(), "her kayit oynatilmali");
+        assert_eq!(day_items(&r, 0).len(), written.len(), "her kayit oynatilmali");
 
         let (evs, _reg) = play_ticks(&r);
         assert_eq!(evs.len(), written.len());
@@ -1304,11 +1845,11 @@ mod tests {
         let mut opts = ReplayOpts::new(tmp.path(), DATE);
         opts.speed = 0.0;
         opts.from = Some("11:00".into());
-        assert_eq!(load(&opts).unwrap().len(), 2, "11 ve 12");
+        assert_eq!(day_items(&load(&opts).unwrap(), 0).len(), 2, "11 ve 12");
 
         opts.from = None;
         opts.to = Some("10:00".into());
-        assert_eq!(load(&opts).unwrap().len(), 2, "8 ve 9");
+        assert_eq!(day_items(&load(&opts).unwrap(), 0).len(), 2, "8 ve 9");
     }
 
     #[test]
@@ -1407,7 +1948,7 @@ mod tests {
         let mut opts = ReplayOpts::new(tmp.path(), DATE);
         opts.speed = 0.0;
         let r = load(&opts).expect("kirpilip yuklenmeli");
-        assert_eq!(r.len(), 7, "tam kayitlar korunmali, yarim kayit atilmali");
+        assert_eq!(day_items(&r, 0).len(), 7, "tam kayitlar korunmali, yarim kayit atilmali");
         let (evs, _) = play_ticks(&r);
         let got: Vec<f64> = evs.iter().map(|e| tick_fields(e).2).collect();
         assert_eq!(got, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
@@ -1450,7 +1991,12 @@ mod tests {
     fn bad_flags_are_rejected_before_any_file_is_touched() {
         let tmp = Tmp::new("badflags");
         let mut opts = ReplayOpts::new(tmp.path(), "2024-03-15");
-        assert!(matches!(load(&opts), Err(ReplayError::BadDate(_))));
+        // `-` artık aralık ayırıcısı: `2024-03-15` üç parça verir ve hata
+        // ARALIK hatası olur. Sessizce ilk parçayı ("2024") gün saymak,
+        // istenmeyen bir günü oynatmak olurdu.
+        let e = load(&opts).expect_err("ISO tarih kabul edilmemeli");
+        assert!(matches!(e, ReplayError::BadDateSpec(_)), "{e:?}");
+        assert!(e.to_string().contains("20260513-20260812"), "kabul edilenler yazilmali: {e}");
         opts.date = "20240230".into();
         assert!(matches!(load(&opts), Err(ReplayError::BadDate(_))), "31 subat yok");
         opts.date = DATE.into();
@@ -1893,8 +2439,9 @@ mod tests {
         let mut opts = ReplayOpts::new(tmp.path(), DATE);
         opts.speed = 0.0;
         let r = load(&opts).unwrap();
-        assert_eq!(r.len(), 1, "ertesi gune tasan kayit bu gune ait degil");
-        assert_eq!(r.items[0].rec.bid, 1.0);
+        let items = day_items(&r, 0);
+        assert_eq!(items.len(), 1, "ertesi gune tasan kayit bu gune ait degil");
+        assert_eq!(items[0].rec.bid, 1.0);
     }
 
     // -- başlatma kapısı ---------------------------------------------------
@@ -2021,5 +2568,522 @@ mod tests {
         lay_out(tmp.path(), "mt5-1", &[rec(DAY + 1, DAY + 1, 1.0, 0)], &one_symbol_table(DAY));
         write_ticks(&ticks_path(tmp.path(), "mt5-2", "20240316"), &[rec(1, 1, 1.0, 0)]).unwrap();
         assert_eq!(discover_instances(tmp.path(), DATE).unwrap(), vec!["mt5-1".to_string()]);
+    }
+
+    // -- gün aralığı -------------------------------------------------------
+    //
+    // 2024-03-15 Cuma, 16-17 hafta sonu, 18 Pazartesi. Gerçek takvimin
+    // kullanılması kasıtlı: hafta sonu boşluğu ve gün-aşırı tempo bu işin
+    // asıl konusu.
+
+    /// `(YYYYMMDD, o günün UTC gece yarısı)` — 2024 Mart.
+    fn march(dom: u32) -> (String, i64) {
+        (format!("202403{dom:02}"), DAY + (dom as i64 - 15) * DAY_MS)
+    }
+
+    /// Aralık kipi için hazır kurulum: her gün için verilen `bid` değerlerini
+    /// o günün 12:00'sinden itibaren saniyede bir yaz.
+    fn lay_out_days(dir: &Path, inst: &str, days: &[(u32, &[f64])]) {
+        for (dom, bids) in days {
+            let (date, day_ms) = march(*dom);
+            let base = day_ms + 12 * 3_600_000;
+            let ticks: Vec<TickRec> = bids
+                .iter()
+                .enumerate()
+                .map(|(i, b)| rec(base + i as i64 * 1_000, base + i as i64 * 1_000, *b, 0))
+                .collect();
+            lay_out_on(dir, inst, &date, &ticks, &[SymbolSnapshot {
+                at_ms: day_ms,
+                items: vec![item(0, "EURUSD")],
+            }]);
+        }
+    }
+
+    fn bids_of(evs: &[FeedEvent]) -> Vec<f64> {
+        evs.iter().map(|e| tick_fields(e).2).collect()
+    }
+
+    #[test]
+    fn a_single_day_spec_still_means_exactly_one_day() {
+        // GERİLEME KORUMASI: aralık desteği eklemek, tek günlük replay'in
+        // davranışını bir satır bile değiştirmemeli.
+        assert_eq!(parse_date_spec("20260513").unwrap(), DateSpec::Day("20260513".into()));
+        assert!(!parse_date_spec("20260513").unwrap().is_range());
+
+        let tmp = Tmp::new("onedayspec");
+        // Aralıkta olsaydı komşu gün de gelirdi; tek gün istendiğinde GELMEMELİ.
+        lay_out_days(tmp.path(), "mt5-1", &[(15, &[1.0, 2.0]), (18, &[3.0])]);
+
+        let mut opts = ReplayOpts::new(tmp.path(), DATE);
+        opts.speed = 0.0;
+        let r = load(&opts).unwrap();
+        assert_eq!(r.days, vec![DATE.to_string()], "tek gun istendi, tek gun oynatilmali");
+        assert_eq!(r.day_count(), 1);
+
+        let (evs, _, end) = play_all(&r);
+        let ticks: Vec<&FeedEvent> =
+            evs.iter().filter(|e| matches!(e, FeedEvent::Tick { .. })).collect();
+        assert_eq!(ticks.len(), 2);
+        assert_eq!(end.ticks, 2);
+    }
+
+    #[test]
+    fn a_range_plays_its_days_in_order_over_one_uninterrupted_stream() {
+        // ASIL NOKTA: 66 ayrı süreç yerine tek akış. Günler kronolojik gelir
+        // ve istemci gün değiştiğini fark etmez.
+        let tmp = Tmp::new("range2");
+        lay_out_days(tmp.path(), "mt5-1", &[(15, &[1.0, 2.0]), (18, &[3.0, 4.0])]);
+
+        let mut opts = ReplayOpts::new(tmp.path(), "20240315-20240318");
+        opts.speed = 0.0;
+        let r = load(&opts).unwrap();
+        assert_eq!(r.days, vec!["20240315".to_string(), "20240318".to_string()]);
+
+        let (evs, _, end) = play_all(&r);
+        let ticks: Vec<FeedEvent> =
+            evs.into_iter().filter(|e| matches!(e, FeedEvent::Tick { .. })).collect();
+        assert_eq!(bids_of(&ticks), vec![1.0, 2.0, 3.0, 4.0], "gunler KRONOLOJIK akmali");
+        assert_eq!(end.ticks, 4, "sayac aralik boyunca birikmeli, gun basina sifirlanmamali");
+    }
+
+    #[test]
+    fn a_missing_or_empty_day_inside_the_range_is_skipped_silently() {
+        // Hafta sonu ve tatiller kayıtta YOKTUR. Bunların her biri için hata
+        // vermek, 3 aylık bir backtest'i ilk cumartesinde durdururdu.
+        let tmp = Tmp::new("weekend");
+        lay_out_days(tmp.path(), "mt5-1", &[(15, &[1.0]), (18, &[2.0])]);
+        // Cumartesi: dosya VAR ama 0 bayt (kaydedici açıp hiç yazmamış).
+        let sat = ticks_path(tmp.path(), "mt5-1", &march(16).0);
+        fs::write(&sat, []).unwrap();
+        // Pazar: dosya hiç yok.
+
+        let mut opts = ReplayOpts::new(tmp.path(), "20240315-20240318");
+        opts.speed = 0.0;
+        let r = load(&opts).expect("hafta sonu bir hata degildir");
+        assert_eq!(
+            r.days,
+            vec!["20240315".to_string(), "20240318".to_string()],
+            "bos ve eksik gunler atlanmali"
+        );
+        let (evs, _, end) = play_all(&r);
+        let ticks: Vec<FeedEvent> =
+            evs.into_iter().filter(|e| matches!(e, FeedEvent::Tick { .. })).collect();
+        assert_eq!(bids_of(&ticks), vec![1.0, 2.0]);
+        assert_eq!(end.ticks, 2);
+        // Hafta sonu ATLANAN gün değil, planda HİÇ OLMAYAN gündür: plan iki
+        // gündür ve ikisi de oynatılmıştır. Aksi hâlde her normal aralık
+        // "yarıda kesildi" damgası yerdi.
+        assert_eq!((end.days, end.days_played), (2, 2), "hafta sonu kesinti degildir");
+    }
+
+    #[test]
+    fn a_day_that_cannot_be_read_mid_range_is_reported_not_silently_swallowed() {
+        // Aralığın ortasındaki bir gün okunamazsa oynatım duruyordu ama bunu
+        // TEL ÜZERİNDE söyleyemiyordu: istemci normal bir `replay_done` görür
+        // ve 3 aylık sandığı bir backtest'i tek günün sonucuyla raporlardı.
+        // Sessiz kesinti, yanlış sonucu doğru sanmak demektir.
+        let tmp = Tmp::new("truncated");
+        lay_out_days(tmp.path(), "mt5-1", &[(15, &[1.0]), (18, &[2.0]), (19, &[3.0])]);
+
+        let mut opts = ReplayOpts::new(tmp.path(), "20240315-20240319");
+        opts.speed = 0.0;
+        let r = load(&opts).expect("uc gun de yerinde");
+        assert_eq!(r.days.len(), 3);
+
+        // Açılış doğrulamasından SONRA, oynatım başlamadan önce ortadaki gün
+        // okunamaz hâle geliyor (silinme, kilitlenme, disk hatası). Kapı
+        // sayesinde bu pencere gerçekte de vardır.
+        fs::remove_file(ticks_path(tmp.path(), "mt5-1", "20240318")).unwrap();
+
+        let (evs, _, end) = play_all(&r);
+        let ticks: Vec<FeedEvent> =
+            evs.into_iter().filter(|e| matches!(e, FeedEvent::Tick { .. })).collect();
+        assert_eq!(bids_of(&ticks), vec![1.0], "kesintiden sonrasi oynatilmaz");
+        assert_eq!(end.days, 3, "PLAN uc gundu");
+        assert_eq!(end.days_played, 1, "yalnizca ilk gun oynatildi");
+        assert!(end.days_played < end.days, "kesinti sayilardan okunabilmeli");
+    }
+
+    #[test]
+    fn a_range_that_matches_no_recorded_day_is_a_loud_error() {
+        // Tek tek eksik günler sessizce atlanır; aralığın TAMAMEN boş olması
+        // yazım hatası ya da yanlış dizin demektir ve sessizce boş akışa
+        // dönüşmesi "sistem calisiyor ama piyasa hareketsiz" yanılsaması
+        // üretirdi.
+        let tmp = Tmp::new("emptyrange");
+        lay_out_days(tmp.path(), "mt5-1", &[(15, &[1.0])]);
+
+        let opts = ReplayOpts::new(tmp.path(), "20240401-20240405");
+        let e = load(&opts).expect_err("bos aralik hata olmali");
+        assert!(matches!(e, ReplayError::NoRecordingInRange { .. }), "{e:?}");
+        let msg = e.to_string();
+        assert!(msg.contains("20240401") && msg.contains("20240405"), "aralik yazilmali: {msg}");
+        assert!(msg.contains("ticks-YYYYMMDD.bin"), "beklenen dosya adi yazilmali: {msg}");
+
+        // Açık uçlu aralıkta da aynı: sondaki gün yoksa "sonuna kadar" boştur.
+        let e = load(&ReplayOpts::new(tmp.path(), "20240401-")).expect_err("bos");
+        assert!(matches!(e, ReplayError::NoRecordingInRange { .. }), "{e:?}");
+        assert!(e.to_string().contains("kayittaki son gun"), "{e}");
+
+        // Dizin hiç yoksa hata dizinin kendisi hakkında olmalı.
+        let missing = tmp.path().join("yok");
+        assert!(matches!(
+            load(&ReplayOpts::new(&missing, "20240315-20240318")),
+            Err(ReplayError::NoDataDir(_))
+        ));
+    }
+
+    #[test]
+    fn an_open_ended_range_starts_where_asked_and_takes_everything_after() {
+        let tmp = Tmp::new("openrange");
+        lay_out_days(tmp.path(), "mt5-1", &[(14, &[9.0]), (15, &[1.0]), (18, &[2.0])]);
+
+        let mut opts = ReplayOpts::new(tmp.path(), "20240315-");
+        opts.speed = 0.0;
+        let r = load(&opts).unwrap();
+        assert_eq!(
+            r.days,
+            vec!["20240315".to_string(), "20240318".to_string()],
+            "baslangictan ONCEKI gun alinmamali"
+        );
+        let (evs, _, _) = play_all(&r);
+        let ticks: Vec<FeedEvent> =
+            evs.into_iter().filter(|e| matches!(e, FeedEvent::Tick { .. })).collect();
+        assert_eq!(bids_of(&ticks), vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn the_hello_span_covers_the_whole_range_not_just_one_day() {
+        // `hello.replay_from_ms` / `replay_to_ms` istemcinin "ne kadarlık bir
+        // kayıt dinliyorum" sorusunun tek cevabı; tek günü söylemek yalan olurdu.
+        let tmp = Tmp::new("rangespan");
+        lay_out_days(tmp.path(), "mt5-1", &[(15, &[1.0, 2.0]), (18, &[3.0, 4.0])]);
+
+        let mut opts = ReplayOpts::new(tmp.path(), "20240315-20240318");
+        opts.speed = 0.0;
+        let r = load(&opts).unwrap();
+
+        let (_, fri) = march(15);
+        let (_, mon) = march(18);
+        assert_eq!(
+            r.span(),
+            (fri + 12 * 3_600_000, mon + 12 * 3_600_000 + 1_000),
+            "kapsam ILK gunun ilk tick'inden SON gunun son tick'ine olmali"
+        );
+    }
+
+    #[test]
+    fn the_symbol_table_is_reloaded_for_every_day_because_ids_can_change() {
+        // ASIL TUZAK: `symbol_id` günler arasında AYNI KALMAK ZORUNDA DEĞİL.
+        // Dünün tablosunu taşımak, bugünün tick'lerine yanlış sembol adı
+        // yapıştırmak olurdu — ve bu hiçbir hata vermeden, sessizce.
+        let tmp = Tmp::new("symperday");
+        let (d1, ms1) = march(15);
+        let (d2, ms2) = march(18);
+        // İki günde kimlikler TAKAS EDİLMİŞ.
+        lay_out_on(
+            tmp.path(),
+            "mt5-1",
+            &d1,
+            &[rec(ms1 + 1_000, ms1 + 1_000, 1.0, 0)],
+            &[SymbolSnapshot { at_ms: ms1, items: vec![item(0, "EURUSD"), item(1, "GOLD")] }],
+        );
+        lay_out_on(
+            tmp.path(),
+            "mt5-1",
+            &d2,
+            &[rec(ms2 + 1_000, ms2 + 1_000, 2.0, 0)],
+            &[SymbolSnapshot { at_ms: ms2, items: vec![item(0, "GOLD"), item(1, "EURUSD")] }],
+        );
+
+        let mut opts = ReplayOpts::new(tmp.path(), "20240315-20240318");
+        opts.speed = 0.0;
+        let (evs, _) = play_ticks(&load(&opts).unwrap());
+        let names: Vec<String> = evs.iter().map(|e| tick_fields(e).1).collect();
+        assert_eq!(
+            names,
+            vec!["EURUSD".to_string(), "GOLD".to_string()],
+            "her gun KENDI tablosuyla isimlendirilmeli"
+        );
+    }
+
+    #[test]
+    fn the_day_window_is_applied_to_every_day_of_the_range() {
+        // `--replay-from 09:00 --replay-to 11:00` bir aralıkta "her günün
+        // 09:00-11:00'i" demektir; aralığın tamamına tek pencere uygulamak
+        // ikinci günü baştan sona düşürürdü.
+        let tmp = Tmp::new("rangewindow");
+        for dom in [15u32, 18] {
+            let (date, day_ms) = march(dom);
+            let ticks: Vec<TickRec> = [8i64, 10, 12]
+                .iter()
+                .map(|h| {
+                    rec(day_ms + h * 3_600_000, day_ms + h * 3_600_000, (dom as f64) + *h as f64, 0)
+                })
+                .collect();
+            lay_out_on(tmp.path(), "mt5-1", &date, &ticks, &[SymbolSnapshot {
+                at_ms: day_ms,
+                items: vec![item(0, "EURUSD")],
+            }]);
+        }
+
+        let mut opts = ReplayOpts::new(tmp.path(), "20240315-20240318");
+        opts.speed = 0.0;
+        opts.from = Some("09:00".into());
+        opts.to = Some("11:00".into());
+        let (evs, _) = play_ticks(&load(&opts).unwrap());
+        assert_eq!(bids_of(&evs), vec![25.0, 28.0], "her gunden yalniz 10:00 tick'i");
+    }
+
+    #[test]
+    fn the_end_is_announced_only_after_the_last_day_never_between_days() {
+        // ASIL NOKTA: `replay_done` gün başına gitseydi, 66 günlük bir
+        // backtest istemciye 66 kez "bitti" derdi ve istemci her seferinde
+        // durumunu sıfırlardı — yani gün-aşırı pozisyon yine test edilemezdi.
+        let tmp = Tmp::new("doneonce");
+        let (d1, ms1) = march(15);
+        let (d2, ms2) = march(18);
+        let table = |at: i64| vec![SymbolSnapshot { at_ms: at, items: vec![item(0, "EURUSD")] }];
+        // 1. gün 100 ms sürer, 2. gün 800 ms.
+        lay_out_on(
+            tmp.path(),
+            "mt5-1",
+            &d1,
+            &[rec(ms1, ms1, 1.0, 0), rec(ms1 + 100, ms1 + 100, 2.0, 0)],
+            &table(ms1),
+        );
+        lay_out_on(
+            tmp.path(),
+            "mt5-1",
+            &d2,
+            &[rec(ms2, ms2, 3.0, 0), rec(ms2 + 800, ms2 + 800, 4.0, 0)],
+            &table(ms2),
+        );
+
+        let mut opts = ReplayOpts::new(tmp.path(), "20240315-20240318");
+        // Gerçek zamana yakın: gün 2'nin oynatımı ölçülebilir bir süre sürsün.
+        opts.speed = 2.0;
+        let r = load(&opts).unwrap();
+
+        let registry = Arc::new(Registry::new());
+        let candles = Arc::new(Mutex::new(CandleStore::new()));
+        let (tx, mut rx) = broadcast::channel(64);
+        // Gönderen `Arc` içinde: oynatım thread'i bitince kanal KAPANMASIN,
+        // yoksa `has_changed()` "gönderen gitti" diye hata döner ve testin
+        // asıl sorusu (kaç kez duyuruldu) cevapsız kalır.
+        let dtx = Arc::new(watch::channel(None).0);
+        let mut drx = dtx.subscribe();
+        let probe_rx = dtx.subscribe();
+        let thread_tx = dtx.clone();
+
+        let h = std::thread::spawn(move || play(&r, &registry, &candles, &tx, &thread_tx, None));
+
+        // 1. günün İKİ tick'ini bekle — "gün 1 bitti" anını böyle biliyoruz.
+        let mut seen = 0;
+        while seen < 2 {
+            if let Ok(FeedEvent::Tick { .. }) = rx.blocking_recv() {
+                seen += 1;
+            }
+        }
+        // Gün 2 daha ~400 ms sürecek (gunler arasi kirpilmis bekleme dahil);
+        // bu pencerede bitiş duyurulmuş OLMAMALI.
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            probe_rx.borrow().is_none(),
+            "bitis gun 1'in sonunda DUYURULMAMALI — yalnizca araligin sonunda"
+        );
+
+        let end = h.join().unwrap();
+        assert_eq!(end.ticks, 4, "aralik boyunca 4 tick");
+        assert!(drx.has_changed().unwrap(), "bitis duyurulmali");
+        assert_eq!(*drx.borrow_and_update(), Some(end));
+        assert!(!drx.has_changed().unwrap(), "bitis TAM BIR KEZ duyurulmali");
+    }
+
+    #[test]
+    fn the_gap_between_days_is_clipped_but_a_gap_inside_a_day_is_not() {
+        // Cuma 23:58 → Pazartesi 01:00 farkı ~49 SAAT. Kırpılmasaydı
+        // `--replay-speed 1` ile oynatım 49 saat uyurdu ve çok günlü replay
+        // pratikte kullanılamazdı.
+        let tmp = Tmp::new("gapclip");
+        let (d1, ms1) = march(15);
+        let (d2, ms2) = march(18);
+        let table = |at: i64| vec![SymbolSnapshot { at_ms: at, items: vec![item(0, "EURUSD")] }];
+        let fri = ms1 + 23 * 3_600_000 + 58 * 60_000;
+        let mon = ms2 + 3_600_000;
+        lay_out_on(tmp.path(), "mt5-1", &d1, &[rec(fri, fri, 1.0, 0)], &table(ms1));
+        lay_out_on(tmp.path(), "mt5-1", &d2, &[rec(mon, mon, 2.0, 0)], &table(ms2));
+        assert!(mon - fri > 48 * 3_600_000, "test kurulumu 48 saatten uzun bir bosluk kurmali");
+
+        let mut opts = ReplayOpts::new(tmp.path(), "20240315-20240318");
+        opts.speed = 1.0;
+        let r = load(&opts).unwrap();
+        let t0 = Instant::now();
+        let (evs, _) = play_ticks(&r);
+        let took = t0.elapsed();
+        assert_eq!(bids_of(&evs), vec![1.0, 2.0]);
+        assert!(took < Duration::from_secs(4), "49 saatlik bosluk kirpilmali: {took:?}");
+        assert!(
+            took >= Duration::from_millis(800),
+            "kirpma tavani {REPLAY_GAP_MAX_MS} ms; bekleme tamamen kaldirilmis: {took:?}"
+        );
+
+        // Gün İÇİNDEKİ boşluk GERÇEK piyasa sessizliğidir ve kırpılmaz.
+        let tmp = Tmp::new("gapinside");
+        let inside = ms1 + 9 * 3_600_000;
+        lay_out_on(
+            tmp.path(),
+            "mt5-1",
+            &d1,
+            &[rec(inside, inside, 1.0, 0), rec(inside + 1_200, inside + 1_200, 2.0, 0)],
+            &table(ms1),
+        );
+        let mut opts = ReplayOpts::new(tmp.path(), DATE);
+        opts.speed = 1.0;
+        let t0 = Instant::now();
+        let (evs, _) = play_ticks(&load(&opts).unwrap());
+        let took = t0.elapsed();
+        assert_eq!(evs.len(), 2);
+        assert!(
+            took >= Duration::from_millis(1_100),
+            "gun ICINDEKI 1200 ms bosluk KIRPILMAMALI: {took:?}"
+        );
+    }
+
+    #[test]
+    fn the_whole_range_is_never_resident_in_memory_at_once() {
+        // ASIL NOKTA: 66 gün = 1,15 GB ve 25,8 milyon kayıt. Hepsini birden
+        // yüklemek kabul edilemez. Bunu bir yorumla değil ÖLÇEREK sabitliyoruz:
+        // `Recording`e bir `items` alanı eklemek diğer tüm testleri yeşil
+        // bırakır, bellek patlaması ancak üretimde görülürdü.
+        let tmp = Tmp::new("mem");
+        let per_day: Vec<f64> = (0..100).map(|i| 1.0 + i as f64).collect();
+        let days: Vec<(u32, &[f64])> =
+            [11u32, 12, 13, 14, 15, 18, 19, 20].iter().map(|d| (*d, &per_day[..])).collect();
+        lay_out_days(tmp.path(), "mt5-1", &days);
+
+        let mut opts = ReplayOpts::new(tmp.path(), "20240311-20240320");
+        opts.speed = 0.0;
+        let r = load(&opts).unwrap();
+        assert_eq!(r.day_count(), 8);
+
+        // Kapsam ölçümü de gün yükler; sayacı oynatımdan HEMEN önce sıfırla.
+        probe::reset();
+        let (evs, _, end) = play_all(&r);
+        let (peak_days, peak_ticks) = probe::peak();
+
+        assert_eq!(end.ticks, 800, "8 gun x 100 tick oynatilmali");
+        assert_eq!(
+            evs.iter().filter(|e| matches!(e, FeedEvent::Tick { .. })).count(),
+            800
+        );
+        assert_eq!(peak_days, 1, "ayni anda YALNIZCA bir gun bellekte olmali");
+        assert_eq!(peak_ticks, 100, "ayni anda yalnizca bir gunun tick'leri bellekte olmali");
+    }
+
+    #[test]
+    fn date_specs_parse_into_a_day_or_a_range() {
+        assert_eq!(parse_date_spec("20260513").unwrap(), DateSpec::Day("20260513".into()));
+        assert_eq!(
+            parse_date_spec("20260513-20260812").unwrap(),
+            DateSpec::Range { start: "20260513".into(), end: Some("20260812".into()) }
+        );
+        assert_eq!(
+            parse_date_spec("20260513-").unwrap(),
+            DateSpec::Range { start: "20260513".into(), end: None }
+        );
+        // Tek günlük aralık geçerli: `20260513-20260513`.
+        assert!(parse_date_spec("20260513-20260513").is_ok());
+        assert_eq!(parse_date_spec("20260513-20260812").unwrap().start(), "20260513");
+    }
+
+    #[test]
+    fn malformed_range_specs_are_rejected_loudly() {
+        // Sessizce ilk parçayı gün saymak, İSTENMEYEN bir günü oynatmak
+        // olurdu ve sonuç doğru görünürdü.
+        for s in [
+            "20260513-20260812-20260901", // fazladan ayirici
+            "-20260812",                  // baslangic yok
+            "2026051-20260812",           // kisa baslangic
+            "20260513-2026081",           // kisa bitis
+            "20260513-20261332",          // takvimde olmayan bitis
+            "-",                          // ikisi de yok
+        ] {
+            let e = parse_date_spec(s).expect_err("kabul edilmemeliydi: {s}");
+            assert!(matches!(e, ReplayError::BadDateSpec(_)), "{s}: {e:?}");
+            let msg = e.to_string();
+            assert!(msg.contains("--replay-date"), "{s}: hangi bayrak oldugu soylenmeli: {msg}");
+            assert!(msg.contains("20260513-20260812"), "{s}: kabul edilenler yazilmali: {msg}");
+        }
+
+        // Ters aralık AYRI bir hata: biçim doğru, anlam yanlış.
+        let e = parse_date_spec("20260812-20260513").expect_err("ters aralik");
+        assert!(matches!(e, ReplayError::BadDateRange { .. }), "{e:?}");
+        let msg = e.to_string();
+        assert!(msg.contains("--replay-date"), "{msg}");
+        assert!(msg.contains("20260812-20260513"), "verilen deger yazilmali: {msg}");
+
+        // Ayırıcısız bozuk tarih ESKİ hatasını korumalı.
+        assert!(matches!(parse_date_spec("2024031"), Err(ReplayError::BadDate(_))));
+        assert!(matches!(parse_date_spec(""), Err(ReplayError::BadDate(_))));
+    }
+
+    #[test]
+    fn recorded_days_are_discovered_across_every_instance_in_order() {
+        let tmp = Tmp::new("days");
+        lay_out_days(tmp.path(), "brokerA", &[(15, &[1.0]), (18, &[2.0])]);
+        lay_out_days(tmp.path(), "brokerB", &[(14, &[3.0]), (18, &[4.0])]);
+        assert_eq!(
+            discover_days(tmp.path()).unwrap(),
+            vec!["20240314".to_string(), "20240315".to_string(), "20240318".to_string()],
+            "gunler birlestirilmis, tekillestirilmis ve KRONOLOJIK olmali"
+        );
+    }
+
+    #[test]
+    fn several_instances_still_merge_by_arrival_on_every_day_of_the_range() {
+        // Çoklu örnek desteği aralıkta da GÜN BAŞINA çalışmalı; bir örnek
+        // aralığın ortasında kayda başlamış olabilir.
+        let tmp = Tmp::new("rangemulti");
+        let (d1, ms1) = march(15);
+        let (d2, ms2) = march(18);
+        let table = |at: i64| vec![SymbolSnapshot { at_ms: at, items: vec![item(0, "EURUSD")] }];
+        // 1. günde yalnız brokerA var; 2. günde ikisi de.
+        lay_out_on(tmp.path(), "mt5-a", &d1, &[rec(ms1 + 100, ms1 + 100, 1.0, 0)], &table(ms1));
+        lay_out_on(
+            tmp.path(),
+            "mt5-a",
+            &d2,
+            &[rec(ms2 + 100, ms2 + 100, 2.0, 0), rec(ms2 + 300, ms2 + 300, 4.0, 0)],
+            &table(ms2),
+        );
+        lay_out_on(
+            tmp.path(),
+            "mt5-b",
+            &d2,
+            &[rec(ms2 + 200, ms2 + 200, 3.0, 0)],
+            &table(ms2),
+        );
+
+        let mut opts = ReplayOpts::new(tmp.path(), "20240315-20240318");
+        opts.speed = 0.0;
+        let r = load(&opts).unwrap();
+        // Örnek listesi TÜM günlerin birleşimi: `hello.instances` oynatım
+        // boyunca sabit kalmalı.
+        assert_eq!(r.instances, vec!["mt5-a".to_string(), "mt5-b".to_string()]);
+
+        let (evs, _) = play_ticks(&r);
+        let got: Vec<(String, f64)> =
+            evs.iter().map(|e| (tick_fields(e).0, tick_fields(e).2)).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("mt5-a".to_string(), 1.0),
+                ("mt5-a".to_string(), 2.0),
+                ("mt5-b".to_string(), 3.0),
+                ("mt5-a".to_string(), 4.0),
+            ],
+            "gun basina varis sirasina gore birlestirilmeli"
+        );
     }
 }

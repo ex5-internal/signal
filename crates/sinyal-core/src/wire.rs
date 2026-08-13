@@ -344,6 +344,22 @@ pub enum ServerMsg {
         /// boşsa gönderilmez.
         #[serde(skip_serializing_if = "Option::is_none")]
         last_ms: Option<i64>,
+        /// Oynatılması PLANLANAN gün sayısı (aralıktaki kayıtlı gün sayısı).
+        days: u32,
+        /// Gerçekten oynatılan gün sayısı. `days` ile eşit değilse oynatım
+        /// yarıda kesilmiştir.
+        days_played: u32,
+        /// **Aralık yarıda kesildi**: bir gün okunamadı ve sonrası
+        /// oynatılmadı.
+        ///
+        /// Bu bayrak olmadan kesinti tel üzerinde GÖRÜNMEZDİ: istemci normal
+        /// bir `replay_done` görür ve 3 aylık sandığı bir backtest'i tek
+        /// günün sonucuyla raporlardı. Sessiz kesinti, yanlış sonucu doğru
+        /// sanmak demektir; bu yüzden AÇIKÇA ilan ediliyor.
+        ///
+        /// Normal (kesintisiz) bitişte alan hiç gönderilmez.
+        #[serde(skip_serializing_if = "is_false")]
+        truncated: bool,
     },
 
     /// İstemci yavaş kaldı ve mesaj atlandı.
@@ -807,14 +823,48 @@ mod tests {
         let j = serde_json::to_string(&ServerMsg::ReplayDone {
             ticks: 1234,
             last_ms: Some(1_700_000_000_123),
+            days: 66,
+            days_played: 66,
+            truncated: false,
         })
         .unwrap();
         assert!(j.contains(r#""t":"replay_done""#), "{j}");
         assert!(j.contains(r#""ticks":1234"#));
         assert!(j.contains(r#""last_ms":1700000000123"#));
+        // Gün sayıları HER ZAMAN gider: istemci kaç günlük bir kapsam
+        // oynatıldığını saymak zorunda kalmamalı.
+        assert!(j.contains(r#""days":66"#), "{j}");
+        assert!(j.contains(r#""days_played":66"#), "{j}");
+        // Kesintisiz bitişte bayrak HİÇ görünmez; alanın varlığı kötü haberdir.
+        assert!(!j.contains("truncated"), "saglam bitiste bayrak olmamali: {j}");
 
-        let j = serde_json::to_string(&ServerMsg::ReplayDone { ticks: 0, last_ms: None }).unwrap();
+        let j = serde_json::to_string(&ServerMsg::ReplayDone {
+            ticks: 0,
+            last_ms: None,
+            days: 0,
+            days_played: 0,
+            truncated: false,
+        })
+        .unwrap();
         assert!(!j.contains("last_ms"), "bos kapsamda son zaman uydurulmaz: {j}");
+    }
+
+    #[test]
+    fn a_truncated_replay_says_so_on_the_wire() {
+        // Bir gün okunamayıp oynatım yarıda kesildiğinde istemci NORMAL bir
+        // `replay_done` görüyordu ve 3 aylık sandığı bir backtest'i tek günün
+        // sonucuyla raporlayabilirdi. Sessiz kesinti = sessizce yanlış sonuç.
+        let j = serde_json::to_string(&ServerMsg::ReplayDone {
+            ticks: 163,
+            last_ms: Some(1_786_363_257_689),
+            days: 3,
+            days_played: 1,
+            truncated: true,
+        })
+        .unwrap();
+        assert!(j.contains(r#""truncated":true"#), "kesinti ILAN EDILMELI: {j}");
+        assert!(j.contains(r#""days":3"#), "{j}");
+        assert!(j.contains(r#""days_played":1"#), "{j}");
     }
 
     #[test]
