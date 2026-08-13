@@ -309,22 +309,49 @@ Bilinmesi gerekenler:
 - Stop'u sonradan **değiştirmek** için (trailing vb.) yine `modify_sltp`
   kullanılır; o yolda doğrulama devrededir.
 
-### ⚠️ `expiration` TEK BAŞINA GÖNDERİLİRSE YOK SAYILIR
-
-Bu sessiz bir tuzak ve emri **sonsuza kadar bekleyen emir olarak bırakır**.
-Çalışması için `time` alanı da **zorunludur**:
+### ⏱️ Süreli emir: `expire_sn` kullanın, `expiration` bir tuzaktır
 
 ```json
 {"op":"order","id":"x-1","action":"pending","type":"buy_limit",
- "symbol":"GOLD","volume":0.01,"price":4388.20,
- "time":"specified","expiration":1786492800}
+ "symbol":"GOLD","volume":0.01,"price":4331.49,"expire_sn":120}
 ```
 
-- `time` verilmezse varsayılan `gtc` olur ve EA `expiration`'ı **hiç
-  atamaz** — hata da vermez, emir kalıcı olur ve istemci bunu telden
-  anlayamaz.
-- **`expiration` birimi MUTLAK epoch SANİYEDİR**, göreli değil. "120 saniye
-  sonra dolsun" için `şimdi + 120` göndermelisiniz.
+`expire_sn` = **kaç saniye sonra düşsün**. `time` vermenize gerek yok,
+`specified` varsayılır. Saat dilimi hesabını köprü yapar.
+
+#### Neden ham `expiration` tehlikeli — ÖLÇÜLDÜ
+
+MT5 `expiration` alanını **broker sunucu saati** sayar. Gerçek UTC epoch
+göndermek (sunucu UTC+3):
+
+| gönderilen | sonuç |
+|---|---|
+| `UTC + 120 sn` | **`retcode 10022`** — emir hiç kurulmaz |
+| `UTC + 1 gün` | **kabul edilir ama 3 saat ERKEN dolar**, sessizce |
+
+İkincisi gürültü çıkarmadığı için tehlikelidir. `expire_sn` bu sınıfı tamamen
+ortadan kaldırır.
+
+#### Artık sessizce yok sayılmıyor
+
+Aşağıdakiler **açık hatayla reddedilir** (eskiden `expiration` sessizce düşer,
+emir sonsuza kadar beklerdi):
+
+- `expiration` verilip `time` verilmemesi
+- `expire_sn` ile `expiration`ın birlikte gönderilmesi
+- `expire_sn` ile `time: "gtc"`/`"day"` çelişkisi
+
+#### Süre DAKİKAYA yuvarlanır — istenenden fazla olur, asla az olmaz
+
+MT5 son kullanmayı dakika sınırına kırpar. Aşağı yuvarlamak istenenden **az**
+süre vermek olurdu; köprü **yukarı** yuvarlar.
+
+`expire_sn: 120` için ölçülen gerçek ömür: **151 sn** (120 ≤ ömür < 180).
+Kesin saniye gerekiyorsa emri kendiniz iptal edin; `expire_sn` bir **taban**
+garantisidir, kesin süre değil.
+
+> Ham `expiration` hâlâ kabul ediliyor ama **broker saatinde** verilmeli ve
+> `time: "specified"` şart. Yeni kodda kullanmayın.
 
 Süre dolduğunda **`{"t":"order","kind":"expired"}` gelir** ve biletin
 düştüğünü anlarsınız. Ayrıca `{"op":"orders"}` ile de doğrulayabilirsiniz.

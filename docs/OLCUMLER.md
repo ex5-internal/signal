@@ -427,6 +427,109 @@ PID 44396  REPLAY  0.0.0.0:8788   --replay-date 20260812 --replay-speed 1000
 
 ---
 
+## 10. Kayıt dosyası `time_msc`'e göre SIRALI DEĞİL
+
+Tüketici sistem bildirdi, doğrulandı ve **onların ölçtüğünden büyük çıktı**.
+`ticks-20260812.bin`, 541.771 kayıt:
+
+```
+recv_ms  gore geri sicrama:        0     -> dosya recv_ms'e gore SIRALI
+time_msc gore geri sicrama:   80.428     -> en buyuk sicrama TAM 3.00 saat
+```
+
+Onlar 31.543 demişti (yalnız GOLD); tüm sembollerde **80.428**.
+
+Dosyada **iki kayıt grubu** var:
+
+| grup | kayıt | oran | kaynak |
+|---|---|---|---|
+| `recv−time_msc = 0` | 189.300 | %34,9 (hepsi GOLD) | geri doldurma |
+| `recv−time_msc ≈ −3sa` | 352.471 | %65,1 | canlı kayıt |
+
+**Kök sebep bizde:** geri doldurma `recv_ms` alanına **broker saatini** yazıyor
+(`backfill.rs:16-22`, bilinen ve belgeli bir karar), canlı kayıt ise gerçek UTC
+alım zamanını. Birleştirme `recv_ms`'e göre sıralıyor. Aynı piyasa anı için
+canlı kaydın `recv_ms`'i 3 saat küçük olduğundan, `recv_ms` sıralaması iki
+grubu **`time_msc` ekseninde iç içe geçiriyor**.
+
+Belgede bunun **tempo** etkisi yazılıydı; **`time_msc`'in monoton olmaktan
+çıktığı** yazılı değildi. Asıl zarar veren bu: `time_msc`'e göre sıralamadan
+bar kuran biri, kovalara doğru düşen ama `close`'u yanlış tick'ten alan barlar
+üretir. Sessiz ve fark edilmesi zor.
+
+**Tüketici için kural:** ham dosyadan ya da replay'den bar kurarken
+**`time_msc`'e göre sıralayın**. Dosya sırası piyasa sırası değildir.
+
+Kalıcı çözüm (yapılmadı): geri doldurma `recv_ms`'e gerçek UTC karşılığını
+yazsın, ya da kaydın kaynağı `flags` ile bildirilsin.
+
+---
+
+## 11. `stops_level` tabloda `0` ama gerçekte ~20–25 point
+
+Açık pozisyona SL kademeli yaklaştırılarak ölçüldü:
+
+```
+mesafe 25 point -> kabul
+mesafe 20 point -> RED 10016
+```
+
+**`stops_level: 0` "sınır yok" demek değildir** — broker dinamik bir eşik
+uyguluyor. Eşik spread'in (55 point) kabaca yarısına denk geliyor ama bu bir
+kural olarak doğrulanmadı.
+
+> Ölçümün zayıf yanı: 20 point altındaki denemeler `10013` döndürdü (fiyat
+> oynadığı için SL yanlış tarafa geçmişti), yani eşikte **tek** temiz örnek
+> var. Kesin sayı gerekiyorsa sabit fiyatlı bir turla yeniden ölçülmeli.
+
+Pratik öneri: limit/stop fiyatlarını piyasadan **en az 30 point** uzak tutun.
+
+---
+
+## 12. Süreli emir: `expiration` broker saatinde, `expire_sn` eklendi
+
+| gönderilen `expiration` | sonuç |
+|---|---|
+| `UTC + 120 sn` | **`retcode 10022`** (INVALID_EXPIRATION) |
+| `UTC + 10800 + 120` | kabul |
+| `UTC + 86400` | kabul — **3 saat ERKEN dolar, sessizce** |
+
+MT5 alanı **sunucu saati** sayıyor. Kabul edilen emrin telden dönen hâli
+mekanizmayı doğruluyor: `time_setup_msc` ile o andaki gerçek UTC arasındaki
+fark **10.809 sn = 3 saat**.
+
+Çözüm olarak `expire_sn` (göreli saniye) eklendi. Köprü broker saatini **son
+tick'ten** okur ve mutlak damgayı kendisi hesaplar.
+
+**İki kusur ölçümle bulundu ve düzeltildi:**
+
+1. **Bayat tick.** İlk sürüm tick damgasını doğrudan "şu an" saydı. 21 sn
+   bayat bir tick, 120 sn istenen emri 99 sn'ye düşürdü. Artık tick'in
+   `recv_ms`'i ile yerel saat farkı ekleniyor.
+2. **Dakikaya kırpma.** MT5 son kullanmayı dakika sınırına **aşağı** yuvarlıyor
+   — 120 sn istenen emir 72 sn yaşadı. Aşağı yuvarlamak sessizce eksik teslim
+   etmektir; köprü artık **yukarı** yuvarlıyor. Ölçülen sonuç: `expire_sn: 120`
+   → gerçek ömür **151 sn** (120 ≤ ömür < 180).
+
+`expire_sn` bir **taban** garantisidir, kesin süre değil.
+
+### `{"kind":"expired"}` ÜRETİLİYOR — doğrulandı
+
+```
+kind=expired  ret=0  order=946117963  state=6  txn=2
+```
+
+`state=6` (`ORDER_STATE_EXPIRED`), `txn=2` (`ORDER_DELETE`). Süre dolduğu anda
+geldi.
+
+### Sessiz yok saymanın sonu
+
+Üç hatalı kullanım artık açık hatayla reddediliyor (canlıda doğrulandı):
+`expiration` + `time` yok · `expire_sn` + `expiration` birlikte ·
+`expire_sn` + `time:"gtc"`.
+
+---
+
 ## Henüz ÖLÇÜLMEMİŞ — bunlara güvenme
 
 Aşağıdakiler kodda yazılı ama **canlıda doğrulanmadı**. Sinyal sistemine

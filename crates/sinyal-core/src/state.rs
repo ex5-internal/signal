@@ -17,6 +17,14 @@ pub struct LastTick {
     pub last: f64,
     /// Broker sunucu saati, epoch ms.
     pub time_msc: i64,
+    /// Bu tick'in BİZE ulaştığı an — yerel saat, epoch ms.
+    ///
+    /// [`Registry::update_last`] doldurur; çağıranın verdiği değer yok
+    /// sayılır. İki saat arasındaki farkı (ölçüldü: 3 saat) taşımak için
+    /// gerekli: broker saatini "şu an" olarak kullanmak isteyen bir yer,
+    /// tick'in ne kadar bayat olduğunu bilmeden yanılır. Sessiz sembollerde
+    /// son tick dakikalarca eski olabilir.
+    pub recv_ms: i64,
 }
 
 /// Tek bir örneğin (broker/terminal) durumu.
@@ -89,7 +97,13 @@ impl Registry {
         g.entry(instance.to_owned()).or_default().set_symbols(entries);
     }
 
-    pub fn update_last(&self, instance: &str, id: u32, t: LastTick) {
+    /// Son fiyatı güncelle. `t.recv_ms` **burada** damgalanır — çağıranın
+    /// verdiği değer yok sayılır, çünkü tek doğru an bu çağrının anıdır.
+    pub fn update_last(&self, instance: &str, id: u32, mut t: LastTick) {
+        t.recv_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
         let mut g = self.inner.write().unwrap_or_else(|e| e.into_inner());
         if let Some(st) = g.get_mut(instance) {
             st.last.insert(id, t);
@@ -131,6 +145,18 @@ impl Registry {
     pub fn symbol(&self, instance: &str, id: u32) -> Option<SymbolEntry> {
         let g = self.inner.read().unwrap_or_else(|e| e.into_inner());
         g.get(instance)?.symbol(id).copied()
+    }
+
+    /// Tek bir sembolün son fiyatı — **broker saatinin de kaynağıdır**.
+    ///
+    /// `LastTick::time_msc` broker sunucu saatidir. Yerel saatten türetilen
+    /// bir damga buranın yerine geçemez: ölçüldü, aradaki fark bu kurulumda
+    /// 3 saat (bkz. `docs/OLCUMLER.md`). Son kullanma damgası hesaplanırken
+    /// yerel saat kullanmak, emri ya reddettirir ya da sessizce erken
+    /// düşürürdü.
+    pub fn last_of(&self, instance: &str, id: u32) -> Option<LastTick> {
+        let g = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        g.get(instance)?.last.get(&id).copied()
     }
 
     /// Bir örneğin durum görüntüsünü güncelle (okuyucu thread'i çağırır).
@@ -271,8 +297,8 @@ mod tests {
             "mt5-1",
             vec![entry(0, "EURUSD", sym_flag::READY), entry(1, "OLU", 0)],
         );
-        r.update_last("mt5-1", 0, LastTick { bid: 1.1, ask: 1.2, last: 0.0, time_msc: 100 });
-        r.update_last("mt5-1", 1, LastTick { bid: 9.9, ask: 9.9, last: 0.0, time_msc: 100 });
+        r.update_last("mt5-1", 0, LastTick { bid: 1.1, ask: 1.2, last: 0.0, time_msc: 100 , recv_ms: 0});
+        r.update_last("mt5-1", 1, LastTick { bid: 9.9, ask: 9.9, last: 0.0, time_msc: 100 , recv_ms: 0});
 
         let snap = r.snapshot(&[]);
         assert_eq!(snap.len(), 1, "yalnız READY sembol dönmeli");
@@ -286,8 +312,8 @@ mod tests {
             "mt5-1",
             vec![entry(0, "EURUSD", sym_flag::READY), entry(1, "GBPUSD", sym_flag::READY)],
         );
-        r.update_last("mt5-1", 0, LastTick { bid: 1.1, ask: 1.2, last: 0.0, time_msc: 1 });
-        r.update_last("mt5-1", 1, LastTick { bid: 1.3, ask: 1.4, last: 0.0, time_msc: 1 });
+        r.update_last("mt5-1", 0, LastTick { bid: 1.1, ask: 1.2, last: 0.0, time_msc: 1 , recv_ms: 0});
+        r.update_last("mt5-1", 1, LastTick { bid: 1.3, ask: 1.4, last: 0.0, time_msc: 1 , recv_ms: 0});
 
         let snap = r.snapshot(&["GBPUSD".to_string()]);
         assert_eq!(snap.len(), 1);
@@ -300,7 +326,7 @@ mod tests {
         // istemcilere gereksiz bir "veri yok" penceresi yaşatırdı.
         let r = Registry::new();
         r.set_symbols("mt5-1", vec![entry(0, "EURUSD", sym_flag::READY)]);
-        r.update_last("mt5-1", 0, LastTick { bid: 1.1, ask: 1.2, last: 0.0, time_msc: 5 });
+        r.update_last("mt5-1", 0, LastTick { bid: 1.1, ask: 1.2, last: 0.0, time_msc: 5 , recv_ms: 0});
 
         r.set_symbols(
             "mt5-1",

@@ -292,7 +292,7 @@ fn reader_loop(
                 registry.update_last(
                     &instance,
                     t.symbol_id,
-                    LastTick { bid: t.bid, ask: t.ask, last: t.last, time_msc: t.time_msc },
+                    LastTick { bid: t.bid, ask: t.ask, last: t.last, time_msc: t.time_msc , recv_ms: 0},
                 );
                 let sym: Arc<str> = Arc::from(name.as_str());
 

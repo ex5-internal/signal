@@ -155,9 +155,35 @@ pub struct OrderReq {
     #[serde(default)]
     pub time: String,
 
-    /// `time` = `specified*` ise epoch saniye.
+    /// `time` = `specified*` ise epoch saniye — **BROKER saatinde**.
+    ///
+    /// # Bu alan bir tuzaktır; `expire_sn` kullanın
+    ///
+    /// MT5 bu değeri **sunucu saati** olarak yorumlar. Gerçek UTC epoch
+    /// göndermek ÖLÇÜLDÜ (2026-08-13, sunucu UTC+3):
+    ///
+    /// - `UTC + 120 sn` → `retcode 10022` ile **reddedilir**
+    /// - `UTC + 1 gün` → **kabul edilir ama 3 saat ERKEN dolar**, sessizce
+    ///
+    /// İkinci hâli gürültü çıkarmadığı için tehlikelidir. Bu yüzden
+    /// [`OrderReq::expire_sn`] eklendi: göreli saniye verirsiniz, dönüşümü
+    /// köprü yapar, saat dilimi hiç gündeme gelmez.
+    ///
+    /// `time` verilmeden gönderilirse **hata döner** — eskiden sessizce yok
+    /// sayılırdı ve emir sonsuza kadar bekleyen emir olarak kalırdı.
     #[serde(default)]
     pub expiration: i64,
+
+    /// Emrin **kaç saniye sonra** düşeceği. `0` = kullanılmıyor.
+    ///
+    /// [`OrderReq::expiration`]'ın saat dilimi tuzağını ortadan kaldırır:
+    /// köprü broker saatini son tick'ten okur ve mutlak damgayı kendisi
+    /// hesaplar. `time` verilmemişse `specified` varsayılır.
+    ///
+    /// `expiration` ile **birlikte gönderilemez** — hangisinin kazandığı
+    /// belirsiz kalırdı.
+    #[serde(default)]
+    pub expire_sn: i64,
 
     /// `auto` (varsayılan) | `fok` | `ioc` | `return` | `boc`
     ///

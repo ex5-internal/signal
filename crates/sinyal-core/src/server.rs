@@ -1445,6 +1445,107 @@ fn submit_simple(
     dispatch(ctx, &instance, cmd, id)
 }
 
+/// Son kullanma damgasını çöz: `expire_sn` (göreli) → mutlak BROKER damgası.
+///
+/// # Neden bu fonksiyon var
+///
+/// MT5 `MqlTradeRequest.expiration` alanını **sunucu saati** olarak yorumlar.
+/// Gerçek UTC epoch göndermek ÖLÇÜLDÜ (2026-08-13, sunucu UTC+3):
+///
+/// ```text
+/// UTC + 120 sn   -> retcode 10022 (INVALID_EXPIRATION), emir HİÇ kurulmaz
+/// UTC + 1 gün    -> KABUL EDİLİR ama 3 saat ERKEN dolar, sessizce
+/// ```
+///
+/// İkincisi tehlikelidir: hata vermez, telde de görünmez. Bu yüzden köprü
+/// göreli saniyeyi kendisi çevirir ve broker saatini **son tick'ten** okur —
+/// yerel saatten türetmek aynı 3 saatlik hatayı geri getirirdi.
+///
+/// # Sessiz yok saymanın sonu
+///
+/// Eskiden `expiration` verilip `time` verilmediğinde alan **sessizce
+/// düşerdi**: emir GTC olarak sonsuza kadar bekler, istemci telden bunu
+/// anlayamazdı. Artık açık hata döner.
+fn resolve_expiry(
+    ctx: &Ctx,
+    req: &OrderReq,
+    tt: u8,
+    instance: &str,
+    symbol_id: u32,
+) -> Result<(u8, i64), String> {
+    let belirli = tt == type_time::SPECIFIED || tt == type_time::SPECIFIED_DAY;
+
+    if req.expire_sn != 0 {
+        if req.expiration != 0 {
+            return Err(
+                "expire_sn ile expiration BIRLIKTE gonderilemez: hangisinin \
+                 kazandigi belirsiz kalirdi. Goreli sure icin yalniz expire_sn kullan."
+                    .into(),
+            );
+        }
+        if req.expire_sn < 0 {
+            return Err("expire_sn negatif olamaz".into());
+        }
+        // `time` verilmemişse niyet açık: süreli emir. `gtc`/`day` ile
+        // birlikte gelmesi ise çelişkidir — sessizce birini seçmek yerine
+        // istemciye söylüyoruz.
+        let tt = if req.time.is_empty() {
+            type_time::SPECIFIED
+        } else if belirli {
+            tt
+        } else {
+            return Err(format!(
+                "expire_sn ile time={:?} celisiyor: sureli emir icin time \
+                 bos birakilmali ya da specified/specified_day olmali",
+                req.time
+            ));
+        };
+
+        // Broker saati YALNIZCA tick'ten gelir. Tick yoksa uyduramayız:
+        // yerel saatle hesaplamak ölçülmüş 3 saatlik hatayı geri getirirdi.
+        let Some(t) = ctx.registry.last_of(instance, symbol_id) else {
+            return Err(
+                "expire_sn icin broker saati bilinmiyor: bu sembolde henuz \
+                 tick gelmedi. Once tick akisini bekle ya da mutlak expiration ver."
+                    .into(),
+            );
+        };
+        if t.time_msc <= 0 {
+            return Err("expire_sn icin broker saati gecersiz (tick damgasi 0)".into());
+        }
+
+        // Tick BAYAT olabilir: sessiz bir sembolde son fiyat dakikalarca eski
+        // kalır. Damgayı olduğu gibi "şu an" saymak, o bayatlık kadar kısa bir
+        // ömür verirdi. ÖLÇÜLDÜ: 21 sn bayat tick, 120 sn istenen emri 99 sn'ye
+        // düşürdü. Yerel saatte geçen süreyi ekleyerek telafi ediyoruz.
+        let simdi = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let bayatlik = if t.recv_ms > 0 { (simdi - t.recv_ms).max(0) } else { 0 };
+        let broker_simdi = (t.time_msc + bayatlik) / 1000;
+
+        // MT5 son kullanmayı DAKİKAYA yuvarlar — ölçüldü: 120 sn istendi,
+        // broker 1786655700 yazdı (tam dakika). Aşağı yuvarlamak istenenden
+        // AZ süre vermek demek; sessizce eksik teslim etmektense yukarı
+        // yuvarlayıp istenenden biraz FAZLA veriyoruz.
+        let hedef = broker_simdi + req.expire_sn;
+        let hedef = hedef.div_euclid(60) * 60 + if hedef.rem_euclid(60) == 0 { 0 } else { 60 };
+        return Ok((tt, hedef));
+    }
+
+    if req.expiration != 0 && !belirli {
+        return Err(format!(
+            "expiration verildi ama time={:?}: MT5 bu alani yalnizca \
+             time=specified/specified_day iken okur, aksi halde emir GTC olarak \
+             SONSUZA KADAR bekler. time'i ayarla ya da expire_sn kullan.",
+            req.time
+        ));
+    }
+
+    Ok((tt, req.expiration))
+}
+
 fn submit_order(req: OrderReq, ctx: &Ctx) -> ServerMsg {
     let wire = match gate(ctx, &req.id) {
         Ok(w) => w,
@@ -1499,6 +1600,11 @@ fn submit_order(req: OrderReq, ctx: &Ctx) -> ServerMsg {
         _ => return rejected(ctx, &req.id, "gecersiz time"),
     };
 
+    let (tt, expiration) = match resolve_expiry(ctx, &req, tt, &instance, symbol_id) {
+        Ok(v) => v,
+        Err(e) => return rejected(ctx, &req.id, &e),
+    };
+
     // AUTO'yu burada da çözebiliyor muyuz? Çözemiyorsak EA de çözemez —
     // emri göndermeden reddetmek daha dürüst.
     if fill == filling::AUTO {
@@ -1516,7 +1622,7 @@ fn submit_order(req: OrderReq, ctx: &Ctx) -> ServerMsg {
         stoplimit: norm(req.stoplimit),
         sl: norm(req.sl),
         tp: norm(req.tp),
-        expiration: req.expiration,
+        expiration,
         symbol_id,
         deviation: if req.deviation > 0 { req.deviation } else { ctx.deviation },
         action: if is_pending { action::PENDING } else { action::DEAL },
@@ -2931,7 +3037,7 @@ mod tests {
         ctx.registry.update_last(
             "mt5-1",
             1,
-            crate::state::LastTick { bid, ask, last: 0.0, time_msc: 1_700_000_000_500 },
+            crate::state::LastTick { bid, ask, last: 0.0, time_msc: 1_700_000_000_500 , recv_ms: 0},
         );
     }
 
@@ -2972,7 +3078,7 @@ mod tests {
         ctx.registry.update_last(
             "aa-other",
             1,
-            crate::state::LastTick { bid: 2.0, ask: 2.00002, last: 0.0, time_msc: 1 },
+            crate::state::LastTick { bid: 2.0, ask: 2.00002, last: 0.0, time_msc: 1 , recv_ms: 0},
         );
 
         // ASIL İDDİA, `resolve_any`nin hangi örneği seçtiğinden BAĞIMSIZ
@@ -2995,6 +3101,121 @@ mod tests {
         );
     }
 
+    // -- son kullanma çözümü --------------------------------------------
+    //
+    // Bu mantığın sessizce bozulması pahalı: ölçüldü ki yanlış saat dilimi
+    // ya emri 10022 ile reddettirir ya da 3 saat ERKEN düşürür (sessizce).
+
+    fn expiry_req(time: &str, expiration: i64, expire_sn: i64) -> OrderReq {
+        OrderReq {
+            id: "x".into(),
+            action: "pending".into(),
+            symbol: "EURUSD".into(),
+            side: String::new(),
+            order_type: "buy_limit".into(),
+            volume: 0.01,
+            price: 1.0,
+            stoplimit: 0.0,
+            sl: 0.0,
+            tp: 0.0,
+            deviation: 0,
+            time: time.into(),
+            expiration,
+            expire_sn,
+            filling: String::new(),
+            comment: String::new(),
+        }
+    }
+
+    /// Broker saati 1 000 000 sn olan tek sembollü bir kayıt.
+    ///
+    /// `update_last` var olmayan bir örneği OLUŞTURMAZ (tick'ten örnek
+    /// türetmek yanlış olurdu), o yüzden önce sembol tablosu yazılıyor.
+    fn expiry_ctx() -> Ctx {
+        let ctx = ctx_with(None);
+        ctx.registry.set_symbols("mt5-1", Vec::new());
+        ctx.registry.update_last(
+            "mt5-1",
+            0,
+            crate::state::LastTick { bid: 1.0, ask: 1.1, last: 0.0, time_msc: 1_000_000_000 , recv_ms: 0},
+        );
+        ctx
+    }
+
+    #[test]
+    fn expire_sn_broker_saatinden_hesaplanir() {
+        let ctx = expiry_ctx();
+        let (tt, exp) =
+            resolve_expiry(&ctx, &expiry_req("", 0, 120), type_time::GTC, "mt5-1", 0).unwrap();
+        // Yerel saat DEĞİL, tick damgası taban alınmalı. Sonuç dakikaya
+        // YUKARI yuvarlanır (MT5 aşağı kırpıyor; eksik teslim etmemek için).
+        assert!(exp % 60 == 0, "dakika sinirina oturmali: {exp}");
+        assert!(
+            exp >= 1_000_000 + 120 && exp < 1_000_000 + 120 + 60,
+            "istenenden az olmamali, bir dakikadan fazla da tasmamali: {exp}"
+        );
+        assert_eq!(tt, type_time::SPECIFIED, "time bos birakilinca specified varsayilmali");
+    }
+
+    #[test]
+    fn expire_sn_tick_yoksa_uydurmaz() {
+        // Yerel saatle hesaplamak ÖLÇÜLMÜŞ 3 saatlik hatayı geri getirirdi;
+        // bilmiyorsak söylemek zorundayız.
+        let ctx = ctx_with(None);
+        let e = resolve_expiry(&ctx, &expiry_req("", 0, 120), type_time::GTC, "mt5-1", 0)
+            .expect_err("tick yokken basarili olmamali");
+        assert!(e.contains("broker saati"), "sebep soylenmeli: {e}");
+    }
+
+    #[test]
+    fn expire_sn_ile_expiration_birlikte_reddedilir() {
+        let ctx = expiry_ctx();
+        let e = resolve_expiry(&ctx, &expiry_req("specified", 123, 120), type_time::SPECIFIED, "mt5-1", 0)
+            .expect_err("ikisi birden kabul edilmemeli");
+        assert!(e.contains("BIRLIKTE"), "{e}");
+    }
+
+    #[test]
+    fn expire_sn_gtc_ile_celisir() {
+        let ctx = expiry_ctx();
+        let e = resolve_expiry(&ctx, &expiry_req("gtc", 0, 120), type_time::GTC, "mt5-1", 0)
+            .expect_err("gtc + expire_sn celiskisi sessiz gecmemeli");
+        assert!(e.contains("celisiyor"), "{e}");
+    }
+
+    #[test]
+    fn expiration_time_verilmeden_artik_sessizce_dusmez() {
+        // ESKİ DAVRANIŞ: alan sessizce yok sayılır, emir sonsuza kadar bekler
+        // ve istemci bunu telden anlayamazdı.
+        let ctx = expiry_ctx();
+        let e = resolve_expiry(&ctx, &expiry_req("", 1_000_500, 0), type_time::GTC, "mt5-1", 0)
+            .expect_err("sessiz yok sayma geri gelmemeli");
+        assert!(e.contains("SONSUZA KADAR"), "sonucu soylemeli: {e}");
+    }
+
+    #[test]
+    fn mutlak_expiration_specified_ile_gecer() {
+        let ctx = expiry_ctx();
+        let (tt, exp) = resolve_expiry(
+            &ctx,
+            &expiry_req("specified", 1_000_500, 0),
+            type_time::SPECIFIED,
+            "mt5-1",
+            0,
+        )
+        .unwrap();
+        assert_eq!(exp, 1_000_500, "mutlak damga oldugu gibi gecmeli");
+        assert_eq!(tt, type_time::SPECIFIED);
+    }
+
+    #[test]
+    fn son_kullanma_yoksa_sifir_kalir() {
+        let ctx = expiry_ctx();
+        let (tt, exp) =
+            resolve_expiry(&ctx, &expiry_req("", 0, 0), type_time::GTC, "mt5-1", 0).unwrap();
+        assert_eq!((tt, exp), (type_time::GTC, 0));
+    }
+
     fn market_order(id: &str, side: &str, volume: f64) -> ClientMsg {
         ClientMsg::Order(OrderReq {
             id: id.into(),
@@ -3010,6 +3231,7 @@ mod tests {
             deviation: 0,
             time: String::new(),
             expiration: 0,
+            expire_sn: 0,
             filling: String::new(),
             comment: String::new(),
         })
@@ -3167,6 +3389,7 @@ mod tests {
                 deviation: 0,
                 time: String::new(),
                 expiration: 0,
+                expire_sn: 0,
                 filling: String::new(),
                 comment: String::new(),
             }),
@@ -3311,6 +3534,7 @@ mod tests {
                 deviation: 0,
                 time: String::new(),
                 expiration: 0,
+                expire_sn: 0,
                 filling: String::new(),
                 comment: String::new(),
             })
@@ -3417,6 +3641,7 @@ mod tests {
             deviation: 0,
             time: String::new(),
             expiration: 0,
+            expire_sn: 0,
             filling: String::new(),
             comment: String::new(),
         })
@@ -3638,7 +3863,7 @@ mod tests {
         ctx.registry.update_last(
             "mt5-1",
             1,
-            crate::state::LastTick { bid, ask: ask_p, last: 0.0, time_msc: 1_700_000_002_000 },
+            crate::state::LastTick { bid, ask: ask_p, last: 0.0, time_msc: 1_700_000_002_000 , recv_ms: 0},
         );
         pump_tick(
             ctx.sim().unwrap(),
@@ -3683,7 +3908,7 @@ mod tests {
         ctx.registry.update_last(
             "mt5-1",
             1,
-            crate::state::LastTick { bid, ask: ask_p, last: 0.0, time_msc: 1_700_000_003_000 },
+            crate::state::LastTick { bid, ask: ask_p, last: 0.0, time_msc: 1_700_000_003_000 , recv_ms: 0},
         );
         pump_tick(
             ctx.sim().unwrap(),
