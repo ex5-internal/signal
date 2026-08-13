@@ -610,6 +610,57 @@ birikir). Broker 00:00 = 21:00 UTC devrinden sonra `positions[].swap` okunacak.
 
 ---
 
+## 14. Tick `flags`: BUY/SELL bitleri İŞE YARAMAZ, BID/ASK bitleri YARAR
+
+Tüketici sistem `tick_delta` motorunda taker tarafını `flags`in BUY (32) /
+SELL (64) bitinden türetmeyi denedi ve bitlerin birlikte set olduğunu bildirdi
+(~%90). Doğrulandı ve **daha kesin çıktı.**
+
+`ticks-20260805.bin`, GOLD, 398.482 tick — **tamamı**:
+
+| flags | ikili | BUY | SELL | adet | % |
+|---|---|---|---|---|---|
+| 1254 | `0b0000010011100110` | X | X | 364.449 | 91,5 |
+| 1124 | `0b0000010001100100` | X | X | 18.329 | 4,6 |
+| 1250 | `0b0000010011100010` | X | X | 15.703 | 3,9 |
+
+```
+BUY+SELL BIRLIKTE : 398.482  (%100,0)
+yalniz BUY        :       0
+yalniz SELL       :       0
+```
+
+**Tek bir tick bile tek taraflı değil.** Bayrağı olduğu gibi "taker tarafı"
+diye kullanan bir istemci, öncelik hangisindeyse **her tick'i** o tarafa
+yazar. Sessiz ve tamamen yanlış bir sinyal kaynağı olur.
+
+### Ama BID(2) / ASK(4) bitleri gerçek bilgi taşıyor
+
+Aynı tabloda fiyat yönüyle çapraz bakınca:
+
+| flags | BID biti | ASK biti | bid değişti mi |
+|---|---|---|---|
+| 1254 | ✔ | ✔ | **%100 değişti** (52,2 yukarı / 47,8 aşağı) |
+| 1250 | ✔ | ✗ | **%100 değişti** (60 yukarı / 40 aşağı) |
+| 1124 | ✗ | ✔ | **%100 DEĞİŞMEDİ** |
+
+Yani `ASK` biti set ve `BID` biti yokken bid **hiç** oynamıyor — 18.329
+örnekte istisnasız. Kotasyonun hangi tarafının hareket ettiği bilgisi
+bayrakta **gerçekten var**; yanlış olan yalnızca BUY/SELL yorumu.
+
+**Tüketiciye öneri:** taker tarafı için `32`/`64`e bakmayın (bilgi yok);
+kotasyon tarafı için `2`/`4`e bakın (bilgi var, %100 tutarlı).
+
+> `128` (0x80) ve `1024` (0x400) bitleri de her kayıtta görünüyor. Bunlar
+> MT5'in belgeli `TICK_FLAG_*` listesinde **yok**; broker/terminale özgü.
+> Anlamları bilinmiyor, bir şey çıkarmayın.
+
+Bizim `sinyal_proto::tick_flag` sabitleri MT5'inkiyle birebir aynıdır
+(`BID=2 ASK=4 LAST=8 VOLUME=16 BUY=32 SELL=64`), yani yorumlama farkı yok —
+alan MT5'ten olduğu gibi taşınıyor.
+
+---
+
 ## Henüz ÖLÇÜLMEMİŞ — bunlara güvenme
 
 Aşağıdakiler kodda yazılı ama **canlıda doğrulanmadı**. Sinyal sistemine
