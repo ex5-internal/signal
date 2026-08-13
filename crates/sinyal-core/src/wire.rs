@@ -568,7 +568,15 @@ fn is_false(v: &bool) -> bool {
 pub struct OrderEvent {
     /// İstemcinin verdiği kimlik.
     pub id: String,
-    /// `queued` | `ack` | `txn` | `rejected` | `duplicate`
+    /// `queued` | `ack` | `txn` | `expired` | `rejected` | `duplicate` |
+    /// `sltp_unverified`
+    ///
+    /// `expired` bekleyen emrin SÜRESİNİN dolduğunu bildirir; `retcode`
+    /// 10009 gelse bile **dolum değildir** (bkz. `source::order_kind`).
+    ///
+    /// `sltp_unverified` bir emir sonucu DEĞİL, bir KORUMA UYARISIDIR:
+    /// `modify_sltp` kabul edildi ama broker'ın stop'u gerçekten kurduğu
+    /// doğrulanamadı (bkz. [`OrderEvent::istenen_sl`]).
     pub kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retcode: Option<u32>,
@@ -582,6 +590,86 @@ pub struct OrderEvent {
     pub volume: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub price: Option<f64>,
+    /// Olay ANINDAKİ piyasa fiyatı — giriş maliyetini AYIRMAK için.
+    ///
+    /// `price - ask` (alışta) kaymayı, `ask - bid` spread'i verir. Bu iki
+    /// bileşen ayrılmadan "maliyet kazancın yarısını yiyor" gözlemi
+    /// eyleme dönüştürülemez: motorun önerdiği fiyatın ulaşılamaz olması
+    /// ile spread'in genişlemesi aynı sayıya karışır.
+    ///
+    /// **Türetilmiş bir `spread` alanı BİLEREK yok.** İstemci `ask - bid`i
+    /// kendisi hesaplar; ikinci bir kaynak eklemek, biri güncellenmeyince
+    /// sessizce tutarsızlaşan iki gerçek demek olurdu.
+    ///
+    /// Ölçüm yoksa alan HİÇ gönderilmez; `0` göndermek "spread sıfırdı"
+    /// gibi okunurdu.
+    ///
+    /// Asıl kaynak `txn` olayıdır (EA'nın dolum ANINDAKİ tick önbelleği).
+    /// `ack`te MT5'in `MqlTradeResult`'ı taşınır: `OrderSendAsync` normalde
+    /// bunu boş döner, ama **requote'ta (10004) dolu gelir** — orada da
+    /// gerçek bir ölçümdür, uydurma değil. `queued`/`rejected`/`duplicate`
+    /// köprünün kendi ürettiği olaylardır ve alan asla bulunmaz.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bid: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ask: Option<f64>,
+    /// MT5 `ENUM_ORDER_STATE` — ham sayı.
+    ///
+    /// `3` = `PARTIAL`: emir KISMEN doldu, kalan hacim hâlâ piyasada.
+    /// `kind` bunu ayırt etmez (ikisi de `txn`), bu yüzden ham durum
+    /// gerekiyor. `0` (`STARTED`) "ölçüm yok" demektir ve gönderilmez.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub order_state: Option<u8>,
+    /// MT5 `ENUM_TRADE_TRANSACTION_TYPE` — ham sayı.
+    ///
+    /// `2` = `ORDER_DELETE`, `6` = `DEAL_ADD`. `0` (`ORDER_ADD`) "ölçüm
+    /// yok" ile aynı sayı olduğu için gönderilmez — bu bilinçli bir kayıp:
+    /// emrin sadece listeye eklendiği olay zaten tek başına eyleme
+    /// dönüşmez, ama sıfır dolu bir alanı "veri var" sanmak pahalıdır.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub txn_type: Option<u8>,
+    /// `sltp_unverified` — stop'u doğrulanamayan pozisyonun bileti.
+    ///
+    /// Diğer `kind`lerde bulunmaz: emir yaşam döngüsü olayları pozisyonu
+    /// `position` alanıyla söyler, bu uyarı ise komuttaki BİLETİ söyler ve
+    /// ikisi hedging hesabında aynı sayı olmayabilir.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<u64>,
+    /// `sltp_unverified` — `modify_sltp` komutunda İSTENEN stop.
+    ///
+    /// # Neden bu uyarı var
+    ///
+    /// `modify_sltp`in kabul edilmesi, stop'un KURULDUĞU anlamına gelmez.
+    /// Broker `stops_level`/`freeze_level` ihlalinde, requote'ta ya da
+    /// "invalid stops" (10016) ile emri düşürebilir; pozisyon o an sessizce
+    /// KORUMASIZ kalır. Bu yüzden komuttan sonra durum yayınındaki `sl`
+    /// izlenir ve istenen değere ulaşmazsa bu olay üretilir.
+    ///
+    /// **Bu bir HATA DEĞİL, bir UYARIDIR.** Emir kabul edilmiş olabilir;
+    /// söylenen tek şey, kurulduğunun DOĞRULANAMADIĞIdır. İstemci kendi
+    /// yedek stop'unu devrede tutmalıdır (bkz. API.md, "stop broker
+    /// tarafında, köprü yedek").
+    ///
+    /// Yalnızca **SL** doğrulanır, TP doğrulanmaz: doğrulanmayan bir TP kâr
+    /// kaçırır, doğrulanmayan bir SL hesabı boşaltır. Bu bilinçli bir kapsam
+    /// sınırı.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub istenen_sl: Option<f64>,
+    /// `sltp_unverified` — durum yayınındaki GERÇEK stop.
+    ///
+    /// Pozisyon durum yayınında hiç bulunamadıysa alan GÖNDERİLMEZ: `0`
+    /// göndermek "stop yok" diye okunurdu, oysa doğru cevap "bakamadık".
+    /// Sebep `comment` alanında yazar.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gercek_sl: Option<f64>,
+    /// `sltp_unverified` — bakılan durum görüntüsünün yaşı (ms).
+    ///
+    /// Büyükse suç broker'da olmayabilir: **zombi bir köprü durumu
+    /// dondurur** ve stop gerçekte kurulmuş olsa bile burada eski değer
+    /// görünür. "Broker reddetti" ile "köprü ölmüş" arasındaki farkı
+    /// ayırmanın tek yolu bu sayı.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_age_ms: Option<u64>,
     #[serde(skip_serializing_if = "String::is_empty")]
     #[serde(default)]
     pub comment: String,
@@ -696,6 +784,7 @@ mod tests {
             comment: String::new(),
             src: "mt5-1".into(),
             sim: false,
+            ..Default::default()
         };
         let j = serde_json::to_string(&ServerMsg::Order(e)).unwrap();
         assert!(j.contains(r#""kind":"ack""#));
@@ -739,6 +828,49 @@ mod tests {
         };
         let j = serde_json::to_string(&ServerMsg::Order(e)).unwrap();
         assert!(j.contains(r#""sim":true"#), "simule dolum gizlenemez: {j}");
+    }
+
+    #[test]
+    fn unmeasured_bid_ask_is_absent_not_zero() {
+        // `"bid":0` "spread sıfırdı" diye okunur ve kayma hesabını sessizce
+        // çöpe çevirir. Ölçüm yoksa alan HİÇ bulunmamalı — istemci o zaman
+        // tick akışına düşmesi gerektiğini bilir.
+        let e = OrderEvent {
+            id: "a1".into(),
+            kind: "ack",
+            retcode: Some(10008),
+            src: "mt5-1".into(),
+            ..Default::default()
+        };
+        let j = serde_json::to_string(&ServerMsg::Order(e)).unwrap();
+        assert!(!j.contains(r#""bid":"#), "olcum yokken bid gorunmemeli: {j}");
+        assert!(!j.contains(r#""ask":"#), "olcum yokken ask gorunmemeli: {j}");
+        assert!(!j.contains("order_state"), "sifir order_state gizlenmeli: {j}");
+        assert!(!j.contains("txn_type"), "sifir txn_type gizlenmeli: {j}");
+    }
+
+    #[test]
+    fn a_measured_fill_carries_the_market_it_hit() {
+        let e = OrderEvent {
+            id: "a1".into(),
+            kind: "txn",
+            retcode: Some(10009),
+            price: Some(4367.95),
+            bid: Some(4367.60),
+            ask: Some(4367.90),
+            order_state: Some(4),
+            txn_type: Some(6),
+            src: "mt5-1".into(),
+            ..Default::default()
+        };
+        let j = serde_json::to_string(&ServerMsg::Order(e)).unwrap();
+        assert!(j.contains(r#""bid":4367.6"#), "{j}");
+        assert!(j.contains(r#""ask":4367.9"#), "{j}");
+        assert!(j.contains(r#""order_state":4"#), "{j}");
+        assert!(j.contains(r#""txn_type":6"#), "{j}");
+        // TÜRETİLMİŞ ALAN YOK: istemci ask-bid'i kendisi hesaplar. İkinci bir
+        // kaynak, biri güncellenmeyince sessizce tutarsızlaşırdı.
+        assert!(!j.contains("spread"), "turetilmis spread alani olmamali: {j}");
     }
 
     #[test]

@@ -49,6 +49,33 @@ const HIST_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// istek gönderen bir istemci hâlâ terminali meşgul edebilir.
 pub const HIST_SLOTS: usize = 4;
 
+/// `modify_sltp` gönderildikten sonra stop'un durum yayınında görünmesi için
+/// tanınan süre.
+///
+/// Durum yayını saniyede bir tazeleniyor; üç saniye, broker'ın emri işlemesi
+/// artı iki yayın turu için makul bir pay bırakır. Daha kısası taze bir
+/// görüntü gelmeden alarm çalardı (yanlış uyarı, en pahalı uyarı türüdür:
+/// birkaç kez tekrarlanınca gerçek olan da yok sayılır). Daha uzunu ise
+/// korumasız pozisyonun sessiz kaldığı pencereyi büyütürdü.
+pub const SLTP_VERIFY_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Bekleyen doğrulamaların tarandığı sıklık.
+///
+/// Pencereden çok daha kısa: stop erkenden kurulduysa uyarı üretilmeden
+/// kapatılabilsin ve süre dolduğunda uyarı geç kalmasın.
+const SLTP_SWEEP: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Durum görüntüsü bu yaştan sonra "BAKAMIYORUZ" sayılır.
+///
+/// EA durumu **saniyede bir** yayımlıyor (`OnTimer`, heartbeat + olay
+/// güdümlü). Beş saniye, bir-iki turun kaçmasına pay bırakır ama zombi bir
+/// köprüyü gizlemez.
+///
+/// Bu eşiğin tek işi "pozisyonu listede GÖREMEDİK" cevabını yorumlamak:
+/// görüntü TAZE ise pozisyon gerçekten kapanmıştır (uyarı YOK), BAYAT ise
+/// hiçbir şey bilmiyoruz demektir (uyarı VAR).
+const SLTP_STATE_STALE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Sunucunun paylaşılan bağlamı.
 pub struct Ctx {
     pub registry: Arc<Registry>,
@@ -98,6 +125,8 @@ pub struct Ctx {
     /// kipinde de aynı motor çalışıyor ve iki kipin emir yolu ayrışırsa
     /// birinde düzeltilen hata diğerinde kalırdı.
     pub replay: Option<Arc<Replay>>,
+    /// Broker'a yazılan stop'ların DOĞRULAMA defteri (bkz. [`SltpGuard`]).
+    pub sltp: Arc<SltpGuard>,
 }
 
 impl Ctx {
@@ -334,6 +363,83 @@ impl OrderTracker {
     }
 }
 
+/// Doğrulanmayı bekleyen tek bir stop.
+#[derive(Debug, Clone)]
+struct PendingSltp {
+    /// `modify_sltp` isteğinin istemci kimliği — uyarı bununla geri bağlanır.
+    id: String,
+    ticket: u64,
+    want_sl: f64,
+    /// Bu ana kadar doğrulanmazsa uyarı üretilir.
+    deadline: std::time::Instant,
+}
+
+/// **Broker'a yazılan stop gerçekten kuruldu mu?**
+///
+/// `modify_sltp`in kabul edilmesi, stop'un kurulduğu anlamına GELMEZ: broker
+/// `stops_level`/`freeze_level` ihlalinde, requote'ta ya da "invalid stops"
+/// (10016) ile emri düşürebilir ve pozisyon SESSİZCE korumasız kalır. Bu
+/// defter komutu kaydeder, durum yayınındaki `sl`i izler ve istenen değere
+/// ulaşmazsa [`FeedEvent::SltpUnverified`] üretir.
+///
+/// # Kapsam
+///
+/// Bu **köprünün kendi stop mantığının yerine geçmez**. Kullanıcının kararı:
+/// broker stop'u ASIL koruma, köprü stop'u YEDEK — ikisi de durur. İkisi aynı
+/// anda tetiklenirse ikinci kapatma "pozisyon yok" alır; zararsız ama
+/// loglanır.
+///
+/// # Sayaçlar
+///
+/// Kaç komut gönderildi, kaçı doğrulandı, kaçı doğrulanamadı — telemetriye
+/// çıkar. Doğrulanamayan bir stop sessiz kalırsa, korumasız bir pozisyonu
+/// korunmuş sanmak demektir.
+#[derive(Debug, Default)]
+pub struct SltpGuard {
+    pending: Mutex<Vec<PendingSltp>>,
+    sent: AtomicU64,
+    verified: AtomicU64,
+    unverified: AtomicU64,
+    closed: AtomicU64,
+}
+
+/// `(gonderilen, dogrulanan, dogrulanamayan, kapanmis)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SltpCounts {
+    pub sent: u64,
+    pub verified: u64,
+    pub unverified: u64,
+    /// Pozisyon doğrulanmadan KAPANDI — uyarı üretilmedi.
+    ///
+    /// Kapanmış pozisyonun stop'u da yoktur; bunu "doğrulanamadı" saymak
+    /// her stop'a-değen pozisyonda yanlış alarm üretirdi. Ama sessizce
+    /// yutmak da doğru değil: sayı beklenmedik biçimde büyükse, stop
+    /// komutları pozisyonlar kapandıktan SONRA gidiyor demektir.
+    pub closed: u64,
+}
+
+impl SltpGuard {
+    /// Doğrulamayı KUR — komut kabul edildikten sonra çağrılır.
+    fn arm(&self, id: &str, ticket: u64, want_sl: f64, now: std::time::Instant) {
+        self.sent.fetch_add(1, Ordering::Relaxed);
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).push(PendingSltp {
+            id: id.to_owned(),
+            ticket,
+            want_sl,
+            deadline: now + SLTP_VERIFY_WINDOW,
+        });
+    }
+
+    pub fn counts(&self) -> SltpCounts {
+        SltpCounts {
+            sent: self.sent.load(Ordering::Relaxed),
+            verified: self.verified.load(Ordering::Relaxed),
+            unverified: self.unverified.load(Ordering::Relaxed),
+            closed: self.closed.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// Bir bağlantının yetki seviyesi.
 ///
 /// Bağlantı **Public** olarak başlar: piyasa verisi (tick, derinlik, mum,
@@ -440,7 +546,11 @@ impl Subs {
         match ev {
             FeedEvent::Tick { symbol, .. } => self.tick_all || self.ticks.contains(&**symbol),
             FeedEvent::Book { symbol, .. } => self.book_all || self.books.contains(&**symbol),
-            FeedEvent::Order { .. } => self.orders,
+            // Stop doğrulama uyarısı `order` kanalından gider: emir gönderen
+            // istemci zaten oraya abone ve korumasız pozisyonu ilgilendiren
+            // taraf odur. Ayrı bir kanal, aboneliği unutan bir istemcinin
+            // uyarıyı hiç görmemesi demek olurdu.
+            FeedEvent::Order { .. } | FeedEvent::SltpUnverified { .. } => self.orders,
             FeedEvent::Candle { symbol, tf, .. } => {
                 self.candle_all_tf.contains(*tf) || self.candles.contains(&format!("{symbol}.{tf}"))
             }
@@ -450,6 +560,31 @@ impl Subs {
 
 /// Sunucuyu çalıştır.
 pub async fn serve(listener: TcpListener, ctx: Arc<Ctx>) {
+    // Stop doğrulama tarayıcısı. Bağlantı başına DEĞİL, sunucu başına: bir
+    // stop'un kurulup kurulmadığı, komutu gönderen bağlantının hâlâ açık
+    // olmasına bağlı olmamalı — kopan bir istemcinin bıraktığı korumasız
+    // pozisyon tam da endişe ettiğimiz durum.
+    let guard = ctx.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(SLTP_SWEEP);
+        loop {
+            tick.tick().await;
+            for ev in sweep_sltp(&guard, std::time::Instant::now()) {
+                if let FeedEvent::SltpUnverified { id, ticket, want_sl, actual_sl, why, .. } = &ev {
+                    // Tel üzerinde uyarı gitse bile daemon günlüğünde de
+                    // durmalı: istemci abone değilse ya da düşmüşse bunun
+                    // hiçbir yerde iz bırakmaması kabul edilemez.
+                    eprintln!(
+                        "[stop] UYARI: sltp DOGRULANAMADI id={id} bilet={ticket} \
+                         istenen_sl={want_sl} gercek_sl={} - {why}",
+                        actual_sl.map(|v| v.to_string()).unwrap_or_else(|| "yok".into())
+                    );
+                }
+                let _ = guard.events.send(ev);
+            }
+        }
+    });
+
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
@@ -753,7 +888,20 @@ fn to_wire(ev: &FeedEvent, ctx: &Ctx) -> Option<ServerMsg> {
             bar: *bar,
         },
         FeedEvent::Order {
-            instance, client_id, kind, retcode, order, deal, position, volume, price, comment,
+            instance,
+            client_id,
+            kind,
+            retcode,
+            order,
+            deal,
+            position,
+            volume,
+            price,
+            bid,
+            ask,
+            order_state,
+            txn_type,
+            comment,
         } => {
             // Bizim göndermediğimiz bir işlem (ör. elle kapatma) olabilir;
             // metin kimliği yoksa boş bırakıyoruz, mesajı yutmuyoruz.
@@ -767,6 +915,21 @@ fn to_wire(ev: &FeedEvent, ctx: &Ctx) -> Option<ServerMsg> {
                 position: (*position != 0).then_some(*position),
                 volume: (*volume != 0.0).then_some(*volume),
                 price: (*price != 0.0).then_some(*price),
+                // Sıfır = "EA ölçemedi" (sembol tabloda yok, ya da olay
+                // canlı bir dolum değil). Sıfırı telden geçirmek istemciye
+                // "spread sıfırdı" dedirtirdi; alan hiç görünmüyorsa
+                // istemci ölçüm olmadığını bilir ve tick akışına düşer.
+                bid: (*bid != 0.0).then_some(*bid),
+                ask: (*ask != 0.0).then_some(*ask),
+                order_state: (*order_state != 0).then_some(*order_state),
+                txn_type: (*txn_type != 0).then_some(*txn_type),
+                // Emir yaşam döngüsü olayları stop doğrulama alanlarını
+                // TAŞIMAZ. Açıkça yazılıyor (`..Default` ile geçiştirilmiyor)
+                // ki ileride eklenen bir alan sessizce boş kalmasın.
+                ticket: None,
+                istenen_sl: None,
+                gercek_sl: None,
+                state_age_ms: None,
                 comment: comment.clone(),
                 src: instance.to_string(),
                 // Simüle kipte emir olayının TEK kaynağı simülasyon motorudur
@@ -777,6 +940,29 @@ fn to_wire(ev: &FeedEvent, ctx: &Ctx) -> Option<ServerMsg> {
                 sim: ctx.sim.is_some(),
             })
         }
+        FeedEvent::SltpUnverified {
+            instance,
+            id,
+            ticket,
+            want_sl,
+            actual_sl,
+            state_age_ms,
+            why,
+        } => ServerMsg::Order(OrderEvent {
+            id: id.clone(),
+            kind: "sltp_unverified",
+            ticket: Some(*ticket),
+            istenen_sl: Some(*want_sl),
+            gercek_sl: *actual_sl,
+            state_age_ms: *state_age_ms,
+            comment: (*why).to_owned(),
+            src: instance.to_string(),
+            sim: ctx.sim.is_some(),
+            // `retcode` BİLEREK yok: bu bir broker cevabı değil, bizim
+            // gözlemimiz. Uydurma bir kod, istemcinin bunu emir sonucu
+            // sanmasına yol açardı.
+            ..Default::default()
+        }),
     })
 }
 
@@ -978,10 +1164,17 @@ fn handle_client_msg(
                 vec![submit_simple(ctx, &id, action::CLOSE_POSITION, ticket, volume, 0.0, 0.0)]
             }
         },
-        ClientMsg::ModifySltp { id, ticket, sl, tp } => match ctx.sim() {
-            Some(s) => sim_modify(ctx, s, &id, ticket, sl, tp),
-            None => vec![submit_simple(ctx, &id, action::SLTP, ticket, 0.0, sl, tp)],
-        },
+        // Stop'un broker'a YAZILMASI ile KURULMASI ayrı şeyler. Komut kabul
+        // edildiyse doğrulamayı kuruyoruz; kurulmadığı ortaya çıkarsa
+        // `sltp_unverified` uyarısı gider (bkz. [`SltpGuard`]).
+        ClientMsg::ModifySltp { id, ticket, sl, tp } => {
+            let out = match ctx.sim() {
+                Some(s) => sim_modify(ctx, s, &id, ticket, sl, tp),
+                None => vec![submit_simple(ctx, &id, action::SLTP, ticket, 0.0, sl, tp)],
+            };
+            arm_sltp_verify(ctx, &id, ticket, sl, &out);
+            out
+        }
     })
 }
 
@@ -1492,6 +1685,17 @@ fn feed_order(src: &Arc<str>, ev: &SimEvent) -> FeedEvent {
         position: ev.position,
         volume: ev.volume,
         price: ev.price,
+        // SİMÜLASYON BU ALANLARI ÖLÇEMEZ, dolayısıyla UYDURMAZ.
+        //
+        // Motor dolumu tek bir fiyattan modelliyor; bir "dolum anı bid/ask"
+        // üretmek, gerçek bir ölçümmüş gibi görünen türetilmiş bir sayı
+        // olurdu. Kayma analizi tam da bu alanlar üzerinde yapılacağı için,
+        // simüle bir spread'in canlı ölçümle aynı yerde durması analizi
+        // sessizce bozardı. Sıfır bırakılıyor → tel üzerinde alan HİÇ yok.
+        bid: 0.0,
+        ask: 0.0,
+        order_state: 0,
+        txn_type: 0,
         comment: cause_comment(ev.cause),
     }
 }
@@ -1832,6 +2036,182 @@ fn collect_accounts(ctx: &Ctx) -> Vec<AccountInfo> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// Broker stop'unun DOĞRULANMASI
+// ---------------------------------------------------------------------------
+
+/// Komut kabul edildiyse doğrulamayı kur.
+///
+/// Kabul ölçütü `kind == "queued"`: canlı ve simüle yollar kabul edilen
+/// komuta AYNI etiketi basıyor (bkz. [`dispatch`] ve [`sim_reply`]). `rejected`
+/// ya da `duplicate` için doğrulama kurulmaz — gönderilmemiş bir komutun
+/// doğrulanmaması bir uyarı değil, beklenen durumdur.
+fn arm_sltp_verify(ctx: &Ctx, id: &str, ticket: u64, sl: f64, out: &[ServerMsg]) {
+    let accepted = out
+        .iter()
+        .any(|m| matches!(m, ServerMsg::Order(e) if e.kind == "queued"));
+    if accepted {
+        ctx.sltp.arm(id, ticket, sl, std::time::Instant::now());
+    }
+}
+
+/// Şu anki pozisyon listesi ve **listeye güvenilip güvenilmeyeceği**.
+///
+/// İkinci alan bu doğrulamanın bel kemiği: "pozisyon listede YOK" cevabı
+/// ancak liste GÜVENİLİRSE "pozisyon kapandı" demektir. Bayat ya da
+/// kırpılmış bir görüntüde aynı cevap "hiçbir şey bilmiyoruz" demektir ve
+/// ikisini karıştırmak ya her kapanışta yanlış alarm üretir ya da zombi bir
+/// köprüyü sessizce gizler.
+///
+/// Simüle kipte motorun listesi ANLIKTIR ve daima güvenilir.
+///
+/// `age` hazır geçirilir: `all_states()` her çağrıda TÜM durum görüntüsünü
+/// (pozisyon vektörleriyle birlikte) klonluyor ve bu tarama saniyede dört kez
+/// çalışıyor — aynı bilgiyi iki kez toplamak boşuna kopya demek.
+fn positions_now(ctx: &Ctx, age: Option<u64>) -> (Vec<PositionInfo>, bool) {
+    match ctx.sim() {
+        Some(s) => (sim_positions(ctx, s).0, true),
+        None => {
+            let (items, _total, truncated) = collect_positions(ctx);
+            // Görüntü hiç yoksa (`None`) da güvenilmez: EA yayın yapmamış
+            // demektir ve o hâlde "pozisyon yok" bilgi değil, körlüktür.
+            let fresh = age.is_some_and(|ms| ms <= SLTP_STATE_STALE.as_millis() as u64);
+            (items, fresh && !truncated)
+        }
+    }
+}
+
+/// Durum görüntülerinin EN ESKİSİNİN yaşı (ms).
+///
+/// En eskisi alınıyor: bir örnek taze diye zombi olan diğerini gizlemek,
+/// bu uyarının var olma sebebini ortadan kaldırırdı. Simüle kiplerde
+/// paylaşılan bellekten gelen bir görüntü YOKTUR — orada `None`.
+fn state_age_ms(ctx: &Ctx, now: std::time::Instant) -> Option<u64> {
+    ctx.registry
+        .all_states()
+        .iter()
+        .map(|(_, s)| now.checked_duration_since(s.at).unwrap_or_default().as_millis() as u64)
+        .max()
+}
+
+/// Sembolün fiyat ızgarası — bulunamazsa 0.
+fn tick_size_of(ctx: &Ctx, symbol: &str) -> f64 {
+    ctx.registry
+        .resolve_any(symbol)
+        .and_then(|(inst, id)| ctx.registry.symbol(&inst, id))
+        .map(|e| e.tick_size)
+        .unwrap_or(0.0)
+}
+
+/// İstenen stop kuruldu mu.
+///
+/// Birebir eşitlik ARANMAZ: broker fiyatı kendi ızgarasına (`tick_size`)
+/// yuvarlar, bizim gönderdiğimiz ham `sl` ile geri okunan değer son basamakta
+/// ayrışabilir. Katı karşılaştırma neredeyse her doğrulamayı "kurulmadı"
+/// yapar; yanlış uyarı birkaç kez tekrarlanınca gerçek olanı da yok
+/// ettirirdi. Tolerans bir ızgara adımı — broker'ın gerçekten reddettiği
+/// durumda fark bundan kat kat büyük olur.
+fn stop_reached(want: f64, actual: f64, tick: f64) -> bool {
+    let tol = if tick > 0.0 { tick } else { want.abs().max(1.0) * 1e-9 };
+    (want - actual).abs() <= tol
+}
+
+/// Bekleyen doğrulamaları tara; süresi dolmuş ve kurulmamış olanlar için
+/// uyarı üret.
+///
+/// `now` DIŞARIDAN veriliyor: "pencere dolmadan uyarı üretilmez" kuralı
+/// gerçek zaman beklemeden sınanabilmeli, yoksa test ya kırılgan olur ya da
+/// saniyelerce uyur.
+///
+/// Dört sonuç var ve dördü de ayrı:
+/// - stop istenen değerde → **doğrulandı**, sessizce düşer;
+/// - pencere dolmadı → hiçbir şey (ERKEN ALARM YOK);
+/// - pozisyon GÜVENİLİR bir listede yok → **kapanmış**, sessizce düşer;
+/// - pencere doldu ve stop yerinde değil (ya da hiçbir şey göremiyoruz) →
+///   uyarı.
+///
+/// # Kapanmış pozisyona alarm verilmez
+///
+/// Pozisyon yoksa stop'u da yoktur — bu tamamen normaldir ve stop'a değerek
+/// kapanan HER pozisyonda tekrarlanır. Buna uyarı üretmek, uyarının kendisini
+/// öldürürdü: birkaç gün sonra `sltp_unverified` satırlarının hepsi gürültü
+/// sanılır ve gerçek olan da okunmaz. **Tek istisna**, listenin güvenilmez
+/// olduğu durum (bayat/kırpılmış görüntü, ya da hiç görüntü yok): orada
+/// "yok" bilgi değil körlüktür ve susmak zombi köprüyü gizlerdi.
+fn sweep_sltp(ctx: &Ctx, now: std::time::Instant) -> Vec<FeedEvent> {
+    let mut out = Vec::new();
+    let mut pend = ctx.sltp.pending.lock().unwrap_or_else(|e| e.into_inner());
+    if pend.is_empty() {
+        // Bekleyen yoksa pozisyon listesi toplamıyoruz: bu tarama saniyede
+        // birkaç kez çalışıyor ve normal hâl "bekleyen yok".
+        return out;
+    }
+    let age = state_age_ms(ctx, now);
+    let (items, trustworthy) = positions_now(ctx, age);
+    let src: Arc<str> = Arc::from(
+        ctx.sim()
+            .map(|s| s.primary.to_string())
+            .or_else(|| ctx.registry.all_states().first().map(|(i, _)| i.clone()))
+            .unwrap_or_default(),
+    );
+
+    pend.retain(|p| {
+        let found = items.iter().find(|q| q.ticket == p.ticket);
+        match found {
+            Some(q) if stop_reached(p.want_sl, q.sl, tick_size_of(ctx, &q.symbol)) => {
+                ctx.sltp.verified.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+            // Pencere daha dolmadı: broker'a da, durum yayınına da zaman
+            // tanıyoruz.
+            _ if now < p.deadline => true,
+            Some(q) => {
+                ctx.sltp.unverified.fetch_add(1, Ordering::Relaxed);
+                out.push(FeedEvent::SltpUnverified {
+                    instance: src.clone(),
+                    id: p.id.clone(),
+                    ticket: p.ticket,
+                    want_sl: p.want_sl,
+                    actual_sl: Some(q.sl),
+                    state_age_ms: age,
+                    why: if trustworthy {
+                        "durum yayinindaki sl istenen degere ulasmadi \
+                         - broker stop'u uygulamamis olabilir"
+                    } else {
+                        // Bayat görüntüde eski `sl`i görüyor olabiliriz;
+                        // broker'ı suçlamak yanlış teşhis olurdu.
+                        "sl istenen degerde degil AMA durum goruntusu BAYAT \
+                         - once kopruyu kontrol edin (bkz. state_age_ms)"
+                    },
+                });
+                false
+            }
+            // Pozisyon GÜVENİLİR bir listede yok: kapanmış. Kapanmış
+            // pozisyonun stop'u da yoktur — alarm YOK.
+            None if trustworthy => {
+                ctx.sltp.closed.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+            None => {
+                ctx.sltp.unverified.fetch_add(1, Ordering::Relaxed);
+                out.push(FeedEvent::SltpUnverified {
+                    instance: src.clone(),
+                    id: p.id.clone(),
+                    ticket: p.ticket,
+                    want_sl: p.want_sl,
+                    // `0` DEĞİL: "stop yok" ile "bakamadık" aynı şey değil.
+                    actual_sl: None,
+                    state_age_ms: age,
+                    why: "pozisyonu goremiyoruz: durum goruntusu BAYAT, kirpilmis \
+                          ya da hic gelmemis - kopru zombi olabilir",
+                });
+                false
+            }
+        }
+    });
+    out
+}
+
 fn collect_positions(ctx: &Ctx) -> (Vec<PositionInfo>, u32, bool) {
     let mut items = Vec::new();
     let mut total = 0u32;
@@ -2022,6 +2402,10 @@ mod tests {
             position: 7,
             volume: 0.1,
             price: 1.0,
+            bid: 0.0,
+            ask: 0.0,
+            order_state: 0,
+            txn_type: 0,
             comment: String::new(),
         };
         s.add("tick.*");
@@ -2063,6 +2447,7 @@ mod tests {
             hist_slots: Arc::new(tokio::sync::Semaphore::new(HIST_SLOTS)),
             sim: None,
             replay: None,
+            sltp: Arc::new(SltpGuard::default()),
         }
     }
 
@@ -2818,11 +3203,23 @@ mod tests {
             position: 7,
             volume: 0.1,
             price: 1.2345,
+            bid: 1.2343,
+            ask: 1.2344,
+            order_state: sinyal_proto::order_state::FILLED,
+            txn_type: sinyal_proto::txn_type::DEAL_ADD,
             comment: String::new(),
         };
         let msg = to_wire(&ev, &ctx).unwrap();
         match &msg {
-            ServerMsg::Order(e) => assert!(!e.sim, "canli olay simule isaretlenemez"),
+            ServerMsg::Order(e) => {
+                assert!(!e.sim, "canli olay simule isaretlenemez");
+                // Ölçüm alanları EA'dan tele KESİNTİSİZ geçmeli; bir yerde
+                // düşürülürse kayma analizi sessizce imkânsız hale gelir.
+                assert_eq!(e.bid, Some(1.2343));
+                assert_eq!(e.ask, Some(1.2344));
+                assert_eq!(e.order_state, Some(4));
+                assert_eq!(e.txn_type, Some(6));
+            }
             other => panic!("beklenmeyen: {other:?}"),
         }
         let j = serde_json::to_string(&msg).unwrap();
@@ -3110,6 +3507,29 @@ mod tests {
     }
 
     #[test]
+    fn a_simulated_fill_never_fabricates_the_market_it_hit() {
+        // Kayma analizi tam da bu alanların üzerinde yapılacak. Simülatör
+        // dolumu tek fiyattan modelliyor; oradan türetilmiş bir "dolum anı
+        // bid/ask" üretmek, gerçek bir ÖLÇÜM gibi görünen uydurma bir sayı
+        // olurdu ve analizi sessizce bozardı.
+        let (ctx, _cmd) = paper_ctx(10_000.0);
+        seed_symbol(&ctx, 1.10000, 1.10002);
+        let mut events = ctx.events.subscribe();
+
+        ask(&ctx, market_order("p1", "buy", 0.10));
+        let evs = drain_orders(&ctx, &mut events);
+        assert!(!evs.is_empty(), "olay bekleniyordu");
+        for e in &evs {
+            assert_eq!(e.bid, None, "simule olay bid uydurmamali: {e:?}");
+            assert_eq!(e.ask, None, "simule olay ask uydurmamali: {e:?}");
+            assert_eq!(e.order_state, None, "{e:?}");
+            assert_eq!(e.txn_type, None, "{e:?}");
+        }
+        // Dolum fiyatı yine de var — eksik olan ÖLÇÜM, dolum değil.
+        assert!(evs.iter().any(|e| e.price.is_some()), "{evs:?}");
+    }
+
+    #[test]
     fn the_paper_port_never_writes_a_single_command_to_shared_memory() {
         // GÜVENLİK SINIRI — bu testin varlık sebebi tek cümle: yanlışlıkla
         // gerçek emir gitmesi kabul edilemez.
@@ -3173,6 +3593,10 @@ mod tests {
             position: 7,
             volume: 0.1,
             price: 1.2345,
+            bid: 0.0,
+            ask: 0.0,
+            order_state: 0,
+            txn_type: 0,
             comment: String::new(),
         };
 
@@ -3406,5 +3830,327 @@ mod tests {
             }
             other => panic!("beklenmeyen: {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // BROKER STOP'U GERÇEKTEN KURULDU MU
+    //
+    // `modify_sltp`in kabul edilmesi stop'un kurulduğu anlamına GELMEZ.
+    // Broker `stops_level`/`freeze_level` ihlalinde, requote'ta ya da
+    // "invalid stops" (10016) ile emri düşürebilir ve pozisyon SESSİZCE
+    // korumasız kalır. Aşağıdaki testler doğrulamanın dört kenarını da
+    // sabitliyor: kurulduysa sus, kurulmadıysa bağır, değerleri taşı, ve
+    // ERKEN bağırma.
+    // -----------------------------------------------------------------
+
+    /// Durum yayınını (EA'nın saniyede bir tazelediği görüntü) kur.
+    ///
+    /// `sl` = pozisyonun broker tarafındaki GERÇEK stop'u. Testler bunu
+    /// oynatarak "broker uyguladı" ile "broker düşürdü"yü ayırıyor.
+    fn publish_position(ctx: &Ctx, ticket: u64, sl: f64) {
+        let account = sinyal_proto::AccountSnapshot {
+            balance: 10_000.0,
+            equity: 10_000.0,
+            trade_mode: sinyal_proto::trade_mode::DEMO,
+            margin_mode: sinyal_proto::margin_mode::HEDGING,
+            trade_allowed: 1,
+            trade_expert: 1,
+            terminal_trade_allowed: 1,
+            mql_trade_allowed: 1,
+            connected: 1,
+            ..Default::default()
+        };
+        let mut p = sinyal_proto::PositionRec {
+            ticket,
+            identifier: ticket,
+            volume: 0.10,
+            price_open: 1.10002,
+            price_current: 1.10002,
+            sl,
+            ..Default::default()
+        };
+        sinyal_proto::write_fixed_str(&mut p.symbol, "EURUSD");
+        ctx.registry.set_state(
+            "mt5-1",
+            sinyal_proto::StateSnapshot {
+                account,
+                positions: vec![p],
+                orders: Vec::new(),
+                built_at_msc: 1_700_000_000_000,
+                built_at_qpc: 0,
+                truncated: false,
+                unstable: false,
+                pos_total: 1,
+                ord_total: 0,
+            },
+        );
+    }
+
+    /// CANLI bağlam: komut kanalı bağlı, simülasyon YOK.
+    fn live_ctx(ticket: u64, sl_now: f64) -> (Ctx, std::sync::mpsc::Receiver<Cmd>) {
+        let mut ctx = ctx_with(None);
+        let (c_tx, c_rx) = std::sync::mpsc::channel::<Cmd>();
+        ctx.cmd_tx.insert("mt5-1".into(), c_tx);
+        seed_symbol(&ctx, 1.10000, 1.10002);
+        publish_position(&ctx, ticket, sl_now);
+        (ctx, c_rx)
+    }
+
+    fn modify(id: &str, ticket: u64, sl: f64) -> ClientMsg {
+        ClientMsg::ModifySltp { id: id.into(), ticket, sl, tp: 0.0 }
+    }
+
+    /// Doğrulama penceresinin SONRASI.
+    fn after_window() -> std::time::Instant {
+        std::time::Instant::now() + SLTP_VERIFY_WINDOW + std::time::Duration::from_millis(1)
+    }
+
+    #[test]
+    fn a_stop_the_broker_really_set_raises_no_alarm() {
+        // Doğrulanmış stop SESSİZ olmalı. Her komuta uyarı üreten bir sistem,
+        // birkaç gün sonra hiçbir uyarısı okunmayan bir sistemdir.
+        let (ctx, c_rx) = live_ctx(942649399, 0.0);
+        let out = ask(&ctx, modify("m1", 942649399, 1.09500));
+        assert!(out.iter().any(|m| matches!(m, ServerMsg::Order(e) if e.kind == "queued")));
+        assert!(c_rx.try_recv().is_ok(), "komut paylasilan bellege gitmeliydi");
+
+        // Broker uyguladı: durum yayını istenen stop'u gösteriyor.
+        publish_position(&ctx, 942649399, 1.09500);
+
+        assert!(
+            sweep_sltp(&ctx, after_window()).is_empty(),
+            "kurulmus stop icin uyari URETILMEMELI"
+        );
+        let c = ctx.sltp.counts();
+        assert_eq!((c.sent, c.verified, c.unverified), (1, 1, 0));
+        // Defter boşaldı: aynı komut ikinci turda tekrar sayılmamalı.
+        assert!(sweep_sltp(&ctx, after_window()).is_empty());
+        assert_eq!(ctx.sltp.counts(), c, "ikinci tarama sayaci degistirmemeli");
+    }
+
+    #[test]
+    fn a_stop_the_broker_silently_dropped_is_reported() {
+        // RAPORUN ASIL ŞİKÂYETİ. Komut kabul edildi, `sl` hâlâ 0 — pozisyon
+        // KORUMASIZ. Bunun sessiz kalması, korumasız bir pozisyonu korunmuş
+        // sanmak demek.
+        let (ctx, _c_rx) = live_ctx(942649399, 0.0);
+        ask(&ctx, modify("m1", 942649399, 1.09500));
+
+        // Durum yayını GELDİ ama `sl` hâlâ 0: broker emri düşürmüş.
+        let evs = sweep_sltp(&ctx, after_window());
+        assert_eq!(evs.len(), 1, "tam bir uyari beklenirdi: {evs:?}");
+        let c = ctx.sltp.counts();
+        assert_eq!((c.sent, c.verified, c.unverified), (1, 0, 1));
+    }
+
+    #[test]
+    fn the_warning_carries_both_the_asked_and_the_actual_stop() {
+        // "Doğrulanamadı" tek başına eyleme dönüşmez: istemci NEYİ istediğini
+        // ve broker'da NE olduğunu görmeden kendi yedek stop'unu doğru yere
+        // koyamaz.
+        let (ctx, _c_rx) = live_ctx(942649399, 1.08000);
+        ask(&ctx, modify("m7", 942649399, 1.09500));
+
+        let evs = sweep_sltp(&ctx, after_window());
+        match &evs[..] {
+            [FeedEvent::SltpUnverified { id, ticket, want_sl, actual_sl, .. }] => {
+                assert_eq!(id, "m7");
+                assert_eq!(*ticket, 942649399);
+                assert!((want_sl - 1.09500).abs() < 1e-12, "istenen: {want_sl}");
+                // Eski stop hâlâ yerinde: broker YENİSİNİ uygulamamış.
+                assert_eq!(*actual_sl, Some(1.08000));
+            }
+            other => panic!("beklenmeyen: {other:?}"),
+        }
+
+        // Tel üzerinde de görünmeli — istemcinin gördüğü şey bu.
+        let msg = to_wire(&evs[0], &ctx).expect("uyari tele cevrilmeli");
+        let j = serde_json::to_string(&msg).unwrap();
+        assert!(j.contains(r#""kind":"sltp_unverified""#), "{j}");
+        assert!(j.contains(r#""ticket":942649399"#), "{j}");
+        assert!(j.contains(r#""istenen_sl":1.095"#), "{j}");
+        assert!(j.contains(r#""gercek_sl":1.08"#), "{j}");
+        // `retcode` UYDURULMAZ: bu bizim gözlemimiz, broker cevabı değil.
+        assert!(!j.contains("retcode"), "{j}");
+    }
+
+    #[test]
+    fn no_alarm_before_the_verification_window_closes() {
+        // ERKEN ALARM YOK. Durum yayını saniyede bir geliyor; komuttan hemen
+        // sonra bakıp "kurulmamış" demek, her doğru stop'u da yanlış
+        // damgalardı — ve birkaç kez tekrarlanan yanlış uyarı, gerçek olanı
+        // da okunmaz hâle getirirdi.
+        let (ctx, _c_rx) = live_ctx(942649399, 0.0);
+        let armed_at = std::time::Instant::now();
+        ask(&ctx, modify("m1", 942649399, 1.09500));
+
+        // Pencere içindeki her tarama SESSİZ: stop henüz kurulmamış olsa bile.
+        for ms in [0u64, 500, 1_500, 2_500] {
+            let now = armed_at + std::time::Duration::from_millis(ms);
+            assert!(
+                sweep_sltp(&ctx, now).is_empty(),
+                "pencere dolmadan ({ms} ms) uyari uretilmemeli"
+            );
+        }
+        let c = ctx.sltp.counts();
+        assert_eq!(
+            (c.sent, c.verified, c.unverified),
+            (1, 0, 0),
+            "pencere icinde karar VERILMEMELI"
+        );
+
+        // Pencere içinde stop kurulursa uyarı hiç doğmaz.
+        publish_position(&ctx, 942649399, 1.09500);
+        assert!(sweep_sltp(&ctx, armed_at + std::time::Duration::from_millis(2_500)).is_empty());
+        assert_eq!(ctx.sltp.counts().verified, 1);
+    }
+
+    #[test]
+    fn a_position_that_simply_closed_raises_no_alarm() {
+        // KAPANMIŞ pozisyonun stop'u da yoktur — bu normaldir ve stop'a
+        // değerek kapanan HER pozisyonda tekrarlanır. Buna uyarı üretmek
+        // `sltp_unverified`in tamamını gürültüye çevirir ve gerçek olanı da
+        // okunmaz hâle getirirdi.
+        //
+        // Durum görüntüsü TAZE (`publish_position` az önce çalıştı), yani
+        // "listede yok" gerçekten "kapandı" demek.
+        let (ctx, _c_rx) = live_ctx(942649399, 0.0);
+        ask(&ctx, modify("m1", 111, 1.09500)); // artık var olmayan bilet
+
+        assert!(
+            sweep_sltp(&ctx, after_window()).is_empty(),
+            "kapanmis pozisyon icin uyari URETILMEMELI"
+        );
+        let c = ctx.sltp.counts();
+        assert_eq!(
+            (c.sent, c.verified, c.unverified, c.closed),
+            (1, 0, 0, 1),
+            "kapanmis ayri sayilmali: ne dogrulandi ne dogrulanamadi"
+        );
+    }
+
+    #[test]
+    fn a_position_we_cannot_see_says_so_instead_of_claiming_the_stop_is_zero() {
+        // Pozisyonu göremediğimiz İKİ sebep var ve ayrımı hayati: TAZE bir
+        // görüntüde "yok" = kapandı (sessiz), BAYAT bir görüntüde "yok" =
+        // hiçbir şey bilmiyoruz (uyarı). Zombi köprü tam olarak ikincisi gibi
+        // görünür ve orada susmak, güvenlik olayının kendisini tekrarlardı.
+        //
+        // `gercek_sl` YOK: `0` göndermek "stop yok" diye okunurdu, oysa doğru
+        // cevap "bakamadık".
+        let (ctx, _c_rx) = live_ctx(942649399, 0.0);
+        ask(&ctx, modify("m1", 111, 1.09500));
+
+        // Görüntü bayatladı: köprü artık durum yayınlamıyor.
+        let much_later = std::time::Instant::now() + SLTP_STATE_STALE + SLTP_VERIFY_WINDOW;
+        let evs = sweep_sltp(&ctx, much_later);
+        match &evs[..] {
+            [FeedEvent::SltpUnverified { actual_sl, state_age_ms, why, .. }] => {
+                assert_eq!(*actual_sl, None, "bulunamayan pozisyon icin 0 UYDURULMAMALI");
+                assert!(state_age_ms.is_some_and(|ms| ms >= 5_000), "{state_age_ms:?}");
+                assert!(why.contains("BAYAT"), "{why}");
+            }
+            other => panic!("beklenmeyen: {other:?}"),
+        }
+        assert_eq!(ctx.sltp.counts().unverified, 1);
+        let j = serde_json::to_string(&to_wire(&evs[0], &ctx).unwrap()).unwrap();
+        assert!(!j.contains("gercek_sl"), "olcum yoksa alan HIC gonderilmemeli: {j}");
+    }
+
+    #[test]
+    fn a_stop_that_never_landed_is_reported_even_after_the_position_closes() {
+        // TUZAK: "kapanmışa alarm verme" kuralı, gerçek bir kaçırılmış
+        // stop'u da gizleyebilir. Pozisyon pencere İÇİNDE hâlâ açıkken
+        // `sl` istenen değere ulaşmadıysa, sonra kapanması bunu affetmez —
+        // çünkü o pencerede pozisyon KORUMASIZDI.
+        //
+        // Ayrım şu: karar penceresi dolduğu ANDA verilir. Pozisyon o an hâlâ
+        // açık ve stop'suz ise UYARI; o an artık yoksa kapanmıştır.
+        let (ctx, _c_rx) = live_ctx(942649399, 0.0);
+        ask(&ctx, modify("m1", 942649399, 1.09500));
+
+        // Pencere dolduğunda pozisyon HÂLÂ açık ve `sl` hâlâ 0.
+        let evs = sweep_sltp(&ctx, after_window());
+        assert_eq!(evs.len(), 1, "acik ve korumasiz pozisyon bildirilmeli: {evs:?}");
+        assert_eq!(ctx.sltp.counts().closed, 0, "bu kapanis DEGIL");
+    }
+
+    #[test]
+    fn a_refused_command_arms_no_verification() {
+        // Gönderilmemiş bir komutun doğrulanmaması uyarı değil, beklenen
+        // durumdur. Aksi hâlde her ret bir "korumasız pozisyon" alarmına
+        // dönüşür ve uyarı listesi okunmaz hâle gelirdi.
+        let ctx = ctx_with(None); // komut kanalı YOK → "bagli instance yok"
+        let out = ask(&ctx, modify("m1", 5, 1.09));
+        assert!(out.iter().any(|m| matches!(m, ServerMsg::Order(e) if e.kind == "rejected")));
+        assert_eq!(ctx.sltp.counts().sent, 0, "reddedilen komut icin dogrulama KURULMAMALI");
+        assert!(sweep_sltp(&ctx, after_window()).is_empty());
+    }
+
+    #[test]
+    fn the_broker_rounding_the_price_to_its_grid_is_not_a_failure() {
+        // Broker fiyatı `tick_size` ızgarasına yuvarlar. Birebir eşitlik
+        // aramak neredeyse her doğrulamayı "kurulmadi" yapardı — ve yanlış
+        // uyarı, uyarının kendisini öldürür.
+        let (ctx, _c_rx) = live_ctx(942649399, 0.0);
+        ask(&ctx, modify("m1", 942649399, 1.095004));
+        // tick_size = 0.00001; broker 1.09500'e yuvarladı.
+        publish_position(&ctx, 942649399, 1.09500);
+        assert!(sweep_sltp(&ctx, after_window()).is_empty(), "izgara yuvarlamasi hata degil");
+        assert_eq!(ctx.sltp.counts().verified, 1);
+
+        // Ama GERÇEK bir sapma (bir ızgara adımından büyük) yakalanmalı.
+        let (ctx2, _c2) = live_ctx(942649399, 0.0);
+        ask(&ctx2, modify("m2", 942649399, 1.09500));
+        publish_position(&ctx2, 942649399, 1.09480);
+        assert_eq!(sweep_sltp(&ctx2, after_window()).len(), 1, "20 point sapma yakalanmali");
+    }
+
+    #[test]
+    fn the_stop_warning_rides_the_order_channel_not_the_price_feed() {
+        // Emir gönderen istemci zaten `order` kanalında. Ayrı bir kanal,
+        // aboneliği unutan bir istemcinin uyarıyı HİÇ görmemesi demek olurdu.
+        let ev = FeedEvent::SltpUnverified {
+            instance: Arc::from("mt5-1"),
+            id: "m1".into(),
+            ticket: 7,
+            want_sl: 1.0,
+            actual_sl: Some(0.0),
+            state_age_ms: Some(12),
+            why: "test",
+        };
+        let mut s = Subs::default();
+        s.add("tick.*");
+        assert!(!s.wants(&ev), "fiyat aboneligi stop uyarisi getirmemeli");
+        s.add("order");
+        assert!(s.wants(&ev));
+    }
+
+    #[test]
+    fn a_simulated_stop_is_verified_on_the_same_path_as_a_live_one() {
+        // Paper/replay'de de doğrulama ÇALIŞIR. İki kipin doğrulama yolu
+        // ayrışsaydı, burada düzeltilen bir hata canlıda kalırdı — ve stop
+        // doğrulamasını test edecek tek güvenli yer zaten simülasyon.
+        let (ctx, _c_rx) = paper_ctx(10_000.0);
+        seed_symbol(&ctx, 1.10000, 1.10002);
+        ask(&ctx, market_order("o1", "buy", 0.10));
+        let ticket = match &ask(&ctx, ClientMsg::Positions)[0] {
+            ServerMsg::Positions { items, .. } => items[0].ticket,
+            other => panic!("beklenmeyen: {other:?}"),
+        };
+
+        ask(&ctx, modify("m1", ticket, 1.09500));
+        assert_eq!(ctx.sltp.counts().sent, 1);
+        assert!(sweep_sltp(&ctx, after_window()).is_empty(), "motor stop'u kurdu, uyari olmamali");
+        assert_eq!(ctx.sltp.counts().verified, 1);
+
+        // Motorun REDDETTİĞİ bir stop (ters taraf) doğrulanamaz olarak
+        // bildirilmeli — kabul edilmiş sanıp korumasız kalmak kabul edilemez.
+        let out = ask(&ctx, modify("m2", ticket, 1.20000));
+        assert!(
+            out.iter().any(|m| matches!(m, ServerMsg::Order(e) if e.kind == "rejected")),
+            "alis pozisyonunda fiyatin USTUNE sl reddedilmeli: {out:?}"
+        );
+        assert_eq!(ctx.sltp.counts().sent, 1, "reddedilen komut sayaca girmemeli");
     }
 }

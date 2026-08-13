@@ -60,10 +60,10 @@ pub mod validate;
 
 pub use bars::{bar_flag, timeframe, BarRec, HistReq, HIST_SYMBOL_LEN};
 pub use msg::{
-    action, book_type, day_of_week, exec_mode, filling, filling_mask, kind, order_type,
-    read_fixed_str, res_kind, res_source, swap_mode, sym_flag, tick_flag, type_time,
-    write_fixed_str, Book, BookLevel, Cmd, Res, SymbolEntry, Tick, COMMENT_LEN, MAX_BOOK_DEPTH,
-    SYMBOL_NAME_LEN,
+    action, book_type, day_of_week, exec_mode, filling, filling_mask, kind, order_state,
+    order_type, read_fixed_str, res_kind, res_source, swap_mode, sym_flag, tick_flag, txn_type,
+    type_time, write_fixed_str, Book, BookLevel, Cmd, Res, SymbolEntry, Tick, COMMENT_LEN,
+    MAX_BOOK_DEPTH, SYMBOL_NAME_LEN,
 };
 pub use ring::{Cell, Ring, RingError, RingHeader};
 pub use state::{

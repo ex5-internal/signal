@@ -260,8 +260,19 @@ Bu sessiz bir tuzak ve emri **sonsuza kadar bekleyen emir olarak bırakır**.
 - **`expiration` birimi MUTLAK epoch SANİYEDİR**, göreli değil. "120 saniye
   sonra dolsun" için `şimdi + 120` göndermelisiniz.
 
-Süre dolduğunda şu an **`expired` bildirimi gönderilmiyor**; biletin
-düştüğünü `{"op":"orders"}` ile görebilirsiniz. Bu eksik giderilecek.
+Süre dolduğunda **`{"t":"order","kind":"expired"}` gelir** ve biletin
+düştüğünü anlarsınız. Ayrıca `{"op":"orders"}` ile de doğrulayabilirsiniz.
+
+### ⚠️ `expired` olayında `retcode` 10009 OLABİLİR — bu dolum DEĞİLDİR
+
+MT5 süre dolumunu ayrı bir olay türü olarak bildirmez; dolan bir emrin
+listeden düşmesiyle **aynı** işlemi (`txn_type: 2`, `ORDER_DELETE`) üretir
+ve `retcode` hâlâ 10009 (`DONE`) gelebilir — çünkü emrin *yerleştirilmesi*
+başarılıydı, yürütülmesi değil. İkisini ayıran tek alan `order_state`
+(`6` = `EXPIRED`) ve köprü bu ayrımı sizin için `kind` alanına yansıtır.
+
+**Yalnızca `retcode`a bakan bir istemci, süresi dolmuş emri dolmuş sanar**
+ve var olmayan bir pozisyonu yönetmeye çalışır.
 
 ### Emir sonucu iki aşamalıdır — karıştırmayın
 
@@ -269,13 +280,126 @@ düştüğünü `{"op":"orders"}` ile görebilirsiniz. Bu eksik giderilecek.
 {"t":"order","id":"benim-1","kind":"queued"}
 {"t":"order","id":"benim-1","kind":"ack","retcode":10008}
 {"t":"order","id":"benim-1","kind":"txn","retcode":10009}
-{"t":"order","id":"benim-1","kind":"txn","order":942649399,"deal":931503131,"position":942649399,"volume":0.01,"price":4367.95}
+{"t":"order","id":"benim-1","kind":"txn","order":942649399,"deal":931503131,"position":942649399,"volume":0.01,"price":4367.95,"bid":4367.60,"ask":4367.90,"order_state":4,"txn_type":6}
 ```
 
 - `kind: "ack"` + `retcode: 10008` → istek sunucuya iletildi. **DOLMADI.**
 - `kind: "txn"` + `retcode: 10009` → gerçekten yürütüldü.
 
 Emri yalnızca ikincisiyle "gerçekleşti" sayın.
+
+`kind` değerleri: `queued` · `ack` · `txn` · `expired` · `rejected` ·
+`duplicate` · `sltp_unverified`.
+
+### 🛡️ Stop broker tarafında, köprü stop'u YEDEK — ikisi de dursun
+
+Bu bir tercih değil, **kural**:
+
+| Katman | Rol |
+|---|---|
+| `modify_sltp` ile broker'a yazılan SL | **ASIL koruma.** MT5 sunucusu tutar; `sinyald` ölse, VPS kapansa, ağ kopsa bile çalışır. |
+| İstemcinin kendi stop mantığı | **YEDEK.** Kaldırmayın. |
+
+Köprüdeki stop **tek başına yeterli değildir**: köprü zombi kalırsa
+(bağlantı ayakta görünür ama hiçbir şey işlemez) pozisyonlar saatlerce
+kapanmadan durur. Bu gerçekten yaşandı: köprü 8 saat zombi kaldı, 11
+pozisyon 6 saatlik sınırı aştığı hâlde 10+ saat açık kaldı.
+
+Broker stop'u da **tek başına yeterli değildir**: aşağıya bakın.
+
+**Çift tetiklenme zararsızdır.** İkisi aynı anda tetiklenirse ikinci
+kapatma "pozisyon yok" hatası alır. Bu beklenen davranıştır — ama
+loglayın, sessiz geçmesin.
+
+### ⚠️ `modify_sltp`in KABUL edilmesi, stop'un KURULDUĞU anlamına gelmez
+
+Broker SL'i sessizce düşürebilir: `stops_level` / `freeze_level` ihlali,
+requote, ya da "invalid stops" (`10016`). Pozisyon o an **korumasız**
+kalır ve emir cevabına bakan bir istemci bunu göremez.
+
+Bu yüzden köprü komuttan sonra **3 saniye** boyunca durum yayınındaki
+`positions[].sl` değerini izler. İstenen değere ulaşmazsa:
+
+```json
+{"t":"order","id":"benim-5","kind":"sltp_unverified","ticket":942649399,
+ "istenen_sl":4300.0,"gercek_sl":0.0,"state_age_ms":840,
+ "comment":"durum yayinindaki sl istenen degere ulasmadi — broker stop'u uygulamamis olabilir"}
+```
+
+- **Bu bir HATA DEĞİL, bir UYARIDIR.** Emir kabul edilmiş olabilir;
+  söylenen tek şey, kurulduğunun **doğrulanamadığı**dır.
+- Gördüğünüzde: kendi yedek stop'unuzu **devrede tutun** ve komutu farklı
+  bir seviyeyle (`stops_level` dışında) tekrarlamayı düşünün.
+- `retcode` **yoktur** — bu bizim gözlemimiz, broker cevabı değil. Uydurma
+  bir kod koymak, olayı emir sonucu sanmanıza yol açardı.
+- **Pozisyon KAPANDIYSA uyarı GELMEZ.** Kapanmış pozisyonun stop'u da
+  yoktur; bu tamamen normaldir ve stop'a değerek kapanan her pozisyonda
+  tekrarlanırdı. Buna alarm vermek `sltp_unverified`in tamamını gürültüye
+  çevirirdi. Karar, doğrulama penceresinin dolduğu **an** verilir:
+  pozisyon o an hâlâ açık ve stop'suzsa uyarı gelir; artık yoksa gelmez.
+- `gercek_sl` **yoksa** pozisyonu hiç göremedik demektir — durum görüntüsü
+  **bayat** (>5 sn), kırpılmış, ya da hiç gelmemiş. `0` gönderilmez: "stop
+  yok" ile "bakamadık" aynı şey değildir. Bu uyarının işaret ettiği yer
+  broker değil, **köprüdür**.
+- `state_age_ms` **büyükse suç broker'da olmayabilir** — zombi köprü durum
+  görüntüsünü dondurur ve stop gerçekte kurulmuş olsa bile burada eski
+  değer görünür. "Broker reddetti" ile "köprü ölmüş" arasındaki farkı
+  ayırmanın tek yolu bu sayıdır.
+- Doğrulama penceresi **dolmadan uyarı üretilmez**. Durum yayını saniyede
+  bir tazeleniyor; erken bakıp alarm çalmak, doğru kurulmuş stop'ları da
+  yanlış damgalardı.
+- Broker fiyatı kendi `tick_size` ızgarasına yuvarlarsa bu **başarısızlık
+  sayılmaz**; tolerans bir ızgara adımıdır.
+- Yalnızca **SL** doğrulanır, TP doğrulanmaz. Bilinçli kapsam sınırı:
+  doğrulanmayan bir TP kâr kaçırır, doğrulanmayan bir SL hesabı boşaltır.
+- Uyarı `order` kanalından gelir — ayrı bir aboneliğe gerek yok.
+- Sayaçlar daemon telemetrisine de düşer: `[live] stop: modify_sltp
+  gonderilen=N dogrulanan=N dogrulanamayan=N kapanmis=N bekleyen=N`.
+  `kapanmis` beklenmedik biçimde büyükse, stop komutlarınız pozisyonlar
+  kapandıktan **sonra** gidiyor demektir.
+
+### Giriş maliyetini ayırmak: `bid` / `ask`
+
+Dolum olayı, dolumun VURDUĞU piyasayı taşır. `price` tek başına "ne
+ödedim"i söyler ama "neden"i söylemez:
+
+| Ölçmek istediğiniz | Hesap (alışta) |
+|---|---|
+| Spread maliyeti | `ask - bid` |
+| Kayma (istenen fiyata ulaşılamadı) | `price - ask` |
+| Toplam giriş maliyeti | `price - bid` |
+
+Satışta yönler terstir: kayma `bid - price`.
+
+- **Türetilmiş bir `spread` alanı BİLEREK yok.** `ask - bid`'i kendiniz
+  hesaplayın; iki kaynak, biri güncellenmeyince sessizce tutarsızlaşırdı.
+- Ölçüm yoksa alanlar **hiç gönderilmez** — `"bid":0` gelmez.
+- Asıl kaynak `txn` olayıdır. `ack`te normalde bulunmazlar; istisna
+  **requote** (`retcode` 10004) — orada MT5 kendi piyasa fiyatını döner ve
+  o da gerçek bir ölçümdür. `queued` / `rejected` / `duplicate` köprünün
+  kendi ürettiği olaylardır, alan asla bulunmaz.
+- **Paper/replay kipinde bu alanlar HİÇ gelmez.** Simülatör dolumu tek
+  fiyattan modelliyor; uydurma bir spread üretmek, kayma analizini
+  gerçek ölçümle karıştırırdı.
+- Bu değerler EA'nın **dolum anındaki** tick önbelleğinden okunur. Sonradan
+  `tick` akışından eşleştirmek aynı şey değildir: aradaki milisaniyelerde
+  piyasa değişir ve ölçtüğünüz kayma gerçekte olmayan bir şey olur.
+
+### Ham MT5 durumu: `order_state` / `txn_type`
+
+`kind` özet bir etikettir; ham MT5 enum değerleri de geçirilir.
+
+- `order_state` — `ENUM_ORDER_STATE`. **`3` = `PARTIAL`**: emir KISMEN
+  doldu, kalan hacim hâlâ piyasada. `kind` bunu ayırt etmez (ikisi de
+  `txn`). Diğerleri: `1` `PLACED`, `2` `CANCELED`, `4` `FILLED`,
+  `5` `REJECTED`, `6` `EXPIRED`.
+- `txn_type` — `ENUM_TRADE_TRANSACTION_TYPE`. `2` = `ORDER_DELETE`,
+  `6` = `DEAL_ADD`, `10` = `REQUEST`. **Sıra sezgisel değildir**:
+  `HISTORY_*` 3-5, `DEAL_*` 6-8 — yani `DEAL_*` `HISTORY_*`'tan SONRA
+  gelir.
+
+Her ikisinde de `0` "ölçüm yok" ile aynı sayıya denk düştüğü için
+gönderilmez.
 
 `id: ""` gelen bir olay "bize ait değil" demektir — terminalden elle yapılmış
 bir işlem. Olay asla atılmaz, kimliksiz yayımlanır.
@@ -309,19 +433,24 @@ kalkıyor. Hepsi mevcut:
 | LIMIT / STOP emir | `action:"pending"` + `type:"buy_limit"` … |
 | Bekleyen emri iptal | `{"op":"cancel","id":"..","ticket":N}` |
 | Bekleyen emrin **kalan** hacmi | `orders[].volume_initial` − `.volume_current` |
+| Dolum anındaki **spread ve kayma** | `order` olayındaki `bid` / `ask` |
+| **Kısmi** dolumu tam dolumdan ayırmak | `order` olayındaki `order_state` (`3` = `PARTIAL`) |
+| Bekleyen emrin süresinin dolduğu | `{"t":"order","kind":"expired"}` |
+| Broker SL'i gerçekten kurdu mu | `{"t":"order","kind":"sltp_unverified"}` uyarısı |
 
-> **Stop'u köprüde tutmayın.** Köprü çökerse pozisyon korumasız kalır.
-> `modify_sltp` ile SL'i broker'a yazın; MT5 sunucusu tutar ve `sinyald`
-> ölse bile korur. Köprüdeki stop yalnızca **yedek** olarak kalsın.
+> **Stop'u köprüde tutmayın — ama köprü stop'unu da KALDIRMAYIN.**
+> `modify_sltp` ile SL'i broker'a yazın: MT5 sunucusu tutar ve `sinyald`
+> ölse bile korur. Köprüdeki stop **yedek** olarak kalsın. Broker SL'i
+> reddedebilir; o durumda `sltp_unverified` gelir ve yedeğiniz tek
+> koruma olur. Ayrıntı: §4, "Stop broker tarafında, köprü stop'u YEDEK".
 
 ### Henüz OLMAYAN ve bilmeniz gerekenler
 
 | Eksik | Ne yapmalı |
 |---|---|
 | Kapanış `txn`'inde **gerçekleşmiş** kâr/komisyon/swap | Şimdilik dolum fiyatlarından hesaplayın |
-| Dolum anındaki `bid`/`ask` | `tick` akışından en yakın tick'le eşleştirin |
-| `{"kind":"expired"}` | `{"op":"orders"}` ile biletin düştüğünü görün |
 | Simülatörde komisyon/swap | Paper/replay PnL'i **iyimserdir** |
+| Paper/replay'de dolum anı `bid`/`ask` | Simülatör ölçmez ve **uydurmaz**; alan hiç gelmez |
 
 ---
 

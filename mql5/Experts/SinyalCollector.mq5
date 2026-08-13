@@ -127,7 +127,12 @@ uchar       g_bk_kind[];
 //| program başka bir sembole abone olursa bizim işleyicimiz de       |
 //| tetiklenir (broadcast). Doğrusal tarama 100+ sembolde çok pahalı. |
 //+------------------------------------------------------------------+
-int SymbolIndexOf(const string sym)
+// REFERANSLA alınır, değerle DEĞİL. MQL5'te string'i değerle geçirmek
+// içeriğini kopyalar; bu fonksiyon OnBookEvent ve OnTradeTransaction gibi
+// olay başına çağrılan sıcak yollarda kullanılıyor ve oradaki her tahsis
+// kuyruk baskısına dönüşür (işlem kuyruğu 1024, taşarsa ESKİ olaylar
+// sessizce ezilir). Karşılaştırma zaten tahsis yapmıyor; imza da yapmasın.
+int SymbolIndexOf(const string &sym)
   {
    int lo = 0, hi = g_count - 1;
    while(lo <= hi)
@@ -639,8 +644,14 @@ void OnBookEvent(const string &symbol)
 //+------------------------------------------------------------------+
 //| OnTradeTransaction — YALNIZCA halkaya yaz.                        |
 //|                                                                  |
-//| Kuyruk 1024 ve yavaş işlemede eskiler EZİLİR. Sembol arama,       |
-//| HistorySelect, Print, dosya I/O burada YAPILMAZ.                  |
+//| Kuyruk 1024 ve yavaş işlemede eskiler EZİLİR. HistorySelect,      |
+//| OrderSelect, PositionSelect, SymbolInfo*, Print, dosya I/O ve     |
+//| tablo TARAMASI burada YAPILMAZ.                                   |
+//|                                                                  |
+//| TEK istisna: sıralı sembol tablosunda İKİLİ ARAMA (SymbolIndexOf).|
+//| Dolum anındaki bid/ask'i önbellekten okumanın başka yolu yok ve   |
+//| ölçümün değeri log(n) karşılaştırmadan kat kat büyük. Bunu        |
+//| doğrusal taramaya ya da SymbolInfoTick'e çevirmek YASAK.          |
 //+------------------------------------------------------------------+
 void OnTradeTransaction(const MqlTradeTransaction &trans,
                         const MqlTradeRequest    &request,
@@ -680,8 +691,33 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    r.position_by      = trans.position_by;
    r.volume           = (trans.volume != 0.0) ? trans.volume : result.volume;
    r.price            = (trans.price  != 0.0) ? trans.price  : result.price;
-   r.bid              = 0.0;
-   r.ask              = 0.0;
+
+   // DOLUM ANINDAKİ PİYASA — giriş maliyetini AYIRMANIN tek yolu.
+   //
+   // `price` tek başına "ne ödedim"i söyler, "neden"i söylemez: spread mi
+   // genişti, motorun istediği fiyata mı ulaşılamadı? `ask - bid` ile
+   // `price - ask` bunu ayırır. Sonradan tick akışından eşleştirmek AYNI
+   // ŞEY DEĞİL — aradaki milisaniyelerde piyasa değişmiş olur ve ölçülen
+   // kayma gerçekte olmayan bir şeyi gösterir.
+   //
+   // SICAK YOL KURALI: burada `SymbolInfoTick` ÇAĞRILMAZ. Terminalin işlem
+   // kuyruğu 1024 elemanlı ve taşarsa ESKİ olaylar sessizce ezilir — yani
+   // ölçüm uğruna olayın kendisini kaybederdik. Tick yolunun zaten
+   // güncellediği önbellekten okuyoruz: maliyeti bir ikili arama.
+   int bidx = SymbolIndexOf(trans.symbol);
+   if(bidx >= 0)
+     {
+      r.bid = g_last_bid[bidx];
+      r.ask = g_last_ask[bidx];
+     }
+   else
+     {
+      // Sembol tablomuzda yok (biz toplamıyoruz). Sıfır bırakmak
+      // "ölçemedim" demek ve çekirdek alanı tele hiç koymaz.
+      r.bid = 0.0;
+      r.ask = 0.0;
+     }
+
    r.recv_qpc         = SinyalQpc();
    r.retcode          = (uint)result.retcode;
    r.retcode_external = (uint)result.retcode_external;

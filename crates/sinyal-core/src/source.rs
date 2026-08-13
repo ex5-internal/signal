@@ -55,7 +55,50 @@ pub enum FeedEvent {
         position: u64,
         volume: f64,
         price: f64,
+        /// Olay ANINDAKİ piyasa fiyatı — 0 ise ölçüm yok.
+        ///
+        /// Giriş maliyetini `spread` ile `kayma` diye AYIRMANIN tek yolu.
+        /// `price` tek başına "ne kadar kaybettim"i söyler ama "neden"i
+        /// söylemez: `ask - bid` spread'i, `price - ask` ise kaymayı verir.
+        /// Bu ayrım olmadan motorun önerdiği fiyatın ulaşılamaz olması ile
+        /// spread'in genişlemesi aynı sayıya karışır.
+        bid: f64,
+        ask: f64,
+        /// MT5 `ENUM_ORDER_STATE` — 0 (`STARTED`) ölçüm yok demektir.
+        order_state: u8,
+        /// MT5 `ENUM_TRADE_TRANSACTION_TYPE` — 0 (`ORDER_ADD`) ölçüm yok.
+        txn_type: u8,
         comment: String,
+    },
+    /// **Broker'a yazılan stop DOĞRULANAMADI.**
+    ///
+    /// `modify_sltp` kabul edilmiş olabilir ama broker'ın uygulamış olması
+    /// AYRI bir sorudur: `stops_level`/`freeze_level` ihlali, requote ya da
+    /// "invalid stops" (10016) emri sessizce düşürür ve pozisyon KORUMASIZ
+    /// kalır. Komuttan sonra bir pencere boyunca durum yayınındaki `sl`
+    /// izlenir; istenen değere ulaşmazsa bu olay üretilir.
+    ///
+    /// **Hata DEĞİL, UYARI.** İstemci kendi yedek stop'unu devrede tutmalı
+    /// ve bunu BİLMELİ — sessiz kalmak, korumasız bir pozisyonu korunmuş
+    /// sanmak demektir.
+    SltpUnverified {
+        instance: Arc<str>,
+        /// `modify_sltp` isteğinin istemci kimliği.
+        id: String,
+        ticket: u64,
+        /// Komutta İSTENEN stop.
+        want_sl: f64,
+        /// Durum yayınındaki GERÇEK stop. Pozisyon hiç bulunamadıysa `None`
+        /// — "0 idi" ile "bakamadık" aynı şey değil.
+        actual_sl: Option<f64>,
+        /// Bakılan durum görüntüsünün yaşı (ms).
+        ///
+        /// Büyükse sorun broker'da değil KÖPRÜDE olabilir: zombi bir köprü
+        /// durumu dondurur ve stop gerçekte kurulmuş olsa bile burada eski
+        /// değer görünür. İki nedeni ayırmanın tek yolu bu sayı.
+        state_age_ms: Option<u64>,
+        /// İnsan okunur sebep.
+        why: &'static str,
     },
     /// Bir mum kapandı.
     ///
@@ -520,25 +563,49 @@ fn reader_loop(
     }
 }
 
-/// Bir emir olayini abonelere yayinla.
-fn emit_order(tx: &broadcast::Sender<FeedEvent>, inst: &Arc<str>, r: &sinyal_proto::Res) {
-    let kind = match r.kind {
+/// Ham `Res`ten tel üzerindeki `kind` etiketini türet.
+///
+/// # Neden `expired` burada doğuyor
+///
+/// MT5 süre dolumunu AYRI bir olay türü olarak bildirmez: bekleyen emrin
+/// süresi dolduğunda `TRADE_TRANSACTION_ORDER_DELETE` gelir — dolan bir
+/// emrin sildiği olayın TA KENDİSİ. İkisini ayıran tek alan `order_state`.
+/// Bu ayrım yapılmazsa süresi dolmuş bir emir istemciye sıradan bir `txn`
+/// olarak görünür ve `retcode` 10009 olduğu için DOLMUŞ sanılır.
+fn order_kind(r: &sinyal_proto::Res) -> &'static str {
+    // Sıra önemli: süre dolumu bir TRADE_TXN kılığında gelir, bu yüzden
+    // genel `txn` etiketinden ÖNCE ayıklanmalı.
+    if r.kind == sinyal_proto::res_kind::TRADE_TXN
+        && r.txn_type == sinyal_proto::txn_type::ORDER_DELETE
+        && r.order_state == sinyal_proto::order_state::EXPIRED
+    {
+        return "expired";
+    }
+    match r.kind {
         sinyal_proto::res_kind::SEND_ACK => "ack",
         sinyal_proto::res_kind::TRADE_TXN => "txn",
         sinyal_proto::res_kind::REJECTED => "rejected",
         sinyal_proto::res_kind::DUPLICATE => "duplicate",
         _ => "unknown",
-    };
+    }
+}
+
+/// Bir emir olayini abonelere yayinla.
+fn emit_order(tx: &broadcast::Sender<FeedEvent>, inst: &Arc<str>, r: &sinyal_proto::Res) {
     let _ = tx.send(FeedEvent::Order {
         instance: inst.clone(),
         client_id: r.client_id,
-        kind,
+        kind: order_kind(r),
         retcode: r.retcode,
         order: r.order,
         deal: r.deal,
         position: r.position,
         volume: r.volume,
         price: r.price,
+        bid: r.bid,
+        ask: r.ask,
+        order_state: r.order_state,
+        txn_type: r.txn_type,
         comment: sinyal_proto::read_fixed_str(&r.comment).to_owned(),
     });
 }
@@ -1035,5 +1102,74 @@ mod tests {
             }
         }
         panic!("komut EA'ya ulaşmadı");
+    }
+
+    // -----------------------------------------------------------------------
+    // `kind` türetimi — süre dolumu bir `txn` kılığında gelir
+    // -----------------------------------------------------------------------
+
+    fn res(kind: u8) -> sinyal_proto::Res {
+        sinyal_proto::Res { kind, ..Default::default() }
+    }
+
+    #[test]
+    fn expired_pending_order_is_not_reported_as_a_fill() {
+        // MT5 süre dolumunu ayrı bir olay türü olarak bildirmez: ORDER_DELETE
+        // + ORDER_STATE_EXPIRED gelir ve `retcode` 10009 (DONE) olabilir —
+        // çünkü emrin YERLEŞTİRİLMESİ başarılıydı. Ayrım yapılmazsa istemci
+        // bunu dolum sanar ve olmayan bir pozisyonu yönetmeye çalışır.
+        let r = sinyal_proto::Res {
+            retcode: 10009,
+            txn_type: sinyal_proto::txn_type::ORDER_DELETE,
+            order_state: sinyal_proto::order_state::EXPIRED,
+            ..res(sinyal_proto::res_kind::TRADE_TXN)
+        };
+        assert_eq!(order_kind(&r), "expired");
+    }
+
+    #[test]
+    fn a_filled_order_leaving_the_list_stays_a_txn() {
+        // Dolan emir de ORDER_DELETE ile listeden düşer. `expired`i yalnızca
+        // txn_type'a bakarak ayırmak, HER dolumu "expired" yapardı.
+        let r = sinyal_proto::Res {
+            txn_type: sinyal_proto::txn_type::ORDER_DELETE,
+            order_state: sinyal_proto::order_state::FILLED,
+            ..res(sinyal_proto::res_kind::TRADE_TXN)
+        };
+        assert_eq!(order_kind(&r), "txn");
+    }
+
+    #[test]
+    fn expired_state_outside_an_order_delete_is_still_a_txn() {
+        // Simetrik tuzak: yalnızca order_state'e bakmak da yeterli değil.
+        let r = sinyal_proto::Res {
+            txn_type: sinyal_proto::txn_type::HISTORY_ADD,
+            order_state: sinyal_proto::order_state::EXPIRED,
+            ..res(sinyal_proto::res_kind::TRADE_TXN)
+        };
+        assert_eq!(order_kind(&r), "txn");
+    }
+
+    #[test]
+    fn existing_kind_labels_are_unchanged() {
+        // `expired` eklenirken mevcut sözleşme BOZULMAMALI: istemciler bu
+        // dört etiketi zaten işliyor.
+        assert_eq!(order_kind(&res(sinyal_proto::res_kind::SEND_ACK)), "ack");
+        assert_eq!(order_kind(&res(sinyal_proto::res_kind::TRADE_TXN)), "txn");
+        assert_eq!(order_kind(&res(sinyal_proto::res_kind::REJECTED)), "rejected");
+        assert_eq!(order_kind(&res(sinyal_proto::res_kind::DUPLICATE)), "duplicate");
+        assert_eq!(order_kind(&res(200)), "unknown");
+    }
+
+    #[test]
+    fn expired_is_derived_only_from_a_live_transaction() {
+        // SEND_ACK'te order_state/txn_type ANLAMSIZDIR (EA sıfır bırakır ama
+        // gelecekte bir alan sızarsa `ack` sessizce `expired`e dönüşmemeli).
+        let r = sinyal_proto::Res {
+            txn_type: sinyal_proto::txn_type::ORDER_DELETE,
+            order_state: sinyal_proto::order_state::EXPIRED,
+            ..res(sinyal_proto::res_kind::SEND_ACK)
+        };
+        assert_eq!(order_kind(&r), "ack");
     }
 }

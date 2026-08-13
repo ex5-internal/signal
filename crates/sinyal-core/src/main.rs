@@ -963,6 +963,7 @@ async fn main() {
         // `None` ise CANLI kip: akış paylaşımlı bellekten geliyor ve emirler
         // gerçekten yürütülür. `Some` ise sunucu hiçbir komut göndermez.
         replay: replay_ctx.clone(),
+        sltp: Arc::new(server::SltpGuard::default()),
     });
 
     // --- PAPER: aynı süreçte İKİNCİ dinleyici, canlı veri + simüle yürütme ---
@@ -1039,7 +1040,11 @@ async fn main() {
                         // Emir olayı GEÇMEZ: canlı terminalde gerçekleşen bir
                         // işlemi paper istemcisine göstermek, onu kendi simüle
                         // emrinin sonucu sanmasına yol açardı.
-                        Ok(FeedEvent::Order { .. }) => {}
+                        // Aynı gerekçe stop uyarısı için de geçerli, hatta
+                        // daha güçlü: canlı bir pozisyonun korumasız kaldığını
+                        // paper istemcisine söylemek, onu SİMÜLE pozisyonu
+                        // sanıp yanlış yerde telafi işlemi yaptırırdı.
+                        Ok(FeedEvent::Order { .. }) | Ok(FeedEvent::SltpUnverified { .. }) => {}
                         Ok(other) => {
                             let _ = bridge_tx.send(other);
                         }
@@ -1086,6 +1091,9 @@ async fn main() {
                 hist_slots: Arc::new(tokio::sync::Semaphore::new(server::HIST_SLOTS)),
                 sim: Some(sim),
                 replay: None,
+                // AYRI defter: paper'da doğrulanamayan bir stop, canlı
+                // sayaçları kirletmemeli.
+                sltp: Arc::new(server::SltpGuard::default()),
             });
             Some((listener, paper_ctx, cfg.bind.clone(), cfg.balance))
         }
@@ -1175,10 +1183,18 @@ async fn main() {
     // yolu. Sessiz bir daemon, "çalışıyor mu bilmiyorum" demektir. Replay'de
     // okuyucu da sayaç da yok; orada bu döngü hiç kurulmaz.
     let telemetry_candles = candles.clone();
+    // Stop doğrulama sayaçları — canlı/replay ve paper AYRI defterler.
+    //
+    // Okuyucu sayaçlarına (`stats_all`) BAĞLI DEĞİL: replay'de okuyucu hiç
+    // çalışmaz ama `modify_sltp` yine gönderilebilir ve doğrulanamayan bir
+    // stop orada da sessiz kalmamalı. Bu yüzden eski "okuyucu yoksa hiç
+    // rapor verme" erken dönüşü kaldırıldı.
+    let mut telemetry_sltp: Vec<(String, Arc<server::SltpGuard>)> =
+        vec![(ctx.mode().to_string(), ctx.sltp.clone())];
+    if let Some((_, paper_ctx, _, _)) = &paper_srv {
+        telemetry_sltp.push((server::MODE_PAPER.to_string(), paper_ctx.sltp.clone()));
+    }
     tokio::spawn(async move {
-        if stats_all.is_empty() {
-            return;
-        }
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
         tick.tick().await;
         loop {
@@ -1251,6 +1267,36 @@ async fn main() {
                         "[{inst}] NOT: {} emir olayi hicbir komuta baglanamadi \
                          (elle islem yaptiysan normal).",
                         s.join_unattributed
+                    );
+                }
+            }
+
+            // Broker stop'u KURULDU MU. Hiç komut gönderilmediyse satır da
+            // yok — her 30 saniyede bir sıfır basmak, gerçek sayının gözden
+            // kaçmasına yol açardı.
+            for (label, guard) in &telemetry_sltp {
+                let c = guard.counts();
+                if c.sent == 0 {
+                    continue;
+                }
+                println!(
+                    "[{label}] stop: modify_sltp gonderilen={} dogrulanan={} dogrulanamayan={} \
+                     kapanmis={} bekleyen={}",
+                    c.sent,
+                    c.verified,
+                    c.unverified,
+                    c.closed,
+                    c.sent
+                        .saturating_sub(c.verified + c.unverified + c.closed),
+                );
+                // Doğrulanamayan stop = KORUMASIZ olabilecek pozisyon.
+                // Sessiz kalması raporun asıl şikâyetiydi.
+                if c.unverified > 0 {
+                    println!(
+                        "[{label}] UYARI: {} stop komutunun KURULDUGU dogrulanamadi \
+                         — broker reddetmis ya da kopru bayat olabilir. Istemci kendi \
+                         yedek stop'unu devrede tutmali.",
+                        c.unverified
                     );
                 }
             }

@@ -417,6 +417,61 @@ pub mod res_source {
     pub const RECONCILE: u8 = 1;
 }
 
+/// `Res.order_state` — MT5 `ENUM_ORDER_STATE`.
+///
+/// # Değerler TAHMİN DEĞİL, derleyiciye sorularak doğrulandı
+///
+/// MQL5 enum'ları `#include` edilebilir bir başlıkta değil, derleyicide
+/// gömülüdür; buradaki sayılar `metaeditor64.exe` ile derlenen bir
+/// `int a[(ORDER_STATE_EXPIRED == 6) ? 1 : -1];` sondasıyla doğrulandı
+/// (yanlış değerde negatif dizi boyutu derleme hatası verir).
+///
+/// **`EXPIRED` bir başarısızlık değildir.** Bekleyen emrin süresi doldu;
+/// `retcode` hâlâ 10009 (`DONE`) olabilir çünkü emrin *yerleştirilmesi*
+/// başarılıydı. `retcode`a bakarak dolum sanmak buradaki tuzak.
+pub mod order_state {
+    pub const STARTED: u8 = 0;
+    pub const PLACED: u8 = 1;
+    pub const CANCELED: u8 = 2;
+    /// Kısmen doldu — kalan hacim hâlâ piyasada.
+    pub const PARTIAL: u8 = 3;
+    pub const FILLED: u8 = 4;
+    pub const REJECTED: u8 = 5;
+    /// Süre doldu; bilet düştü. `TRADE_TRANSACTION_ORDER_DELETE` ile gelir.
+    pub const EXPIRED: u8 = 6;
+}
+
+/// `Res.txn_type` — MT5 `ENUM_TRADE_TRANSACTION_TYPE`.
+///
+/// # Sıra SEZGİSEL DEĞİL
+///
+/// `DEAL_*` (6,7,8) ile `HISTORY_*` (3,4,5) beklenenin TERSİ sırada.
+/// "ORDER, DEAL, HISTORY" diye ardışık varsaymak sessizce yanlış olurdu;
+/// bu yüzden hepsi `order_state`teki derleyici sondasıyla doğrulandı.
+///
+/// Derleyicinin yanında **canlı kanıt** da var: demo hesapta tek bir 0.01
+/// GOLD alışı şu `txn_type` dizisini üretti —
+/// `10` (`REQUEST`) → `6` (`DEAL_ADD`, `deal` ve `price` dolu) →
+/// `2` (`ORDER_DELETE`, `order_state` = `4` `FILLED`) →
+/// `3` (`HISTORY_ADD`) → `9` (`POSITION`).
+/// Yani dolum olayı 6, geçmişe yazım 3. Buradaki eşleme gözlemle birebir
+/// tutuyor.
+pub mod txn_type {
+    pub const ORDER_ADD: u8 = 0;
+    pub const ORDER_UPDATE: u8 = 1;
+    /// Emir listeden düştü: doldu, iptal edildi ya da SÜRESİ DOLDU.
+    /// Hangisi olduğu yalnızca `order_state`ten anlaşılır.
+    pub const ORDER_DELETE: u8 = 2;
+    pub const HISTORY_ADD: u8 = 3;
+    pub const HISTORY_UPDATE: u8 = 4;
+    pub const HISTORY_DELETE: u8 = 5;
+    pub const DEAL_ADD: u8 = 6;
+    pub const DEAL_UPDATE: u8 = 7;
+    pub const DEAL_DELETE: u8 = 8;
+    pub const POSITION: u8 = 9;
+    pub const REQUEST: u8 = 10;
+}
+
 /// EA'dan çekirdeğe emir sonucu / ticaret olayı.
 ///
 /// # Kimlik eşleştirmesi ÇEKİRDEKTE yapılır
