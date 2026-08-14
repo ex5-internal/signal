@@ -535,7 +535,28 @@ pub struct Res {
     /// `res_source::*` — canlı olay mı, mutabakat telafisi mi.
     pub source: u8,
     pub _pad1: [u8; 2],
-    pub _reserved: [u8; 48],
+
+    // --- GERÇEKLEŞMİŞ SONUÇ ---
+    //
+    // Bu üç alan eski `_reserved`in İÇİNE yerleştirildi: yapı boyutu 184'te
+    // kaldı, `RING_VERSION` artmadı, eski bir EA baytları sıfır bırakır.
+    //
+    // YALNIZCA `source == res_source::RECONCILE` olayında anlamlıdırlar.
+    // Canlı `OnTradeTransaction` olayında sıfırdırlar ve öyle KALMALIDIR:
+    // sıcak yolda `HistoryDealGetDouble` çağrılamaz — terminalin işlem
+    // kuyruğu 1024 elemanlı ve taşarsa ESKİ olaylar sessizce ezilir. Değerler
+    // EA'nın `OnTimer` mutabakat turunda okunur.
+    /// Deal'in gerçekleşmiş kârı (`DEAL_PROFIT`), hesap para biriminde.
+    pub profit: f64,
+    /// Komisyon (`DEAL_COMMISSION`).
+    ///
+    /// **Genellikle GİRİŞ deal'inde görünür**, çıkışta 0 olabilir. Yalnız
+    /// çıkışa bakıp "komisyon yok" sonucuna varmak yaygın bir hatadır.
+    pub commission: f64,
+    /// Gecelik taşıma (`DEAL_SWAP`).
+    pub swap: f64,
+
+    pub _reserved: [u8; 24],
 }
 
 impl Default for Res {
@@ -563,7 +584,10 @@ impl Default for Res {
             order_type: 0,
             source: res_source::LIVE,
             _pad1: [0; 2],
-            _reserved: [0; 48],
+            profit: 0.0,
+            commission: 0.0,
+            swap: 0.0,
+            _reserved: [0; 24],
         }
     }
 }

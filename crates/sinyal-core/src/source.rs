@@ -68,6 +68,17 @@ pub enum FeedEvent {
         order_state: u8,
         /// MT5 `ENUM_TRADE_TRANSACTION_TYPE` — 0 (`ORDER_ADD`) ölçüm yok.
         txn_type: u8,
+        /// Olay canlı akıştan mı, mutabakattan mı (`res_source::*`).
+        ///
+        /// Gerçekleşmiş `profit`/`commission`/`swap` YALNIZCA mutabakat
+        /// olayında doludur; canlı olayda sıcak yol kısıtı yüzünden okunamaz.
+        source: u8,
+        /// Gerçekleşmiş kâr (`DEAL_PROFIT`) — yalnız mutabakat olayında.
+        profit: f64,
+        /// Komisyon (`DEAL_COMMISSION`) — yalnız mutabakat olayında.
+        commission: f64,
+        /// Gecelik taşıma (`DEAL_SWAP`) — yalnız mutabakat olayında.
+        swap: f64,
         comment: String,
     },
     /// **Broker'a yazılan stop DOĞRULANAMADI.**
@@ -606,6 +617,10 @@ fn emit_order(tx: &broadcast::Sender<FeedEvent>, inst: &Arc<str>, r: &sinyal_pro
         ask: r.ask,
         order_state: r.order_state,
         txn_type: r.txn_type,
+        source: r.source,
+        profit: r.profit,
+        commission: r.commission,
+        swap: r.swap,
         comment: sinyal_proto::read_fixed_str(&r.comment).to_owned(),
     });
 }

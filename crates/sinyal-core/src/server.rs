@@ -901,6 +901,10 @@ fn to_wire(ev: &FeedEvent, ctx: &Ctx) -> Option<ServerMsg> {
             ask,
             order_state,
             txn_type,
+            source,
+            profit,
+            commission,
+            swap,
             comment,
         } => {
             // Bizim göndermediğimiz bir işlem (ör. elle kapatma) olabilir;
@@ -923,6 +927,20 @@ fn to_wire(ev: &FeedEvent, ctx: &Ctx) -> Option<ServerMsg> {
                 ask: (*ask != 0.0).then_some(*ask),
                 order_state: (*order_state != 0).then_some(*order_state),
                 txn_type: (*txn_type != 0).then_some(*txn_type),
+                // Mutabakat bayrağı yalnız DOĞRUYKEN gider: `false` göndermek
+                // her olaya bir alan ekler ve hiçbir şey söylemez.
+                reconciled: (*source == sinyal_proto::res_source::RECONCILE).then_some(true),
+                // Gerçekleşmiş sonuç YALNIZCA mutabakat olayında anlamlı.
+                // Canlı olayda alanlar sıfırdır ve sıfırı telden geçirmek
+                // "kâr sıfırdı" dedirtirdi — oysa ölçüm hiç yapılmadı.
+                //
+                // Mutabakat olayında sıfır GEÇERLİ bir değerdir (komisyonsuz
+                // hesapta komisyon gerçekten 0'dır), o yüzden orada sıfır da
+                // gönderilir. Ayrım `reconciled` bayrağıyla yapılır.
+                profit: (*source == sinyal_proto::res_source::RECONCILE).then_some(*profit),
+                commission: (*source == sinyal_proto::res_source::RECONCILE)
+                    .then_some(*commission),
+                swap: (*source == sinyal_proto::res_source::RECONCILE).then_some(*swap),
                 // Emir yaşam döngüsü olayları stop doğrulama alanlarını
                 // TAŞIMAZ. Açıkça yazılıyor (`..Default` ile geçiştirilmiyor)
                 // ki ileride eklenen bir alan sessizce boş kalmasın.
@@ -1802,6 +1820,17 @@ fn feed_order(src: &Arc<str>, ev: &SimEvent) -> FeedEvent {
         ask: 0.0,
         order_state: 0,
         txn_type: 0,
+        // Simülasyonda MUTABAKAT YOKTUR: kaçırılacak bir olay yok, çünkü
+        // olayları motorun kendisi üretiyor. `LIVE` bırakmak "bu olay canlı
+        // akıştan geldi" demek değil; "mutabakat telafisi DEĞİL" demek.
+        source: sinyal_proto::res_source::LIVE,
+        // Motor komisyon ve swap MODELLEMİYOR (bkz. `SIM_NOT_MODELED`).
+        // Sıfır yazmak "komisyon sıfırdı" gibi okunurdu; `source` LIVE
+        // olduğu için bu alanlar tel üzerinde HİÇ görünmez ve istemci
+        // ölçüm olmadığını anlar.
+        profit: 0.0,
+        commission: 0.0,
+        swap: 0.0,
         comment: cause_comment(ev.cause),
     }
 }
@@ -2512,6 +2541,10 @@ mod tests {
             ask: 0.0,
             order_state: 0,
             txn_type: 0,
+            source: sinyal_proto::res_source::LIVE,
+            profit: 0.0,
+            commission: 0.0,
+            swap: 0.0,
             comment: String::new(),
         };
         s.add("tick.*");
@@ -3430,12 +3463,21 @@ mod tests {
             ask: 1.2344,
             order_state: sinyal_proto::order_state::FILLED,
             txn_type: sinyal_proto::txn_type::DEAL_ADD,
+            source: sinyal_proto::res_source::LIVE,
+            profit: 0.0,
+            commission: 0.0,
+            swap: 0.0,
             comment: String::new(),
         };
         let msg = to_wire(&ev, &ctx).unwrap();
         match &msg {
             ServerMsg::Order(e) => {
                 assert!(!e.sim, "canli olay simule isaretlenemez");
+                // Canlı olayda gerçekleşmiş alanlar TELDE OLMAMALI: sıcak
+                // yolda okunamıyorlar ve sıfırı göndermek "kâr sıfırdı"
+                // dedirtirdi.
+                assert!(e.reconciled.is_none(), "canli olay mutabakat isaretlenemez");
+                assert!(e.profit.is_none() && e.commission.is_none() && e.swap.is_none());
                 // Ölçüm alanları EA'dan tele KESİNTİSİZ geçmeli; bir yerde
                 // düşürülürse kayma analizi sessizce imkânsız hale gelir.
                 assert_eq!(e.bid, Some(1.2343));
@@ -3451,6 +3493,53 @@ mod tests {
         // Reddedilen canlı emirler de temiz olmalı.
         let j = serde_json::to_string(&rejected(&ctx, "o1", "test")).unwrap();
         assert!(!j.contains("sim"), "{j}");
+    }
+
+    /// Mutabakat olayı gerçekleşmiş sonucu tele TAŞIMALI — sıfır olsa bile.
+    ///
+    /// İki ayrı şeyi birden sabitliyor:
+    /// 1. `reconciled: true` gitmeli — istemci "geç gelen" olayı canlıdan
+    ///    ayırt edebilmeli, yoksa aynı dolumu iki kez sayar.
+    /// 2. Komisyon **sıfırken de** gönderilmeli. Ölçüldü: bu brokerda GOLD
+    ///    komisyonsuz. "Sıfırı atla" optimizasyonu, komisyonsuz bir hesapta
+    ///    alanı hiç göstermez ve istemci "ölçüm yok" sanardı — oysa ölçüm
+    ///    yapıldı ve sonucu sıfır.
+    #[test]
+    fn reconcile_events_carry_realized_result_even_when_zero() {
+        let (ctx, _rx) = live_ctx(7, 0.0);
+        let ev = FeedEvent::Order {
+            instance: Arc::from("mt5-1"),
+            client_id: 0,
+            kind: "txn",
+            retcode: 10009,
+            order: 5,
+            deal: 6,
+            position: 7,
+            volume: 0.01,
+            price: 4350.0,
+            bid: 0.0,
+            ask: 0.0,
+            order_state: sinyal_proto::order_state::FILLED,
+            txn_type: sinyal_proto::txn_type::DEAL_ADD,
+            source: sinyal_proto::res_source::RECONCILE,
+            profit: 12.34,
+            commission: 0.0,
+            swap: -0.89,
+            comment: String::new(),
+        };
+        let msg = to_wire(&ev, &ctx).unwrap();
+        match &msg {
+            ServerMsg::Order(e) => {
+                assert_eq!(e.reconciled, Some(true), "mutabakat isareti dusmus");
+                assert_eq!(e.profit, Some(12.34));
+                assert_eq!(e.commission, Some(0.0), "SIFIR komisyon da olculmus bir degerdir");
+                assert_eq!(e.swap, Some(-0.89));
+            }
+            other => panic!("beklenmeyen: {other:?}"),
+        }
+        let j = serde_json::to_string(&msg).unwrap();
+        assert!(j.contains(r#""reconciled":true"#), "{j}");
+        assert!(j.contains(r#""commission":0.0"#), "sifir komisyon telde olmali: {j}");
     }
 
     #[test]
@@ -3822,6 +3911,10 @@ mod tests {
             ask: 0.0,
             order_state: 0,
             txn_type: 0,
+            source: sinyal_proto::res_source::LIVE,
+            profit: 0.0,
+            commission: 0.0,
+            swap: 0.0,
             comment: String::new(),
         };
 

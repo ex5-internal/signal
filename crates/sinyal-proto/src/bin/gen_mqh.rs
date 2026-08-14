@@ -53,6 +53,19 @@ const SYM_MARGIN_HEDGED_OFF: usize = std::mem::offset_of!(SymbolEntry, margin_he
 const SYM_SWAP_MODE_OFF: usize = std::mem::offset_of!(SymbolEntry, swap_mode);
 const SYM_SWAP_ROLLOVER_OFF: usize = std::mem::offset_of!(SymbolEntry, swap_rollover3d);
 const SYM_RESERVED_OFF: usize = std::mem::offset_of!(SymbolEntry, _reserved);
+
+/// `Res`in gerçekleşmiş sonuç bloğunun ofsetleri.
+///
+/// Aynı gerekçe `SymbolEntry`dekiyle birebir aynı: bu alanlar eski
+/// `_reserved`in İÇİNE yerleştiği için `Res` 120 baytta kaldı ve boyut testi
+/// bloğu HİÇ görmez — üç alan yanlış sıraya yazılsa bile test GEÇER.
+/// Ofsetleri `offset_of!`tan üretmek tek gerçek korumadır.
+const RES_PROFIT_OFF: usize = std::mem::offset_of!(Res, profit);
+const RES_COMMISSION_OFF: usize = std::mem::offset_of!(Res, commission);
+const RES_SWAP_OFF: usize = std::mem::offset_of!(Res, swap);
+const RES_RESERVED_OFF: usize = std::mem::offset_of!(Res, _reserved);
+/// Gerçekleşmiş bloktan SONRA kalan dolgu — MQL5 `reserved2[]` uzunluğu.
+const RES_RESERVED_LEN: usize = size_of::<Res>() - RES_RESERVED_OFF;
 /// Sözleşme bloğundan SONRA kalan dolgu — MQL5 `reserved1[]` uzunluğu.
 const SYM_RESERVED_LEN: usize = size_of::<SymbolEntry>() - SYM_RESERVED_OFF;
 
@@ -435,7 +448,14 @@ struct SinyalRes
    uchar             order_type;     // +132 ENUM_ORDER_TYPE
    uchar             source;         // +133 SINYAL_RESSRC_*
    uchar             reserved1[2];   // +134
-   uchar             reserved2[48];  // +136
+   //--- GERCEKLESMIS SONUC — yalniz source == SINYAL_RESSRC_RECONCILE'da dolu
+   //    Sicak yolda (OnTradeTransaction) HistoryDealGetDouble CAGRILMAZ:
+   //    islem kuyrugu 1024 ve tasarsa ESKI olaylar sessizce ezilir.
+   //    Bu degerler OnTimer mutabakat turunda okunur.
+   double            profit;         // +{res_profit_off}  DEAL_PROFIT
+   double            commission;     // +{res_commission_off}  DEAL_COMMISSION (genelde GIRIS deal'inde)
+   double            swap;           // +{res_swap_off}  DEAL_SWAP
+   uchar             reserved2[{res_reserved_len}];  // +{res_reserved_off}
   }};
 
 //+------------------------------------------------------------------+
@@ -675,6 +695,11 @@ struct SinyalBarRec
         sym_swap_rollover_off = SYM_SWAP_ROLLOVER_OFF,
         sym_reserved_off = SYM_RESERVED_OFF,
         sym_reserved_len = SYM_RESERVED_LEN,
+        res_profit_off = RES_PROFIT_OFF,
+        res_commission_off = RES_COMMISSION_OFF,
+        res_swap_off = RES_SWAP_OFF,
+        res_reserved_off = RES_RESERVED_OFF,
+        res_reserved_len = RES_RESERVED_LEN,
         hist_symbol_len = HIST_SYMBOL_LEN,
         hist_symbol_off = HIST_SYMBOL_OFF,
         hist_tail = size_of::<HistReq>() - HIST_SYMBOL_OFF - HIST_SYMBOL_LEN,

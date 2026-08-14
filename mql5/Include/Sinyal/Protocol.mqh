@@ -318,7 +318,14 @@ struct SinyalRes
    uchar             order_type;     // +132 ENUM_ORDER_TYPE
    uchar             source;         // +133 SINYAL_RESSRC_*
    uchar             reserved1[2];   // +134
-   uchar             reserved2[48];  // +136
+   //--- GERCEKLESMIS SONUC — yalniz source == SINYAL_RESSRC_RECONCILE'da dolu
+   //    Sicak yolda (OnTradeTransaction) HistoryDealGetDouble CAGRILMAZ:
+   //    islem kuyrugu 1024 ve tasarsa ESKI olaylar sessizce ezilir.
+   //    Bu degerler OnTimer mutabakat turunda okunur.
+   double            profit;         // +136  DEAL_PROFIT
+   double            commission;     // +144  DEAL_COMMISSION (genelde GIRIS deal'inde)
+   double            swap;           // +152  DEAL_SWAP
+   uchar             reserved2[24];  // +160
   };
 
 //+------------------------------------------------------------------+

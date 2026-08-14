@@ -46,6 +46,7 @@ input bool   EnableTrading   = false;     // Emir yürütmeyi aç (varsayılan K
 input bool   EnableBook      = true;      // DOM aboneliğini dene
 input int    MaxSymbols      = 512;       // Üst sınır (Market Watch limiti 1000)
 input bool   VerboseLog      = true;      // Açılışta ayrıntılı teşhis
+input int    ReconcileSec    = 5;         // Gerçekleşmiş sonuç mutabakatı (0 = kapalı)
 
 //--- durum ----------------------------------------------------------
 long   g_handle = 0;
@@ -100,6 +101,15 @@ ulong  g_msc_regress    = 0;   // time_msc geriye gitti (anomali)
 ulong  g_cmds_done      = 0;
 ulong  g_cmds_rejected  = 0;
 ulong  g_timer_skips    = 0;   // OnTimer olayı düşürüldü
+// Mutabakat turu (gerçekleşmiş kâr/komisyon/swap).
+//
+// `g_recon_last_deal` bir SU HATTI: MT5'te deal biletleri artan sırada
+// verilir, o yüzden "bundan büyük olanlar yeni" demek yeterli ve tur başına
+// tablo tutmaya gerek yok. 0 = henüz hiç tur koşmadı (ilk tur yayımlamaz).
+ulong  g_recon_last_deal = 0;
+datetime g_recon_last_run = 0;
+ulong  g_recon_sent      = 0;  // mutabakattan yayımlanan olay
+ulong  g_recon_failed    = 0;  // HistorySelect başarısız
 ulong  g_last_timer_qpc = 0;
 ulong  g_qpc_freq       = 1;
 datetime g_last_report  = 0;
@@ -729,6 +739,11 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    r.deal_type        = (uchar)trans.deal_type;
    r.order_type       = (uchar)trans.order_type;
    r.source           = SINYAL_RESSRC_LIVE;
+   // MQL5 yerel struct'i SIFIRLAMAZ; gerceklesmis alanlar canli yolda
+   // okunamiyor ve cop deger halkaya girmemeli.
+   r.profit           = 0.0;
+   r.commission = 0.0;
+   r.swap           = 0.0;
    ArrayInitialize(r.reserved1, 0);
    ArrayInitialize(r.reserved2, 0);
 
@@ -930,6 +945,100 @@ void OnTrade()
   }
 
 //+------------------------------------------------------------------+
+//| MUTABAKAT — gerçekleşmiş kâr/komisyon/swap.                       |
+//|                                                                  |
+//| NEDEN AYRI BİR TUR                                                 |
+//|                                                                  |
+//| `OnTradeTransaction` sıcak yoldur: terminalin işlem kuyruğu 1024   |
+//| elemanlı ve işleyici yavaşlarsa ESKİ olaylar sessizce ezilir.      |
+//| `HistoryDealGetDouble` orada çağrılamaz. Ama gerçekleşmiş sonuç    |
+//| YALNIZCA geçmişte vardır — canlı olay onu taşımaz.                 |
+//|                                                                  |
+//| Çözüm: `OnTimer` içinde, sıcak yol DIŞINDA, seyrek bir tur.        |
+//|                                                                  |
+//| `client_id` BURADA DA 0 bırakılır. Eşleştirme çekirdekte           |
+//| `order`/`position` üzerinden geç bağlamayla yapılıyor; EA'da       |
+//| ikinci bir tablo tutmak aynı bilgiyi iki yerde tutmak olurdu ve    |
+//| ikisi kaydığında hangisinin doğru olduğu bilinemezdi.              |
+//|                                                                  |
+//| İLK TURDA HİÇBİR ŞEY YAYIMLANMAZ: yalnızca su hattı işaretlenir.   |
+//| Aksi halde EA her açılışta son bir saatin tüm deal'lerini "yeni"   |
+//| diye gönderir ve istemci kapanmış işlemleri tekrar sayardı.        |
+//+------------------------------------------------------------------+
+void ReconcileDeals()
+  {
+   if(ReconcileSec <= 0) return;
+
+   datetime now_s = TimeCurrent();
+   if(g_recon_last_run != 0 && (now_s - g_recon_last_run) < ReconcileSec)
+      return;
+   g_recon_last_run = now_s;
+
+   // Pencere sabit: bir saat, 5 saniyelik turda fazlasıyla yeterli ve
+   // taramayı sınırlı tutar. Geçmişin tamamını seçmek her turda büyüyen
+   // bir maliyet olurdu.
+   if(!HistorySelect(now_s - 3600, now_s + 60))
+     {
+      g_recon_failed++;
+      return;
+     }
+
+   int n = HistoryDealsTotal();
+   ulong high = g_recon_last_deal;
+   bool  first = (g_recon_last_deal == 0);
+
+   for(int i = 0; i < n; i++)
+     {
+      ulong t = HistoryDealGetTicket(i);
+      if(t == 0) continue;
+      if(t > high) high = t;
+      if(first) continue;                 // ilk tur: yalnız su hattı
+      if(t <= g_recon_last_deal) continue; // zaten bildirildi
+
+      // BAKİYE/KREDİ hareketleri işlem değildir; emir akışına karıştırmak
+      // istemcinin "kimliksiz dolum" saymasına yol açardı.
+      long dtype = HistoryDealGetInteger(t, DEAL_TYPE);
+      if(dtype != DEAL_TYPE_BUY && dtype != DEAL_TYPE_SELL) continue;
+
+      SinyalRes r;
+      r.client_id        = 0;             // çekirdek bağlayacak
+      r.order            = (ulong)HistoryDealGetInteger(t, DEAL_ORDER);
+      r.deal             = t;
+      r.position         = (ulong)HistoryDealGetInteger(t, DEAL_POSITION_ID);
+      r.position_by      = 0;
+      r.volume           = HistoryDealGetDouble(t, DEAL_VOLUME);
+      r.price            = HistoryDealGetDouble(t, DEAL_PRICE);
+      r.bid              = 0.0;           // geçmişte yok; UYDURULMAZ
+      r.ask              = 0.0;
+      r.recv_qpc         = SinyalQpc();
+      r.retcode          = 0;             // broker cevabı değil, geçmiş kaydı
+      r.retcode_external = 0;
+      r.request_id       = 0;
+      r.reserved0        = 0;
+      r.kind             = SINYAL_RES_TRADE_TXN;
+      r.txn_type         = 0;
+      r.order_state      = 0;
+      r.deal_type        = (uchar)dtype;
+      r.order_type       = 0;
+      r.source           = SINYAL_RESSRC_RECONCILE;
+      // ASIL YÜK — bunlar için var bu tur.
+      r.profit           = HistoryDealGetDouble(t, DEAL_PROFIT);
+      r.commission       = HistoryDealGetDouble(t, DEAL_COMMISSION);
+      r.swap             = HistoryDealGetDouble(t, DEAL_SWAP);
+      ArrayInitialize(r.reserved1, 0);
+      ArrayInitialize(r.reserved2, 0);
+      ArrayInitialize(r.comment, 0);
+
+      if(SinyalPushRes(g_handle, r) != SINYAL_OK)
+         g_res_dropped++;
+      else
+         g_recon_sent++;
+     }
+
+   g_recon_last_deal = high;
+  }
+
+//+------------------------------------------------------------------+
 //| Reddedilen komut için sonuç bildir.                               |
 //+------------------------------------------------------------------+
 void PushRejection(const ulong client_id, const string why)
@@ -944,6 +1053,11 @@ void PushRejection(const ulong client_id, const string why)
    r.kind = SINYAL_RES_REJECTED;
    r.txn_type = 0; r.order_state = 0; r.deal_type = 0; r.order_type = 0;
    r.source = SINYAL_RESSRC_LIVE;
+   // MQL5 yerel struct'i SIFIRLAMAZ; gerceklesmis alanlar canli yolda
+   // okunamiyor ve cop deger halkaya girmemeli.
+   r.profit = 0.0;
+   r.commission = 0.0;
+   r.swap = 0.0;
    ArrayInitialize(r.reserved1, 0);
    ArrayInitialize(r.reserved2, 0);
    SinyalWriteFixed(r.comment, SINYAL_COMMENT_LEN, why);
@@ -1105,6 +1219,11 @@ void ExecuteCmd(const SinyalCmd &cmd)
    ack.deal_type        = 0;
    ack.order_type       = cmd.order_type;
    ack.source           = SINYAL_RESSRC_LIVE;
+   // MQL5 yerel struct'i SIFIRLAMAZ; gerceklesmis alanlar canli yolda
+   // okunamiyor ve cop deger halkaya girmemeli.
+   ack.profit           = 0.0;
+   ack.commission = 0.0;
+   ack.swap           = 0.0;
    ArrayInitialize(ack.reserved1, 0);
    ArrayInitialize(ack.reserved2, 0);
    SinyalWriteFixed(ack.comment, SINYAL_COMMENT_LEN, res.comment);
@@ -1133,13 +1252,20 @@ void ReportTelemetry(const bool force)
    PrintFormat("Sinyal: tick=%I64u (+%I64u) halka-kayip=%I64u birikmis=%I64u | "
                "dom=%I64u (kayip=%I64u) | kopru-hata=%I64u symtick-hata=%I64u | "
                "timer-atlama=%I64u msc-geri=%I64u | emir=%I64u/red=%I64u | "
-               "durum=%I64u/hata=%I64u res-kayip=%I64u",
+               "durum=%I64u/hata=%I64u res-kayip=%I64u | mutabakat=%I64u/hata=%I64u",
                g_ticks_pushed, delta, ring_lost, backlog,
                g_books_pushed, g_books_dropped,
                g_push_errors, g_symtick_fails,
                g_timer_skips, g_msc_regress,
                g_cmds_done, g_cmds_rejected,
-               g_state_pubs, g_state_errs, g_res_dropped);
+               g_state_pubs, g_state_errs, g_res_dropped,
+               g_recon_sent, g_recon_failed);
+
+   // Mutabakat kapalıysa bunu SÖYLE: gerçekleşmiş kâr/komisyon/swap telde
+   // hiç görünmez ve istemci "alan yok" ile "ölçüm kapalı"yı ayıramaz.
+   if(ReconcileSec <= 0)
+      Print("Sinyal: mutabakat KAPALI (ReconcileSec=0) — gerceklesmis "
+            "kar/komisyon/swap telde GORUNMEZ.");
 
    // Durum hiç yayımlanmadıysa çekirdek hesap/pozisyon göremez. Bu sessiz
    // kalırsa "account boş dönüyor" sorununun sebebi anlaşılamaz.
@@ -1227,6 +1353,10 @@ void OnTimer()
       g_last_state_pub = now_s;
       g_state_dirty = false;
      }
+
+   // 4) Gerçekleşmiş sonuç mutabakatı. Kendi periyodunu kendi yönetir;
+   //    burada her turda çağrılması zararsız (içeride erken döner).
+   ReconcileDeals();
 
    ReportTelemetry(false);
   }

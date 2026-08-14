@@ -654,6 +654,34 @@ pub struct OrderEvent {
     /// dönüşmez, ama sıfır dolu bir alanı "veri var" sanmak pahalıdır.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub txn_type: Option<u8>,
+
+    /// Olay **mutabakattan** geldi mi (`true`) yoksa canlı akıştan mı.
+    ///
+    /// Terminalin işlem kuyruğu 1024 elemanlı ve taşarsa eski olaylar
+    /// sessizce ezilir. EA periyodik olarak geçmişi tarayıp kaçırdığı
+    /// olayları telafi eder; bu bayrak "geç geldi" demektir, "yeni oldu"
+    /// değil. Yalnız `true` iken gönderilir.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reconciled: Option<bool>,
+    /// **Gerçekleşmiş** kâr (`DEAL_PROFIT`), hesap para biriminde.
+    ///
+    /// `positions[].profit` YÜZEN kârdır; bu ise kapanmış deal'in kesin
+    /// sonucudur. Yalnızca `reconciled: true` olaylarda bulunur — canlı
+    /// olayda okunamaz, çünkü sıcak yolda `HistoryDealGetDouble`
+    /// çağrılamaz (kuyruk taşması riski).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profit: Option<f64>,
+    /// Komisyon (`DEAL_COMMISSION`).
+    ///
+    /// ⚠️ Genellikle **GİRİŞ** deal'inde görünür, çıkışta `0` olabilir.
+    /// Yalnız çıkışa bakıp "komisyon yok" demek yaygın bir hatadır; bir
+    /// pozisyonun toplam komisyonu için giriş ve çıkış deal'leri toplanır.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commission: Option<f64>,
+    /// Gecelik taşıma (`DEAL_SWAP`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub swap: Option<f64>,
+
     /// `sltp_unverified` — stop'u doğrulanamayan pozisyonun bileti.
     ///
     /// Diğer `kind`lerde bulunmaz: emir yaşam döngüsü olayları pozisyonu
