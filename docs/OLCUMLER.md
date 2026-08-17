@@ -712,12 +712,99 @@ o pencereyi kaçırırsanız 01:00'e kadar mahsursunuz.
 
 ---
 
+## 16. `expire_sn` CANLIDA çalışıyordu, PAPER'da hiç çalışmamış
+
+**Tarih:** 2026-08-17 · **Sembol:** GOLD
+
+Tüketici sistem `expire_sn`in sessizce yok sayıldığını bildirdi ve çalışan
+binary'nin kaynakla aynı sürüm olup olmadığını sordu. İddia **kısmen**
+doğruydu ve nedeni beklenenden farklıydı.
+
+### Binary kimliği — soru haklıydı, cevap "aynı"
+
+```
+calisan surec PID 55852 → D:\...\target\release\sinyald.exe
+diskteki exe   2026-08-14 17:44:05  sha256 ECC344AC...
+calisan imajin hash'i    AYNI
+expire_sn commit'i a705e53 → 2026-08-14 01:55'ten ÖNCE
+```
+
+Yani `expire_sn` çalışan derlemenin **içindeydi**. Sürüm sorunu yok.
+
+### Kanıtı okuyunca: bilet numarası ele verdi
+
+Bildirilen emrin bileti **109**'du. Canlı MT5 biletleri 9 hanelidir; bugün
+ölçülen canlı bilet **948731706**. Simülatör ise `next_ticket: 1`den başlar.
+Bilet 109 = **paper portu**, canlı değil.
+
+### Canlı yol (8787) — ÇALIŞIYOR
+
+```
+referans broker saati  1786973053
+gonderilen             expire_sn: 120, buy_limit 4380.71 (piyasadan 15$ uzak)
+brokerdaki hali        ticket=948731706  expiration=1786973220  (+167 sn)
+olcum                  163 sn: listede EVET
+                       183 sn: listede HAYIR, expired olayi GELDI
+```
+
+### Paper/replay yolu — İKİ ayrı kusur
+
+1. `sim_submit_order` son kullanma çözümünü **hiç çağırmıyordu**;
+   `req.expiration`ı olduğu gibi alıyordu. `expire_sn` gönderen istemcinin
+   alanı sessizce düşüyor, emir GTC kalıyordu.
+2. Motor `expiration`ı saklıyor ama **işletmiyordu**. `sim.rs` içinde
+   `expired` kelimesi **hiç geçmiyordu**.
+
+İkincisi daha zararlı: süresi dolmuş emir listede kalıp saatler sonra
+DOLUYORDU. Tüketicinin ölçümü: 16 limit emrin 6'sı 120 sn'yi aştı, en uzunu
+**5.030 sn** sonra doldu.
+
+Düzeltmeden sonra, ayrı bir derlemeyle 8899'da replay:
+
+```
+gonderilen      expire_sn: 120
+brokerdaki hali ticket=1  expiration=1786676580   (onceden: null)
+sonuc           emir DUSTU, expired olayi geldi
+```
+
+> **Ölçüm uyarısı:** replay 60× hızda oynatıldığı için referans tick'i okuyup
+> emri göndermem arasındaki ~1 sn wall-clock, akış saatinde ~60 sn ediyor.
+> Bu yüzden replay'in "181 sn" çıktısı kuralın ölçüsü DEĞİLDİR; kuralın
+> geçerli ölçümü canlıdaki 167 sn'dir.
+
+### Ofset iki kez uygulanmıyor — TTL diye bir şey yoktu
+
+Tüketici "ofset zincirde iki kez ekleniyor gibi" dedi ve kendi dolum
+modelini `3sa + 180sn` TTL varsayımıyla kalibre edip canlıyla %97 uyum
+bulduğunu bildirdi. **O uyum yanıltıcı.**
+
+Simülatör süre dolumunu hiç işletmediği için orada TTL **yoktu**. Gözlenen
+en uzun dolum 10.271 sn, varsayılan TTL 10.980 sn — yani sınır hiç
+bağlamadı, bu yüzden model "uyuyor" göründü. Atıl bir varsayım veriye
+uyunca doğrulanmış sayılmaz.
+
+### Kural (dolum simülatörünüz buna göre kalibre edilmeli)
+
+```
+son_kullanma = dakikaya_YUKARI_yuvarla(kurulus_broker_saniyesi + expire_sn)
+```
+
+Gerçek ömür `expire_sn` ile `expire_sn + 59` arasında. Yukarı yuvarlanır:
+aşağı yuvarlamak istenenden AZ süre vermek, yani sessizce eksik teslim olurdu.
+
+### Sıra kuralı: önce öl, sonra dol
+
+Motor artık süresi dolan emri **dolumdan önce** düşürür. Tersi, canlıda asla
+olmayacak dolumları backtest'e sokardı — bu köprünün var oluş sebebi tam
+olarak o hatayı kapatmak.
+
+---
+
 ## Henüz ÖLÇÜLMEMİŞ — bunlara güvenme
 
 Aşağıdakiler kodda yazılı ama **canlıda doğrulanmadı**. Sinyal sistemine
 "çalışıyor" diye bildirilmemeli:
 
-- `{"kind":"expired"}` olayının gerçekten üretilmesi
 - `RECONCILE` yoluyla gerçekleşmiş `profit`/`commission`/`swap` — henüz yok
 - Köprü **öldüğü sırada** gönderilen bir `modify_sltp`in akıbeti (yukarıdaki
   test köprüyü SL kurulduktan *sonra* öldürüyor; kurulmadan önce öldürseydi

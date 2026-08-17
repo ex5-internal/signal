@@ -166,6 +166,7 @@ pub const SIM_MODELED: &[&str] = &[
     "stops_level ihlali (retcode 10016)",
     "marjin yetersizligi (retcode 10019)",
     "hacim izgarasi (retcode 10014)",
+    "emir son kullanma (expire_sn/expiration; suresi dolan emir DOLMAZ)",
 ];
 
 /// Simülatörün MODELLEMEDİĞİ şeyler — `hello` bunu da ilan eder.
@@ -179,7 +180,6 @@ pub const SIM_NOT_MODELED: &[&str] = &[
     "requote / deviation penceresi",
     "kur cevrimi (kar sembolun kotasyon biriminde kalir)",
     "kismi dolum ve likidite derinligi",
-    "emir son kullanma (expiration saklanir, isletilmez)",
     "teminat tamamlama (stop-out), freeze_level",
     "hafta sonu bosluklari ve seans kesintileri",
 ];
@@ -1491,6 +1491,45 @@ fn resolve_expiry(
     instance: &str,
     symbol_id: u32,
 ) -> Result<(u8, i64), String> {
+    // Broker saati YALNIZCA tick'ten gelir. Tick yoksa uyduramayız: yerel
+    // saatle hesaplamak ölçülmüş 3 saatlik hatayı geri getirirdi.
+    let broker_simdi_ms = ctx.registry.last_of(instance, symbol_id).and_then(|t| {
+        if t.time_msc <= 0 {
+            return None;
+        }
+        // Tick BAYAT olabilir: sessiz bir sembolde son fiyat dakikalarca eski
+        // kalır. Damgayı olduğu gibi "şu an" saymak, o bayatlık kadar kısa bir
+        // ömür verirdi. ÖLÇÜLDÜ: 21 sn bayat tick, 120 sn istenen emri 99 sn'ye
+        // düşürdü. Yerel saatte geçen süreyi ekleyerek telafi ediyoruz.
+        let simdi = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let bayatlik = if t.recv_ms > 0 { (simdi - t.recv_ms).max(0) } else { 0 };
+        Some(t.time_msc + bayatlik)
+    });
+    expiry_from(req, tt, broker_simdi_ms)
+}
+
+/// [`resolve_expiry`]'nin saatsiz çekirdeği — CANLI ve SİMÜLE yol ortak kullanır.
+///
+/// # Neden ayrıldı
+///
+/// Simüle yol bunu ÇAĞIRMIYORDU: `expire_sn` sessizce düşüyor, emir GTC olarak
+/// sonsuza kadar bekliyordu. Tüketici sistem 2026-08-17'de bunu ölçtü
+/// (`expiration: null`, 16 emrin 6'sı 120 sn'yi aştı). Sessiz yok saymayı
+/// canlı yolda kapatıp simülede açık bırakmak, tam da bu köprünün önlemek
+/// için var olduğu "test ile canlı ayrışır" hatasıydı.
+///
+/// # `broker_simdi_ms` nereden gelir
+///
+/// - **Canlı**: son tick + bayatlık telafisi (yukarıda).
+/// - **Simüle**: akışın kendi damgası, telafi YOK. Replay'de yerel saate
+///   bakmak Mayıs kaydını Ağustos saatiyle oynatmak olurdu; belirlenimcilik
+///   sözü bunu yasaklıyor.
+///
+/// `None` = saat bilinmiyor; `expire_sn` istenmişse açık hata döner.
+fn expiry_from(req: &OrderReq, tt: u8, broker_simdi_ms: Option<i64>) -> Result<(u8, i64), String> {
     let belirli = tt == type_time::SPECIFIED || tt == type_time::SPECIFIED_DAY;
 
     if req.expire_sn != 0 {
@@ -1519,29 +1558,14 @@ fn resolve_expiry(
             ));
         };
 
-        // Broker saati YALNIZCA tick'ten gelir. Tick yoksa uyduramayız:
-        // yerel saatle hesaplamak ölçülmüş 3 saatlik hatayı geri getirirdi.
-        let Some(t) = ctx.registry.last_of(instance, symbol_id) else {
+        let Some(ms) = broker_simdi_ms else {
             return Err(
                 "expire_sn icin broker saati bilinmiyor: bu sembolde henuz \
                  tick gelmedi. Once tick akisini bekle ya da mutlak expiration ver."
                     .into(),
             );
         };
-        if t.time_msc <= 0 {
-            return Err("expire_sn icin broker saati gecersiz (tick damgasi 0)".into());
-        }
-
-        // Tick BAYAT olabilir: sessiz bir sembolde son fiyat dakikalarca eski
-        // kalır. Damgayı olduğu gibi "şu an" saymak, o bayatlık kadar kısa bir
-        // ömür verirdi. ÖLÇÜLDÜ: 21 sn bayat tick, 120 sn istenen emri 99 sn'ye
-        // düşürdü. Yerel saatte geçen süreyi ekleyerek telafi ediyoruz.
-        let simdi = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        let bayatlik = if t.recv_ms > 0 { (simdi - t.recv_ms).max(0) } else { 0 };
-        let broker_simdi = (t.time_msc + bayatlik) / 1000;
+        let broker_simdi = ms / 1000;
 
         // MT5 son kullanmayı DAKİKAYA yuvarlar — ölçüldü: 120 sn istendi,
         // broker 1786655700 yazdı (tam dakika). Aşağı yuvarlamak istenenden
@@ -1919,6 +1943,22 @@ fn sim_submit_order(req: OrderReq, ctx: &Ctx, s: &SimExec) -> Vec<ServerMsg> {
         }
     };
 
+    // SON KULLANMA: canlı yolun TAM AYNI kuralları, canlı yolun TAM AYNI
+    // hataları. Burası eskiden `req.expiration`ı olduğu gibi alıyordu; sonuç
+    // `expire_sn`in sessizce düşmesi ve emrin sonsuza kadar beklemesiydi.
+    // Saat akışın kendi damgasından gelir — yerel saat replay'i bozardı.
+    let tt = match req.time.as_str() {
+        "" | "gtc" => type_time::GTC,
+        "day" => type_time::DAY,
+        "specified" => type_time::SPECIFIED,
+        "specified_day" => type_time::SPECIFIED_DAY,
+        _ => return vec![sim_rejected(ctx, &req.id, simret::INVALID, "gecersiz time")],
+    };
+    let expiration = match expiry_from(&req, tt, Some(look.time_msc).filter(|&m| m > 0)) {
+        Ok((_, e)) => e,
+        Err(e) => return vec![sim_rejected(ctx, &req.id, simret::INVALID, &e)],
+    };
+
     let sreq = SimOrderReq {
         id: req.id.clone(),
         client_id: wire,
@@ -1929,7 +1969,7 @@ fn sim_submit_order(req: OrderReq, ctx: &Ctx, s: &SimExec) -> Vec<ServerMsg> {
         stoplimit: norm(req.stoplimit),
         sl: norm(req.sl),
         tp: norm(req.tp),
-        expiration: req.expiration,
+        expiration,
         comment: if req.comment.is_empty() { short(&req.id) } else { req.comment.clone() },
         // Akışın saati; yoksa 0 — yerel saat yazmak veri akışının zamanıyla
         // çelişen bir damga üretirdi.

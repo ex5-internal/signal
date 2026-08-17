@@ -396,12 +396,54 @@ emir sonsuza kadar beklerdi):
 MT5 son kullanmayı dakika sınırına kırpar. Aşağı yuvarlamak istenenden **az**
 süre vermek olurdu; köprü **yukarı** yuvarlar.
 
-`expire_sn: 120` için ölçülen gerçek ömür: **151 sn** (120 ≤ ömür < 180).
-Kesin saniye gerekiyorsa emri kendiniz iptal edin; `expire_sn` bir **taban**
-garantisidir, kesin süre değil.
+Kural tam olarak şudur — dolum simülatörünüzü buna göre kalibre edin:
+
+```
+son_kullanma = dakikaya_yukari_yuvarla(emrin_kuruldugu_broker_saniyesi + expire_sn)
+```
+
+Yani gerçek ömür `expire_sn` ile `expire_sn + 59` arasındadır; nerede
+düşeceği emrin dakikanın kaçıncı saniyesinde kurulduğuna bağlıdır.
+
+Ölçüm (2026-08-17, canlı, GOLD):
+
+```
+referans broker saati  1786973053   (dakikanın 13. saniyesi)
+istenen                120 sn
+kurulan damga          1786973220   = +167 sn
+ölçülen ölüm           163–183 sn arası (yoklama aralığı 20 sn)
+expired olayı          kind=expired  ticket=948731706
+```
+
+`expire_sn` bir **taban** garantisidir, kesin süre değil. Kesin saniye
+gerekiyorsa emri kendiniz iptal edin.
 
 > Ham `expiration` hâlâ kabul ediliyor ama **broker saatinde** verilmeli ve
 > `time: "specified"` şart. Yeni kodda kullanmayın.
+
+#### ⚠️ PAPER/REPLAY'de bozuktu — 2026-08-17'de düzeltildi
+
+`expire_sn` **yalnızca canlı yolda** çalışıyordu. Paper ve replay portlarında
+iki ayrı kusur vardı:
+
+1. Simüle emir yolu son kullanma çözümünü **hiç çağırmıyordu** — alan sessizce
+   düşüyor, emir GTC olarak kalıyordu (`expiration: null`).
+2. Motor `expiration`ı saklıyor ama **işletmiyordu** — süresi dolmuş bir emir
+   listede kalıyor ve saatler sonra bile DOLABİLİYORDU.
+
+Tüketici sistem bunu 2026-08-17'de ölçtü: 16 limit emrin 6'sı istenen 120
+saniyeyi aştı, en uzunu **5.030 saniye** sonra doldu.
+
+İkinci kusur daha sinsiydi: backtest, canlıda asla gerçekleşmeyecek dolumlar
+üretiyordu. Artık süresi dolan emir **dolumdan ÖNCE** düşürülür — 10:00'da
+ölen emir 10:05'teki tick'le dolamaz.
+
+`hello.sim` listesi de düzeltildi: son kullanma artık MODELLENEN tarafta.
+Eski sürüm `"emir son kullanma (expiration saklanir, isletilmez)"` diye
+**doğru** ilan ediyordu; o satırı gören istemci haklıydı.
+
+Simülatörde saat **akışın kendi damgasıdır**, yerel saat değil — replay'de
+yerel saate bakmak Mayıs kaydını Ağustos saatiyle oynatmak olurdu.
 
 Süre dolduğunda **`{"t":"order","kind":"expired"}` gelir** ve biletin
 düştüğünü anlarsınız. Ayrıca `{"op":"orders"}` ile de doğrulayabilirsiniz.

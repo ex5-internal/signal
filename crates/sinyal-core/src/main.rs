@@ -639,9 +639,10 @@ SİMÜLASYON (hem --replay hem --paper-bind için):
 
   MODELLENİR : spread, aleyhte kayma, bekleyen emir tetiklenmesi, SL/TP
                tetiklenmesi (aynı tick ikisini de vurursa SL kazanır),
-               stops_level (10016), marjin (10019), hacim ızgarası (10014).
+               stops_level (10016), marjin (10019), hacim ızgarası (10014),
+               emir son kullanma (süresi dolan emir DOLMAZ).
   MODELLENMEZ: komisyon, swap, requote/deviation penceresi, kur çevrimi,
-               kısmi dolum, emir son kullanma, stop-out, freeze_level.
+               kısmi dolum, stop-out, freeze_level.
   Her emir olayı `sim: true` taşır ve hello.sim bu listeyi ilan eder.
   Simüle dolum GERÇEK DOLUM DEĞİLDİR.
 
@@ -661,9 +662,10 @@ GÜVENLİK:
 fn print_sim_honesty(slippage: f64) {
     println!("  MODELLENIR : spread; ALEYHTE kayma ({slippage} point); bekleyen emir ve");
     println!("               SL/TP tetiklenmesi (ayni tick ikisini de vurursa SL kazanir);");
-    println!("               stops_level (10016); marjin (10019); hacim izgarasi (10014).");
+    println!("               stops_level (10016); marjin (10019); hacim izgarasi (10014);");
+    println!("               emir son kullanma (suresi dolan emir DOLMAZ).");
     println!("  MODELLENMEZ: komisyon, swap, requote/deviation penceresi, kur cevrimi,");
-    println!("               kismi dolum, emir son kullanma, stop-out, freeze_level.");
+    println!("               kismi dolum, stop-out, freeze_level.");
     println!("  {}", server::SIM_WARNING);
     // `--sim-slippage 0` yukarıdaki "MODELLENIR: ALEYHTE kayma" satırını
     // YALANA çevirir: dolumlar yeniden mükemmelleşir ve strateji burada

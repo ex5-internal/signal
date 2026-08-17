@@ -42,9 +42,8 @@
 //! # Modellenmeyen — bunlar tahmin EDİLMEZ
 //!
 //! Komisyon, swap, kur çevrimi (kâr sembolün kotasyon biriminde kalır),
-//! kısmi dolum/likidite, `deviation` penceresi ve requote, emir son kullanma
-//! (`expiration` saklanır ama işletilmez), teminat tamamlama (stop-out),
-//! hafta sonu boşlukları, freeze level. Modellenmeyen bir maliyeti tahmin
+//! kısmi dolum/likidite, `deviation` penceresi ve requote, teminat tamamlama
+//! (stop-out), hafta sonu boşlukları, freeze level. Modellenmeyen bir maliyeti tahmin
 //! etmektense hiç eklememek, sonucun ne olduğu konusunda dürüst kalmayı
 //! sağlar — ama **simüle dolum GERÇEK DOLUM DEĞİLDİR**.
 //!
@@ -331,6 +330,12 @@ pub enum SimEventKind {
     Queued,
     Ack,
     Txn,
+    /// Bekleyen emrin **süresi doldu** — dolum DEĞİL, ret de DEĞİL.
+    ///
+    /// Canlıda bu ad `ORDER_STATE_EXPIRED`ten türüyor (`source.rs`), burada
+    /// motorun kendisinden. İki kipte de tel üzerindeki ad aynı olmalı, yoksa
+    /// istemci backtest'te hiç görmediği bir olayla canlıda karşılaşır.
+    Expired,
     Rejected,
 }
 
@@ -340,6 +345,7 @@ impl SimEventKind {
             Self::Queued => "queued",
             Self::Ack => "ack",
             Self::Txn => "txn",
+            Self::Expired => "expired",
             Self::Rejected => "rejected",
         }
     }
@@ -363,6 +369,10 @@ pub enum SimCause {
     Close,
     Cancel,
     Modify,
+    /// Süre doldu. `Cancel`den AYRI tutuluyor: iptali istemci ister, süre
+    /// dolmasını kimse istemez. İkisini tek ada indirmek, "emrimi ben mi
+    /// iptal ettim yoksa zaman aşımı mı" sorusunu telden cevaplanamaz yapardı.
+    Expired,
 }
 
 impl SimCause {
@@ -376,6 +386,7 @@ impl SimCause {
             Self::Close => "close",
             Self::Cancel => "cancel",
             Self::Modify => "modify",
+            Self::Expired => "expired",
         }
     }
 }
@@ -821,9 +832,61 @@ impl SimEngine {
             return out;
         }
         self.prices.set(symbol, bid, ask, time_msc);
+        self.expire_pending(time_msc, &mut out);
         self.fire_pending(symbol, bid, ask, time_msc, &mut out);
         self.fire_stops(symbol, bid, ask, time_msc, &mut out);
         out
+    }
+
+    /// Süresi dolmuş bekleyen emirleri düşür.
+    ///
+    /// # Neden DOLUMDAN ÖNCE
+    ///
+    /// 10:00'da ölmüş bir emir, 10:05'te gelen tick'le dolamaz. Önce doldurup
+    /// sonra süreye bakmak, canlıda **asla olmayacak** dolumları backtest'e
+    /// sokardı — bu köprünün düzeltmek için var olduğu hatanın ta kendisi.
+    /// Sessiz piyasada ya da replay boşluğunda iki tick arası dakikalar
+    /// sürebilir; sıra o boşlukta belli olur.
+    ///
+    /// # Saat GLOBALDİR
+    ///
+    /// Tick hangi sembolden gelirse gelsin damgası tüm bekleyen emirler için
+    /// "şu an"dır. Zaman sembole göre akmaz; GOLD tick'i EURUSD emrini de
+    /// yaşlandırır.
+    ///
+    /// # Neden yerel saate bakmıyoruz
+    ///
+    /// Yalnızca akışın damgası kullanılır. `SystemTime::now()` çağırmak,
+    /// Mayıs kaydının Ağustos saatiyle oynatılması demek olurdu ve "aynı kayıt
+    /// aynı sonucu verir" sözünü bozardı. Bunun bedeli, sessiz bir sembolde
+    /// emrin ilk tick'e kadar ölmemesidir — ama o tick geldiğinde DOLMADAN
+    /// ölür, yani yanlış tarafa hata yapmıyoruz.
+    fn expire_pending(&mut self, time_msc: i64, out: &mut Vec<SimEvent>) {
+        if time_msc <= 0 || self.pending.is_empty() {
+            return;
+        }
+        let simdi_sn = time_msc / 1000;
+        let mut kept: Vec<OrdRec> = Vec::with_capacity(self.pending.len());
+        for o in std::mem::take(&mut self.pending) {
+            // 0 = süresiz; MT5'te de öyle.
+            if o.expiration == 0 || simdi_sn < o.expiration {
+                kept.push(o);
+                continue;
+            }
+            let mut ev = SimEvent::new(SimEventKind::Expired, retcode::DONE);
+            ev.id = o.id.clone();
+            ev.client_id = o.client_id;
+            ev.symbol = o.symbol.clone();
+            ev.order = o.ticket;
+            // `volume` DOLAN değil, ölen emrin hacmi; `price` da emrin fiyatı,
+            // bir dolum fiyatı değil. `deal`/`position` 0 kalır: dolum YOK.
+            ev.volume = o.volume;
+            ev.price = o.price;
+            ev.time_msc = time_msc;
+            ev.cause = SimCause::Expired;
+            out.push(ev);
+        }
+        self.pending = kept;
     }
 
     /// Bekleyen emirleri tetikle. Bilet sırası korunur: `pending` daima artan
@@ -1684,6 +1747,74 @@ mod tests {
         assert_eq!(e.positions(&PriceBook::new()).len(), 1);
         // LIMIT emri fiyatından dolar, kayma yemez.
         assert!(near(evs[0].price, 1.09900), "limit dolumu: {}", evs[0].price);
+    }
+
+    // --- son kullanma ------------------------------------------------------
+    //
+    // 2026-08-17'ye kadar motor `expiration`ı SAKLIYOR ama İŞLETMİYORDU.
+    // Tüketici sistem bunu canlıda ölçtü: 16 limit emrin 6'sı istenen 120
+    // saniyeyi aştı, en uzunu 5.030 saniye sonra doldu.
+
+    #[test]
+    fn suresi_dolan_emir_DOLMAZ() {
+        let mut e = engine();
+        // 100. saniyede ölen bir alış limiti.
+        let r = SimOrderReq { price: 1.09900, expiration: 100, ..req(SimOrderKind::BuyLimit, 0.10) };
+        assert!(e.place(&r, &eurusd(), 1.10000, 1.10010).is_accepted());
+
+        // 200. saniyede fiyat limite DEĞİYOR — ama emir 100'de ölmüştü.
+        // Doldurmak, canlıda ASLA olmayacak bir dolumu backtest'e sokmaktır;
+        // bu köprü tam olarak bunu önlemek için var.
+        let evs = e.on_tick("EURUSD", 1.09890, 1.09900, 200_000);
+        assert_eq!(evs.len(), 1, "tek olay beklenir: {evs:?}");
+        assert_eq!(evs[0].kind, SimEventKind::Expired);
+        assert_eq!(evs[0].cause, SimCause::Expired);
+        assert_eq!(evs[0].deal, 0, "dolum yok: deal bileti dogmamali");
+        assert_eq!(evs[0].position, 0, "dolum yok: pozisyon dogmamali");
+        assert!(e.orders().is_empty(), "olen emir listede kalmamali");
+        assert!(
+            e.positions(&PriceBook::new()).is_empty(),
+            "POZISYON ACILMAMALI — asil kusur buydu"
+        );
+    }
+
+    #[test]
+    fn son_kullanma_aninda_oler_bir_saniye_oncesinde_dolar() {
+        // Sınır davranışı açıkça sabitleniyor: `>=` ölür, `<` yaşar.
+        let mut e = engine();
+        let r = SimOrderReq { price: 1.09900, expiration: 200, ..req(SimOrderKind::BuyLimit, 0.10) };
+        assert!(e.place(&r, &eurusd(), 1.10000, 1.10010).is_accepted());
+        let evs = e.on_tick("EURUSD", 1.09890, 1.09900, 199_000);
+        assert_eq!(evs[0].kind, SimEventKind::Txn, "1 sn kala dolmali");
+
+        let mut e2 = engine();
+        assert!(e2.place(&r, &eurusd(), 1.10000, 1.10010).is_accepted());
+        let evs2 = e2.on_tick("EURUSD", 1.09890, 1.09900, 200_000);
+        assert_eq!(evs2[0].kind, SimEventKind::Expired, "tam saniyesinde olmeli");
+    }
+
+    #[test]
+    fn suresiz_emir_hicbir_zaman_olmez() {
+        let mut e = engine();
+        // 0 = süresiz, MT5'teki anlamıyla aynı.
+        let r = SimOrderReq { price: 1.00000, expiration: 0, ..req(SimOrderKind::BuyLimit, 0.10) };
+        assert!(e.place(&r, &eurusd(), 1.10000, 1.10010).is_accepted());
+        assert!(e.on_tick("EURUSD", 1.10000, 1.10010, 9_999_999_000).is_empty());
+        assert_eq!(e.orders().len(), 1, "suresiz emir beklemeye devam etmeli");
+    }
+
+    #[test]
+    fn baska_sembolun_ticki_de_emri_yaslandirir() {
+        // Zaman sembole göre akmaz. GOLD tick'i EURUSD emrini de öldürür;
+        // aksi halde sessiz bir sembolde emir sonsuza kadar yaşardı.
+        let mut e = engine();
+        let r = SimOrderReq { price: 1.09900, expiration: 100, ..req(SimOrderKind::BuyLimit, 0.10) };
+        assert!(e.place(&r, &eurusd(), 1.10000, 1.10010).is_accepted());
+
+        let evs = e.on_tick("GOLD", 4000.00, 4000.50, 200_000);
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].kind, SimEventKind::Expired);
+        assert_eq!(evs[0].symbol, "EURUSD", "olen emrin sembolu tasinmali");
     }
 
     #[test]
