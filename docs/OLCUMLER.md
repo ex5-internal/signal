@@ -759,18 +759,24 @@ olcum                  163 sn: listede EVET
 DOLUYORDU. Tüketicinin ölçümü: 16 limit emrin 6'sı 120 sn'yi aştı, en uzunu
 **5.030 sn** sonra doldu.
 
-Düzeltmeden sonra, ayrı bir derlemeyle 8899'da replay:
+### Düzeltmeden sonra — PAPER portunda (8789), gerçek zamanlı
 
 ```
-gonderilen      expire_sn: 120
-brokerdaki hali ticket=1  expiration=1786676580   (onceden: null)
-sonuc           emir DUSTU, expired olayi geldi
+referans broker saati  1786993334
+gonderilen             expire_sn: 120
+brokerdaki hali        ticket=1  expiration=1786993500   (onceden: null)
+olcum                  154 sn: listede EVET
+                       168 sn: listede HAYIR, expired olayi GELDI
+olculen omur           166 sn
 ```
 
-> **Ölçüm uyarısı:** replay 60× hızda oynatıldığı için referans tick'i okuyup
+Kural birebir tutuyor: `1786993334 + 120 = 1786993454` → dakikaya yukarı →
+`1786993500`, yani +166 sn. Canlıda +167 sn çıkmıştı; **iki yol artık aynı.**
+
+> **Ara ölçümdeki tuzak:** düzeltme ilk kez 60× hızlı replay'de sınandı ve
+> "181 sn" çıktı. O sayı kuralın ölçüsü DEĞİLDİR — referans tick'i okuyup
 > emri göndermem arasındaki ~1 sn wall-clock, akış saatinde ~60 sn ediyor.
-> Bu yüzden replay'in "181 sn" çıktısı kuralın ölçüsü DEĞİLDİR; kuralın
-> geçerli ölçümü canlıdaki 167 sn'dir.
+> Hızlandırılmış oynatımda **süre ölçülmez**; yalnız davranış görülür.
 
 ### Ofset iki kez uygulanmıyor — TTL diye bir şey yoktu
 
@@ -800,12 +806,93 @@ olarak o hatayı kapatmak.
 
 ---
 
+## 17. RECONCILE hiç çalışmamış — "ilk tur" bayrağı su hattıyla karıştırılmış
+
+**Tarih:** 2026-08-17 · **Sembol:** GOLD
+
+Kod 14 Ağustos'ta yazılmış, 451 birim testi geçmiş, MQL5 hatasız derlenmişti.
+**Canlıda hiç çalışmamış.** Birim testi bu kusuru göremezdi.
+
+### Ölçüm — 0.01 GOLD aç-kapat
+
+```
+pozisyon 949370008  (deal 938029798 giris, 938029846 cikis)
+EA telemetrisi      mutabakat=0/hata=0
+telde               profit/commission/swap HIC YOK
+```
+
+### Yanlış şüphe: binary
+
+Önce çalışan derlemeden şüphelendim — exe 14 Ağustos 17:44'te, RECONCILE
+commit'i 17:45'te. "Bir dakika önceki derleme içerir" diye **varsaymıştım**.
+Ölçtüm: exe içinde `reconciled` ve `commission` dizgileri **var**. Daemon
+tarafı sağlamdı, kusur EA'daydı.
+
+### Kusur
+
+```mql5
+bool first = (g_recon_last_deal == 0);
+```
+
+Bu satır **iki ayrı şeyi** karıştırıyor:
+
+- "henüz hiç tur koşmadı"
+- "hiç deal görülmedi"
+
+EA sakin bir saatte yüklenirse son bir saatte deal yoktur → `high` 0 kalır →
+`g_recon_last_deal` 0 kalır → `first` **her turda** true olur. Sonra gelen
+ilk işlem de "ilk tur" sayılıp yalnızca su hattını işaretler ve
+**yayımlanmadan kaybolur**.
+
+Aç-kapat turumda iki deal de aynı 5 saniyelik pencerede görüldü, ikisi de
+atlandı, su hattı 938029846'ya çekildi. Sessiz kayıp.
+
+### Düzeltme
+
+Ayrı bir bayrak: `g_recon_primed`. "İlk tur koştu mu" sorusu su hattının
+**değerinden** bağımsız; boş geçen ilk tur da bayrağı kaldırır.
+
+İlk turun yayımlamama kuralı **korundu** — aksi halde EA her açılışta son bir
+saatin deal'lerini "yeni" diye gönderir, istemci kapanmış işlemleri tekrar
+sayardı.
+
+### Doğrulama — ve BAĞIMSIZ tanık
+
+EA yeniden yüklendikten sonra (CLI derlemesi çalışan EA'yı yenilemiyor,
+ölçüldü: tick sayacı 813994 → 815269, sıfırlama yok):
+
+```
+giris deal 938057057   reconciled=true  profit=0      commission=0  swap=0
+cikis deal 938057107   reconciled=true  profit=-0.49  commission=0  swap=0
+canli olaylarda gerceklesmis alan YOK  (dogru: "olcum yok" != "sifir")
+```
+
+Teldeki `profit`i telin kendi fiyatlarıyla doğrulamak **döngüsel** olurdu.
+Bağımsız tanık olarak hesap bakiyesi kullanıldı — bakiye MT5'in hesap
+durumundan gelir, deal kaydından türetilmez:
+
+```
+ONCE  bakiye 1387.68
+SONRA bakiye 1387.34
+bakiye degisimi        -0.34
+teldeki profit+comm+swap -0.34   TUTUYOR
+```
+
+### Ders
+
+Bu oturumda birim testi geçen **üçüncü** entegrasyon hatası. Üçünün de ortak
+yanı: durum makinesinin ilk anı. Birim testi "ilk tur yayımlamaz" kuralını
+doğruluyordu; kimse "ilk tur ne zaman biter" diye sormamıştı.
+
+---
+
 ## Henüz ÖLÇÜLMEMİŞ — bunlara güvenme
 
 Aşağıdakiler kodda yazılı ama **canlıda doğrulanmadı**. Sinyal sistemine
 "çalışıyor" diye bildirilmemeli:
 
-- `RECONCILE` yoluyla gerçekleşmiş `profit`/`commission`/`swap` — henüz yok
+- Kısmi dolum (`volume_filled` / `order_state` ile ayrım) canlıda hiç
+  gözlenmedi: 0.01 lotluk turlarda kısmi dolum olmuyor
 - Köprü **öldüğü sırada** gönderilen bir `modify_sltp`in akıbeti (yukarıdaki
   test köprüyü SL kurulduktan *sonra* öldürüyor; kurulmadan önce öldürseydi
   ne olurdu ölçülmedi)

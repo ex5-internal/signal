@@ -679,11 +679,41 @@ kalkıyor. Hepsi mevcut:
 > `modify_sltp` yolunda o durumda `sltp_unverified` gelir ve yedeğiniz tek
 > koruma olur. Ayrıntı: §4, "Stop broker tarafında, köprü stop'u YEDEK".
 
+### Gerçekleşmiş kâr: `reconciled` olayları — CANLIDA DOĞRULANDI
+
+Kapanmış bir deal'in **kesin** sonucu ayrı bir olayla gelir:
+
+```json
+{"t":"order","kind":"txn","order":949398482,"deal":938057107,
+ "position":949398427,"volume":0.01,"price":4426.45,
+ "reconciled":true,"profit":-0.49,"commission":0,"swap":0}
+```
+
+- `profit`/`commission`/`swap` **yalnızca `reconciled: true` olaylarda** var.
+  Canlı olayda hiç görünmezler — sıfır göndermek "kâr sıfırdı" dedirtirdi,
+  oysa ölçüm henüz yapılmamıştır.
+- Bir pozisyonun **iki** mutabakat olayı olur: giriş ve çıkış deal'i.
+  Komisyon genellikle **girişte** görünür; yalnız çıkışa bakıp "komisyon yok"
+  demek yaygın bir hatadır.
+- Sıcak yolda değil, `OnTimer`'da seyrek bir turda üretilir (varsayılan 5 sn)
+  — bu yüzden dolumdan **saniyeler sonra** gelir. `reconciled` "geç geldi"
+  demektir, "yeni oldu" değil.
+- Simülatörde mutabakat **yoktur** (olayları motorun kendisi üretir, kaçırılan
+  olay yok) ve komisyon/swap modellenmez; alanlar telde hiç görünmez.
+
+Doğrulama (2026-08-17, GOLD, 0.01 lot): teldeki `profit+commission+swap`
+toplamı **−0,34**, MT5 hesap bakiyesindeki değişim **−0,34**. Bakiye deal
+kaydından türetilmediği için bağımsız tanıktır.
+
+> **2026-08-17'ye kadar bu yol HİÇ çalışmıyordu.** EA'nın "ilk tur yayımlamaz"
+> bayrağı su hattının değerinden türetiliyordu; sakin bir saatte yüklenince
+> her tur "ilk tur" sayılıyor ve gerçekleşmiş sonuç sessizce kayboluyordu.
+> `mutabakat=0` telemetrisi gördüyseniz sebebi buydu.
+
 ### Henüz OLMAYAN ve bilmeniz gerekenler
 
 | Eksik | Ne yapmalı |
 |---|---|
-| Kapanış `txn`'inde **gerçekleşmiş** kâr/komisyon/swap | Şimdilik dolum fiyatlarından hesaplayın |
 | Simülatörde komisyon/swap | Paper/replay PnL'i **iyimserdir** |
 | Paper/replay'de dolum anı `bid`/`ask` | Simülatör ölçmez ve **uydurmaz**; alan hiç gelmez |
 
