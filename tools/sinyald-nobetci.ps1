@@ -74,9 +74,13 @@ else {
     Yaz "OLU: sinyald sureci yok, $Port dinlenmiyor"
 }
 
-# Token komut satırına GÖMÜLMEZ: `Get-CimInstance Win32_Process` ile
-# makinedeki her kullanıcıya görünür. Ortam değişkeninden okunur; yoksa
-# kimlik doğrulama KAPALI başlar ve bu AÇIKÇA loglanır.
+# Token bu DOSYAYA yazılmaz (betik depoda duruyor), ortam değişkeninden
+# okunur. AMA `sinyald` token'ı yalnızca `--token` bayrağından alıyor: token
+# KOMUT SATIRINDA görünür ve `Get-CimInstance Win32_Process` ile makinedeki
+# her kullanıcı okuyabilir. Bu betik o açığı KAPATMAZ — kapatmak için
+# daemon'un ortam değişkeni desteklemesi gerekir. Demo hesapta bilinçli
+# kabul edilmiş risk. Token yoksa kimlik doğrulama KAPALI başlar ve bu
+# AÇIKÇA loglanır.
 $token = $env:SINYAL_TOKEN
 $argv = @(
     '--instance', 'mt5-1'
