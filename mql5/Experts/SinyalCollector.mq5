@@ -105,8 +105,18 @@ ulong  g_timer_skips    = 0;   // OnTimer olayı düşürüldü
 //
 // `g_recon_last_deal` bir SU HATTI: MT5'te deal biletleri artan sırada
 // verilir, o yüzden "bundan büyük olanlar yeni" demek yeterli ve tur başına
-// tablo tutmaya gerek yok. 0 = henüz hiç tur koşmadı (ilk tur yayımlamaz).
+// tablo tutmaya gerek yok.
 ulong  g_recon_last_deal = 0;
+// İlk tur KOŞTU MU — su hattının DEĞERİNDEN ayrı tutulur.
+//
+// ÖLÇÜLDÜ (2026-08-17): bu bayrak yokken "ilk tur" `g_recon_last_deal == 0`
+// ile türetiliyordu ve iki ayrı şeyi karıştırıyordu: "henüz tur koşmadı" ile
+// "hiç deal görülmedi". EA sakin bir saatte yüklenirse su hattı 0 kalıyor,
+// dolayısıyla HER tur "ilk tur" sayılıyor; sonra gelen ilk işlem de yalnızca
+// su hattını işaretleyip yayımlanmadan kayboluyordu. Canlı turda ölçüldü:
+// 0.01 GOLD açılıp kapatıldı, iki deal de aynı 5 sn'lik turda görüldü,
+// `mutabakat=0` kaldı ve gerçekleşmiş kâr tele HİÇ çıkmadı.
+bool   g_recon_primed    = false;
 datetime g_recon_last_run = 0;
 ulong  g_recon_sent      = 0;  // mutabakattan yayımlanan olay
 ulong  g_recon_failed    = 0;  // HistorySelect başarısız
@@ -985,7 +995,13 @@ void ReconcileDeals()
 
    int n = HistoryDealsTotal();
    ulong high = g_recon_last_deal;
-   bool  first = (g_recon_last_deal == 0);
+   // İlk turda yayım YOK, yalnız su hattı işaretlenir: aksi halde EA her
+   // açılışta son bir saatin deal'lerini "yeni" diye gönderir ve istemci
+   // kapanmış işlemleri tekrar sayardı.
+   //
+   // Bayrak su hattının DEĞERİNDEN ayrı: sakin bir saatte su hattı 0 kalır
+   // ve `== 0` testi her turu "ilk tur" yapardı (ölçüldü, bkz. bildirim).
+   bool  first = !g_recon_primed;
 
    for(int i = 0; i < n; i++)
      {
@@ -1036,6 +1052,7 @@ void ReconcileDeals()
      }
 
    g_recon_last_deal = high;
+   g_recon_primed    = true;
   }
 
 //+------------------------------------------------------------------+
